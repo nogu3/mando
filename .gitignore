@@ -1,0 +1,4 @@
+/target
+/.task
+# 実 config（実 IP・EPC）はコミットしない。同梱はサンプルのみ。
+/config.toml

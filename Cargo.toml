@@ -1,0 +1,19 @@
+[package]
+name = "mando"
+version = "0.1.0"
+edition = "2021"
+description = "スマートホーム操作の Web フロント。casa/enl をサブプロセスで呼ぶ常駐 HTTP サービス。"
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = true

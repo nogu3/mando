@@ -1,0 +1,86 @@
+# go-task タスク定義。即ビルド & 実行用。
+#   task           一覧
+#   task run       config.toml で起動（無ければ example から自動生成）
+#   task build     リリースビルド（単一バイナリ）
+version: "3"
+
+vars:
+  CONFIG: '{{.MANDO_CONFIG | default "config.toml"}}'
+  BIN: target/release/mando
+
+tasks:
+  default:
+    desc: タスク一覧
+    cmds:
+      - task --list
+    silent: true
+
+  config:
+    desc: config.toml が無ければ example からコピー（実 IP・EPC は要手動編集）
+    status:
+      - test -f {{.CONFIG}}
+    cmds:
+      - cp config.example.toml {{.CONFIG}}
+      - 'echo "[task] {{.CONFIG}} を作成。実 IP・EPC を埋めること。"'
+
+  run:
+    desc: デバッグ起動（config 自動生成 → cargo run）
+    deps: [config]
+    env:
+      MANDO_CONFIG: "{{.CONFIG}}"
+      RUST_LOG: '{{.RUST_LOG | default "mando=debug"}}'
+    cmds:
+      - cargo run
+
+  build:
+    desc: リリースビルド（単一バイナリ、index.html 焼き込み済み）
+    cmds:
+      - cargo build --release
+    sources:
+      - src/**/*.rs
+      - index.html
+      - Cargo.toml
+    generates:
+      - "{{.BIN}}"
+
+  start:
+    desc: リリースバイナリで起動（build → 実行）
+    deps: [build, config]
+    env:
+      MANDO_CONFIG: "{{.CONFIG}}"
+      RUST_LOG: '{{.RUST_LOG | default "mando=info"}}'
+    cmds:
+      - ./{{.BIN}}
+
+  test:
+    desc: テスト
+    cmds:
+      - cargo test
+
+  lint:
+    desc: clippy（警告をエラー扱い）
+    cmds:
+      - cargo clippy -- -D warnings
+
+  fmt:
+    desc: フォーマット
+    cmds:
+      - cargo fmt
+
+  check:
+    desc: test + lint + fmt 確認（CI 相当）
+    cmds:
+      - cargo fmt --check
+      - task: lint
+      - task: test
+
+  up:
+    desc: Docker Compose で起動（host network）
+    deps: [config]
+    cmds:
+      - docker compose up -d --build
+
+  down:
+    desc: Docker Compose 停止
+    cmds:
+      - docker compose down

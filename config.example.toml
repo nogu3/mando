@@ -1,0 +1,36 @@
+# mando 設定サンプル。
+#
+# 実 config（実 IP・EPC = 設置環境のトポロジ）はリポジトリに含めない。
+# これをコピーして config.toml を作り、実値を埋める:
+#
+#   cp config.example.toml config.toml
+#
+# 本体は各操作のコマンド配列をそのまま exec するだけ（バックエンド非依存）。
+# enl → casa への移行はコード変更ではなく、この配列の差し替えで済む。
+
+# mando が bind するアドレス。LAN なら LAN アドレス、外出先対応なら
+# オーバーレイ網のアドレスに変えるだけ（ポート開放は不要）。
+bind = "0.0.0.0:8080"
+
+[[device]]
+name      = "shutter"        # URL とフロントが使う安定識別子（変えると URL が変わる）
+label     = "シャッター"     # UI 表示名（任意。未指定なら name）
+# 実値（IP・open/close の hex・open_close_state の値域）は機種で振れる。
+# 投入前に `enl describe <IP> 026301` で確認すること。電動シャッターは 0x0263。
+# IP は RFC 5737 のドキュメント用レンジ（192.0.2.0/24）。実 IP に置き換える。
+get_state = ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
+open      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "open"]
+close     = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "close"]
+
+# 将来 casa に差し替える例（本体コードは変更しない）:
+#   get_state = ["casa", "get", "shutter", "open_close_state"]
+#   open      = ["casa", "set", "shutter", "open_close_operation", "open"]
+#   close     = ["casa", "set", "shutter", "open_close_operation", "close"]
+
+# 複数デバイスは [[device]] を増やすだけ（API は既に対応済み）。
+# [[device]]
+# name      = "garage"
+# label     = "ガレージ"
+# get_state = ["enl", "get", "192.0.2.11", "026301", "open_close_state"]
+# open      = ["enl", "set", "192.0.2.11", "026301", "open_close_operation", "open"]
+# close     = ["enl", "set", "192.0.2.11", "026301", "open_close_operation", "close"]

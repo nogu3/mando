@@ -1,0 +1,15 @@
+# mando を動かすホストと対象デバイスは同一 L2 / VLAN にあること。
+# ブリッジネットワークでは UDP のデバイス応答とマルチキャストを受けられない
+# ので、ホストネットワーク必須。ポート 3610 は enl / casa が使う。
+services:
+  mando:
+    build: .
+    # マルチキャスト/UDP 応答を受けるため host network 必須（CLAUDE.md 参照）。
+    network_mode: host
+    volumes:
+      # 実 config は外出し。再コンパイルなしに書き換えられる。
+      - ./config.toml:/config/config.toml:ro
+    environment:
+      MANDO_CONFIG: /config/config.toml
+      RUST_LOG: mando=info
+    restart: unless-stopped
