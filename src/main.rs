@@ -72,6 +72,10 @@ async fn main() {
         .route("/api/devices/:name/open", post(open_device))
         .route("/api/devices/:name/close", post(close_device))
         .route("/api/devices/:name/stop", post(stop_device))
+        .route("/api/groups", get(list_groups))
+        .route("/api/groups/:name/open", post(group_open))
+        .route("/api/groups/:name/close", post(group_close))
+        .route("/api/groups/:name/stop", post(group_stop))
         .with_state(app);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -200,46 +204,150 @@ async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
     }
 }
 
-async fn open_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
-    match app.config.find(&name) {
-        Some(device) => {
-            let cmd = device.open.clone();
-            Json(run_action(&app, device, &cmd).await).into_response()
-        }
-        None => not_found(&name),
+/// 操作の種類。
+#[derive(Clone, Copy)]
+enum Op {
+    Open,
+    Close,
+    Stop,
+}
+
+/// device の該当操作コマンドを返す。stop 非対応なら None。
+fn device_cmd(device: &Device, op: Op) -> Option<Vec<String>> {
+    match op {
+        Op::Open => Some(device.open.clone()),
+        Op::Close => Some(device.close.clone()),
+        Op::Stop => device.stop_cmd().map(|c| c.to_vec()),
     }
+}
+
+async fn open_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    device_op(&app, &name, Op::Open).await
 }
 
 async fn close_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
-    match app.config.find(&name) {
-        Some(device) => {
-            let cmd = device.close.clone();
-            Json(run_action(&app, device, &cmd).await).into_response()
-        }
-        None => not_found(&name),
-    }
+    device_op(&app, &name, Op::Close).await
 }
 
 async fn stop_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
-    match app.config.find(&name) {
-        Some(device) => match device.stop_cmd() {
-            Some(cmd) => {
-                let cmd = cmd.to_vec();
-                Json(run_action(&app, device, &cmd).await).into_response()
-            }
-            // stop 非対応のデバイス。
-            None => (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "application/json")],
-                format!(
-                    "{{\"error\":\"stop unsupported\",\"name\":{}}}",
-                    json_str(&name)
-                ),
-            )
-                .into_response(),
-        },
-        None => not_found(&name),
+    device_op(&app, &name, Op::Stop).await
+}
+
+async fn device_op(app: &App, name: &str, op: Op) -> Response {
+    let Some(device) = app.config.find(name) else {
+        return not_found(name);
+    };
+    match device_cmd(device, op) {
+        Some(cmd) => Json(run_action(app, device, &cmd).await).into_response(),
+        // stop 非対応のデバイス。
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"stop unsupported\",\"name\":{}}}",
+                json_str(name)
+            ),
+        )
+            .into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct GroupInfo {
+    name: String,
+    label: String,
+    members: Vec<String>,
+    /// 全メンバーが stop 対応していれば true（一括停止ボタンの出し分け）。
+    stop: bool,
+}
+
+async fn list_groups(State(app): State<Shared>) -> Json<Vec<GroupInfo>> {
+    let groups = app
+        .config
+        .groups
+        .iter()
+        .map(|g| {
+            let stop = g
+                .members
+                .iter()
+                .filter_map(|m| app.config.find(m))
+                .all(|d| d.stop_cmd().is_some());
+            GroupInfo {
+                name: g.name.clone(),
+                label: g.label().to_string(),
+                members: g.members.clone(),
+                stop,
+            }
+        })
+        .collect();
+    Json(groups)
+}
+
+/// グループ一括操作の 1 メンバー分の結果。
+#[derive(Serialize)]
+struct GroupMemberResult {
+    name: String,
+    /// stop 非対応で飛ばした場合 true。
+    skipped: bool,
+    #[serde(flatten)]
+    result: ActionView,
+}
+
+async fn group_open(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    group_op(&app, &name, Op::Open).await
+}
+
+async fn group_close(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    group_op(&app, &name, Op::Close).await
+}
+
+async fn group_stop(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    group_op(&app, &name, Op::Stop).await
+}
+
+/// グループの全メンバーを記載順に操作する。各操作・state 再取得は Executor で
+/// 直列化される（同時に 3610 を奪い合わない）。メンバーごとの結果を返す。
+async fn group_op(app: &App, name: &str, op: Op) -> Response {
+    let Some(group) = app.config.find_group(name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unknown group\",\"name\":{}}}",
+                json_str(name)
+            ),
+        )
+            .into_response();
+    };
+
+    let mut results = Vec::with_capacity(group.members.len());
+    for member in &group.members {
+        // validate 済みなので必ず見つかる。
+        let device = app.config.find(member).expect("validated member");
+        match device_cmd(device, op) {
+            Some(cmd) => {
+                let result = run_action(app, device, &cmd).await;
+                results.push(GroupMemberResult {
+                    name: member.clone(),
+                    skipped: false,
+                    result,
+                });
+            }
+            // stop 非対応のメンバーは飛ばすが、現在 state は返す。
+            None => {
+                let state = fetch_state(app, device).await;
+                results.push(GroupMemberResult {
+                    name: member.clone(),
+                    skipped: true,
+                    result: ActionView {
+                        action: ExecOutcome::Success,
+                        state,
+                    },
+                });
+            }
+        }
+    }
+    Json(results).into_response()
 }
 
 fn not_found(name: &str) -> Response {

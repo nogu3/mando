@@ -29,6 +29,13 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 #   open      = ["casa", "set", "shutter", "open_close_operation", "open"]
 #   close     = ["casa", "set", "shutter", "open_close_operation", "close"]
 
+# 一括操作グループ（任意）。members の device をまとめて開閉/停止できる。
+# UI 上部に一括ボタンが出る。全メンバーが stop 対応なら一括「止める」も出る。
+# [[group]]
+# name    = "all"
+# alias   = "全部"
+# members = ["shutter", "garage"]
+
 # 複数デバイスは [[device]] を増やすだけ（API は既に対応済み）。
 # [[device]]
 # name      = "garage"

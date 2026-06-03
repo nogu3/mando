@@ -13,6 +13,26 @@ pub struct Config {
     pub bind: String,
     #[serde(default, rename = "device")]
     pub devices: Vec<Device>,
+    #[serde(default, rename = "group")]
+    pub groups: Vec<Group>,
+}
+
+/// 複数デバイスをまとめて一括操作するためのグループ。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Group {
+    /// グループ識別子（URL に使う）。
+    pub name: String,
+    /// 表示名（任意）。`label` でも `alias` でも書ける。未指定なら name。
+    #[serde(default, alias = "alias")]
+    pub label: Option<String>,
+    /// メンバーの device 名。記載順に操作する。
+    pub members: Vec<String>,
+}
+
+impl Group {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
 }
 
 fn default_bind() -> String {
@@ -55,6 +75,9 @@ pub enum ConfigError {
     Empty,
     DuplicateName(String),
     EmptyCommand(String),
+    EmptyGroup(String),
+    UnknownMember { group: String, member: String },
+    DuplicateGroup(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -70,6 +93,11 @@ impl std::fmt::Display for ConfigError {
                     "device {n}: コマンド配列が空。get_state/open/close すべて必須"
                 )
             }
+            ConfigError::EmptyGroup(n) => write!(f, "group {n}: members が空"),
+            ConfigError::UnknownMember { group, member } => {
+                write!(f, "group {group}: 未知の device を参照: {member}")
+            }
+            ConfigError::DuplicateGroup(n) => write!(f, "group 名が重複: {n}"),
         }
     }
 }
@@ -101,11 +129,33 @@ impl Config {
                 return Err(ConfigError::EmptyCommand(d.name.clone()));
             }
         }
+
+        let mut seen_g = std::collections::HashSet::new();
+        for g in &self.groups {
+            if !seen_g.insert(&g.name) {
+                return Err(ConfigError::DuplicateGroup(g.name.clone()));
+            }
+            if g.members.is_empty() {
+                return Err(ConfigError::EmptyGroup(g.name.clone()));
+            }
+            for m in &g.members {
+                if self.find(m).is_none() {
+                    return Err(ConfigError::UnknownMember {
+                        group: g.name.clone(),
+                        member: m.clone(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn find(&self, name: &str) -> Option<&Device> {
         self.devices.iter().find(|d| d.name == name)
+    }
+
+    pub fn find_group(&self, name: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.name == name)
     }
 }
 
@@ -163,6 +213,56 @@ mod tests {
         );
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.find("shutter1").unwrap().label(), "リビング");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn group_parsed_and_validated() {
+        let p = write_tmp(
+            "group",
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["enl","get","x","026301","open_close_state"]
+            open = ["enl","set","x","026301","open_close_operation","open"]
+            close = ["enl","set","x","026301","open_close_operation","close"]
+            [[device]]
+            name = "s2"
+            get_state = ["enl","get","x","026302","open_close_state"]
+            open = ["enl","set","x","026302","open_close_operation","open"]
+            close = ["enl","set","x","026302","open_close_operation","close"]
+            [[group]]
+            name = "all"
+            alias = "全部"
+            members = ["s1","s2"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let g = cfg.find_group("all").unwrap();
+        assert_eq!(g.label(), "全部");
+        assert_eq!(g.members, vec!["s1", "s2"]);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn group_rejects_unknown_member() {
+        let p = write_tmp(
+            "badgroup",
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["enl","get","x","026301","open_close_state"]
+            open = ["enl","set","x","026301","open_close_operation","open"]
+            close = ["enl","set","x","026301","open_close_operation","close"]
+            [[group]]
+            name = "all"
+            members = ["s1","ghost"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::UnknownMember { .. })
+        ));
         std::fs::remove_file(p).ok();
     }
 
