@@ -35,6 +35,25 @@ subprocess の終了コードを写したもの: `success` / `timeout` / `reject
 形式は [`config.example.toml`](./config.example.toml) を参照。論理デバイスごとに
 `get_state` / `open` / `close` のコマンド配列を持ち、本体はそれをそのまま exec する。
 
+## ラズパイ常駐（systemd, 推奨）
+
+Pi 上で常駐させる正攻法。自動起動・異常時再起動・ログを systemd に任せる
+（mando 自身は前景プロセスのまま。self-fork での daemon 化はしない）。
+
+```bash
+# Pi 上で（要 git/cargo。enl も Pi の PATH に置くか config を絶対パスに）
+task install        # ビルド → /usr/local/bin/mando、unit 配置、enable --now
+sudo nano /etc/mando/config.toml   # 実 IP・EPC を編集
+task svc-restart    # 反映
+task logs           # ログ追尾（journalctl -u mando -f）
+```
+
+- バイナリ: `/usr/local/bin/mando`、config: `/etc/mando/config.toml`、
+  unit: `/etc/systemd/system/mando.service`（テンプレは `deploy/mando.service`）
+- ポートは mando=8080 / enl=3610 とも >1024 → 一般ユーザで可（root 不要）
+- enl/casa が UDP・マルチキャストでデバイスと話すため、Pi とデバイスは同一 LAN に
+- 削除: `task uninstall`
+
 ## デプロイ（Docker, ホストネットワーク必須）
 
 ```bash

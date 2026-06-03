@@ -7,6 +7,10 @@ version: "3"
 vars:
   CONFIG: '{{.MANDO_CONFIG | default "config.toml"}}'
   BIN: target/release/mando
+  # systemd 常駐（ラズパイ）用の配置先。
+  BIN_DST: /usr/local/bin/mando
+  CONFIG_DIR: /etc/mando
+  UNIT: /etc/systemd/system/mando.service
 
 tasks:
   default:
@@ -84,3 +88,46 @@ tasks:
     desc: Docker Compose 停止
     cmds:
       - docker compose down
+
+  # ── systemd 常駐（ラズパイ）─────────────────────────────
+  install:
+    desc: systemd サービスとして常駐インストール（sudo 必要。Pi 上で実行）
+    deps: [build]
+    cmds:
+      - sudo install -Dm755 {{.BIN}} {{.BIN_DST}}
+      - sudo install -d {{.CONFIG_DIR}}
+      # 実 config が無ければ example を雛形配置（実 IP・EPC は要編集）。
+      - 'test -f {{.CONFIG_DIR}}/config.toml || sudo install -m644 config.example.toml {{.CONFIG_DIR}}/config.toml'
+      # テンプレートを実値へ置換して unit を配置（User は実行ユーザ）。
+      - >-
+        sed -e "s#__USER__#$(whoami)#"
+        -e "s#__BIN__#{{.BIN_DST}}#"
+        -e "s#__CONFIG__#{{.CONFIG_DIR}}/config.toml#"
+        deploy/mando.service | sudo tee {{.UNIT}} >/dev/null
+      - sudo systemctl daemon-reload
+      - sudo systemctl enable --now mando
+      - 'echo "[task] 常駐開始。{{.CONFIG_DIR}}/config.toml を実値に編集後: sudo systemctl restart mando"'
+
+  uninstall:
+    desc: systemd サービスを停止・削除（config は残す）
+    cmds:
+      - sudo systemctl disable --now mando || true
+      - sudo rm -f {{.UNIT}} {{.BIN_DST}}
+      - sudo systemctl daemon-reload
+      - 'echo "[task] 削除完了。config は {{.CONFIG_DIR}} に残置（不要なら手動削除）"'
+
+  svc-restart:
+    desc: 常駐サービスを再起動（config 変更後など）
+    cmds:
+      - sudo systemctl restart mando
+      - systemctl status mando --no-pager --lines=0
+
+  svc-status:
+    desc: 常駐サービスの状態
+    cmds:
+      - systemctl status mando --no-pager
+
+  logs:
+    desc: 常駐サービスのログを追尾（journalctl）
+    cmds:
+      - journalctl -u mando -f --no-pager

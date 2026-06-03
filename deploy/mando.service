@@ -1,0 +1,31 @@
+# mando systemd ユニット（テンプレート）。
+# `task install` が __USER__ / __BIN__ / __CONFIG__ を実値へ置換して
+# /etc/systemd/system/mando.service に配置する。手動配置でも可。
+[Unit]
+Description=mando — スマートホーム操作の Web フロント（家のリモコン）
+Documentation=https://github.com/nogu3/mando
+# LAN が上がってから起動。enl/casa が UDP/マルチキャストでデバイスと話すため。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 一般ユーザで可（mando=8080 / enl=3610 はどちらも >1024、root 不要）。
+User=__USER__
+ExecStart=__BIN__
+Environment=MANDO_CONFIG=__CONFIG__
+Environment=RUST_LOG=mando=info
+# 落ちても自動再起動（常駐の肝）。
+Restart=on-failure
+RestartSec=2
+# SIGINT で graceful shutdown する（mando は ctrl_c を待つ）。
+KillSignal=SIGINT
+TimeoutStopSec=10
+# enl/casa を subprocess で exec するので隔離は最小限に留める
+# （ネットワーク・マルチキャストを塞がない）。
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
