@@ -15,6 +15,9 @@ User=__USER__
 ExecStart=__BIN__
 Environment=MANDO_CONFIG=__CONFIG__
 Environment=RUST_LOG=mando=info
+# enl/casa を PATH から探す。cargo install 先 (~/.cargo/bin) は systemd の
+# 既定 PATH に無いので明示する。install 時に実ユーザの home へ置換。
+Environment=PATH=__CARGO_BIN__:/usr/local/bin:/usr/bin:/bin
 # 落ちても自動再起動（常駐の肝）。
 Restart=on-failure
 RestartSec=2

@@ -99,10 +99,12 @@ tasks:
       # 実 config が無ければ example を雛形配置（実 IP・EPC は要編集）。
       - 'test -f {{.CONFIG_DIR}}/config.toml || sudo install -m644 config.example.toml {{.CONFIG_DIR}}/config.toml'
       # テンプレートを実値へ置換して unit を配置（User は実行ユーザ）。
+      # __CARGO_BIN__ は実ユーザ home の ~/.cargo/bin（enl の cargo install 先）。
       - >-
         sed -e "s#__USER__#$(whoami)#"
         -e "s#__BIN__#{{.BIN_DST}}#"
         -e "s#__CONFIG__#{{.CONFIG_DIR}}/config.toml#"
+        -e "s#__CARGO_BIN__#$(getent passwd $(whoami) | cut -d: -f6)/.cargo/bin#"
         deploy/mando.service | sudo tee {{.UNIT}} >/dev/null
       - sudo systemctl daemon-reload
       - sudo systemctl enable --now mando
