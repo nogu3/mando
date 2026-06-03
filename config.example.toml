@@ -14,7 +14,7 @@ bind = "0.0.0.0:8080"
 
 [[device]]
 name      = "shutter"        # URL とフロントが使う安定識別子（変えると URL が変わる）
-label     = "シャッター"     # UI 表示名（任意。未指定なら name）
+alias     = "シャッター"     # UI 表示名（任意。未指定なら name。`label` でも可）
 # 実値（IP・open/close の hex・open_close_state の値域）は機種で振れる。
 # 投入前に `enl describe <IP> 026301` で確認すること。電動シャッターは 0x0263。
 # IP は RFC 5737 のドキュメント用レンジ（192.0.2.0/24）。実 IP に置き換える。

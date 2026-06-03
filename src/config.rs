@@ -23,8 +23,8 @@ fn default_bind() -> String {
 pub struct Device {
     /// 論理名。URL とフロントが使う安定識別子。
     pub name: String,
-    /// 表示名（任意）。未指定なら name。
-    #[serde(default)]
+    /// 表示名（任意）。未指定なら name。config では `label` でも `alias` でも書ける。
+    #[serde(default, alias = "alias")]
     pub label: Option<String>,
     /// 状態取得コマンド。例: ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
     pub get_state: Vec<String>,
@@ -145,6 +145,24 @@ mod tests {
     fn rejects_empty() {
         let p = write_tmp("empty", "bind = \"0.0.0.0:8080\"\n");
         assert!(matches!(Config::load(&p), Err(ConfigError::Empty)));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn alias_key_works_as_label() {
+        let p = write_tmp(
+            "alias",
+            r#"
+            [[device]]
+            name = "shutter1"
+            alias = "リビング"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("shutter1").unwrap().label(), "リビング");
         std::fs::remove_file(p).ok();
     }
 
