@@ -32,11 +32,19 @@ pub struct Device {
     pub open: Vec<String>,
     /// close コマンド。
     pub close: Vec<String>,
+    /// stop コマンド（任意）。電動シャッター等の途中停止。未指定なら UI に停止ボタンを出さない。
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
 }
 
 impl Device {
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// stop に対応していれば、その exec コマンドを返す。
+    pub fn stop_cmd(&self) -> Option<&[String]> {
+        self.stop.as_deref()
     }
 }
 
@@ -86,6 +94,10 @@ impl Config {
                 return Err(ConfigError::DuplicateName(d.name.clone()));
             }
             if d.get_state.is_empty() || d.open.is_empty() || d.close.is_empty() {
+                return Err(ConfigError::EmptyCommand(d.name.clone()));
+            }
+            // stop は任意だが、指定するなら空配列は不可。
+            if d.stop.as_ref().is_some_and(|s| s.is_empty()) {
                 return Err(ConfigError::EmptyCommand(d.name.clone()));
             }
         }
@@ -144,7 +156,48 @@ mod tests {
             get_state: vec!["a".into()],
             open: vec!["a".into()],
             close: vec!["a".into()],
+            stop: None,
         };
         assert_eq!(d.label(), "x");
+        assert!(d.stop_cmd().is_none());
+    }
+
+    #[test]
+    fn stop_optional_and_parsed() {
+        let p = write_tmp(
+            "stop",
+            r#"
+            [[device]]
+            name = "shutter"
+            get_state = ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
+            open = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "close"]
+            stop = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("shutter").unwrap();
+        assert_eq!(d.stop_cmd().unwrap().last().unwrap(), "stop");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn rejects_empty_stop() {
+        let p = write_tmp(
+            "emptystop",
+            r#"
+            [[device]]
+            name = "shutter"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            stop = []
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
+        std::fs::remove_file(p).ok();
     }
 }

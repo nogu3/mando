@@ -15,6 +15,7 @@
     --open: #2e7d32;
     --closed: #b0480f;
     --unknown: #5a6170;
+    --stop: #5a6170;
     --warn: #b3261e;
     --tap: 0.08s ease;
   }
@@ -65,6 +66,8 @@
   }
   button.open  { background: var(--open); }
   button.close { background: var(--closed); }
+  /* stop は全幅で開閉の下に。途中停止は補助操作なので一段下げる。 */
+  button.stop  { grid-column: 1 / -1; background: var(--stop); min-height: 60px; }
   button.act:active:not(:disabled) { transform: scale(.97); filter: brightness(1.12); }
   button.act:disabled { opacity: .5; cursor: progress; }
 
@@ -140,6 +143,14 @@ function buildCard(dev) {
     <div class="busy"></div>
   `;
   el.querySelector(".name").textContent = dev.label;
+  // stop 対応デバイスのみ停止ボタンを足す（API の stop フラグで判断）。
+  if (dev.stop) {
+    const stopBtn = document.createElement("button");
+    stopBtn.className = "act stop";
+    stopBtn.dataset.op = "stop";
+    stopBtn.textContent = "止める";
+    el.querySelector(".controls").appendChild(stopBtn);
+  }
   const statusEl = el.querySelector(".status");
   const c = {
     el,
@@ -180,7 +191,8 @@ let busyCount = 0; // 操作中はポーリングを止め、3610 の取り合�
 
 async function act(name, op) {
   busyCount++;
-  setBusy(name, true, op === "open" ? "開けています…" : "閉めています…");
+  const verb = { open: "開けています…", close: "閉めています…", stop: "止めています…" }[op] || "実行中…";
+  setBusy(name, true, verb);
   try {
     // set → 直後に state 再取得済みのレスポンスが返る（楽観表示しない）。
     const view = await api("POST", `/api/devices/${encodeURIComponent(name)}/${op}`);

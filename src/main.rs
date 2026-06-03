@@ -71,6 +71,7 @@ async fn main() {
         .route("/api/devices/:name/state", get(get_state))
         .route("/api/devices/:name/open", post(open_device))
         .route("/api/devices/:name/close", post(close_device))
+        .route("/api/devices/:name/stop", post(stop_device))
         .with_state(app);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -100,6 +101,8 @@ async fn index() -> Html<&'static str> {
 struct DeviceInfo {
     name: String,
     label: String,
+    /// stop 操作に対応しているか（UI が停止ボタンを出すか判断する）。
+    stop: bool,
 }
 
 async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
@@ -110,6 +113,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
         .map(|d| DeviceInfo {
             name: d.name.clone(),
             label: d.label().to_string(),
+            stop: d.stop_cmd().is_some(),
         })
         .collect();
     Json(devices)
@@ -212,6 +216,28 @@ async fn close_device(State(app): State<Shared>, Path(name): Path<String>) -> Re
             let cmd = device.close.clone();
             Json(run_action(&app, device, &cmd).await).into_response()
         }
+        None => not_found(&name),
+    }
+}
+
+async fn stop_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    match app.config.find(&name) {
+        Some(device) => match device.stop_cmd() {
+            Some(cmd) => {
+                let cmd = cmd.to_vec();
+                Json(run_action(&app, device, &cmd).await).into_response()
+            }
+            // stop 非対応のデバイス。
+            None => (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "application/json")],
+                format!(
+                    "{{\"error\":\"stop unsupported\",\"name\":{}}}",
+                    json_str(&name)
+                ),
+            )
+                .into_response(),
+        },
         None => not_found(&name),
     }
 }
