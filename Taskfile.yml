@@ -126,6 +126,16 @@ tasks:
       - sudo systemctl daemon-reload
       - 'echo "[task] 削除完了。config は {{.CONFIG_DIR}} に残置（不要なら手動削除）"'
 
+  update:
+    desc: git pull → 再ビルド → バイナリ更新 → 再起動（デプロイ反映。index.html 変更もこれで反映）
+    cmds:
+      # pull 後にビルドする順序が肝。先にビルドすると古いソースを焼き込む。
+      - git pull --ff-only
+      - cargo build --release
+      - sudo install -Dm755 {{.BIN}} {{.BIN_DST}}
+      - sudo systemctl restart mando
+      - systemctl status mando --no-pager --lines=0
+
   reload:
     desc: 常駐サービスを再起動して config を反映（config 変更後）
     cmds:
