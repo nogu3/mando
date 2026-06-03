@@ -96,8 +96,16 @@ tasks:
     cmds:
       - sudo install -Dm755 {{.BIN}} {{.BIN_DST}}
       - sudo install -d {{.CONFIG_DIR}}
-      # 実 config が無ければ example を雛形配置（実 IP・EPC は要編集）。
-      - 'test -f {{.CONFIG_DIR}}/config.toml || sudo install -m644 config.example.toml {{.CONFIG_DIR}}/config.toml'
+      # 既存の /etc 設定は上書きしない。無ければローカル config.toml を、
+      # それも無ければ example を雛形として配置（実 IP・EPC は要編集）。
+      - |
+        if [ ! -f {{.CONFIG_DIR}}/config.toml ]; then
+          if [ -f {{.CONFIG}} ]; then
+            sudo install -m644 {{.CONFIG}} {{.CONFIG_DIR}}/config.toml
+          else
+            sudo install -m644 config.example.toml {{.CONFIG_DIR}}/config.toml
+          fi
+        fi
       # テンプレートを実値へ置換して unit を配置（User は実行ユーザ）。
       # __CARGO_BIN__ は実ユーザ home の ~/.cargo/bin（enl の cargo install 先）。
       - >-
