@@ -44,7 +44,7 @@ Pi 上で常駐させる正攻法。自動起動・異常時再起動・ログ�
 # Pi 上で（要 git/cargo。enl も Pi の PATH に置くか config を絶対パスに）
 task install        # ビルド → /usr/local/bin/mando、unit 配置、enable --now
 sudo nano /etc/mando/config.toml   # 実 IP・EPC を編集
-task svc-restart    # 反映
+task reload    # 反映
 task logs           # ログ追尾（journalctl -u mando -f）
 ```
 

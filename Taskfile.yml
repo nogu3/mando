@@ -116,8 +116,8 @@ tasks:
       - sudo systemctl daemon-reload
       - 'echo "[task] 削除完了。config は {{.CONFIG_DIR}} に残置（不要なら手動削除）"'
 
-  svc-restart:
-    desc: 常駐サービスを再起動（config 変更後など）
+  reload:
+    desc: 常駐サービスを再起動して config を反映（config 変更後）
     cmds:
       - sudo systemctl restart mando
       - systemctl status mando --no-pager --lines=0
