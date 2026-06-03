@@ -17,11 +17,14 @@ pub enum State {
 
 /// enl の get 出力 JSON を正規化する。
 ///
-/// enl は `{ "properties": [ { "name": "open_close_state", "value": ... } ] }`
-/// の形で返す。`value` から開閉を判定する。スキーマや値が想定外なら Unknown。
+/// enl の実出力例:
+/// `{"eoj":"026301","esv":"GetRes",...,"properties":[
+///    {"epc":"EA","name":"open_close_state","value":{"state":"fully_closed"}}]}`
+/// → `value.state` から開閉を判定する。スキーマや値が想定外なら Unknown。
 ///
-/// 値の表現は機種で振れる（ECHONET Lite open_close_state EDT 0x41=open / 0x42=closed が
-/// 代表だが、enl が文字列 "open"/"closed" に正規化して返すこともある）。両対応する。
+/// 値の表現は機種・バックエンドで振れるので幅広く受ける:
+/// オブジェクト `{"state": "fully_closed"}`、文字列 "open"/"closed"、数値 EDT
+/// (0x41=open / 0x42=closed) のいずれにも対応する。
 pub fn normalize_enl_state(raw: &Value) -> State {
     let Some(props) = raw.get("properties").and_then(Value::as_array) else {
         return State::Unknown;
@@ -53,9 +56,11 @@ fn classify(value: &Value) -> State {
             Some(0x42) => State::Closed,
             _ => State::Unknown,
         },
-        // ネスト: { "open_close_state": "open" } のような形にも一応対応。
+        // enl の実形式: value = { "state": "fully_closed" }。
+        // 後方互換で "open_close_state" キーも見る。
         Value::Object(o) => o
-            .get("open_close_state")
+            .get("state")
+            .or_else(|| o.get("open_close_state"))
             .map(classify)
             .unwrap_or(State::Unknown),
         _ => State::Unknown,
@@ -66,6 +71,8 @@ fn classify_str(s: &str) -> State {
     match s.trim().to_ascii_lowercase().as_str() {
         "open" | "fully_open" | "0x41" | "41" => State::Open,
         "closed" | "close" | "fully_closed" | "0x42" | "42" => State::Closed,
+        // opening(0x43) / closing(0x44) は動作中。open/closed に確定していないので
+        // unknown を返す（楽観表示しない。ポーリングで確定すれば open/closed に変わる）。
         _ => State::Unknown,
     }
 }
@@ -104,6 +111,30 @@ mod tests {
             {"name":"open_close_state","value":"open"}
         ]});
         assert_eq!(normalize_enl_state(&raw), State::Open);
+    }
+
+    #[test]
+    fn real_enl_format() {
+        // enl の実出力: value はオブジェクト {"state": "fully_closed"}。
+        let raw = json!({
+            "eoj":"026301","esv":"GetRes","ip":"192.168.1.222",
+            "properties":[{"edt_hex":"42","epc":"EA","name":"open_close_state","pdc":1,
+                           "value":{"state":"fully_closed"}}]
+        });
+        assert_eq!(normalize_enl_state(&raw), State::Closed);
+
+        let raw =
+            json!({"properties":[{"name":"open_close_state","value":{"state":"fully_open"}}]});
+        assert_eq!(normalize_enl_state(&raw), State::Open);
+    }
+
+    #[test]
+    fn transitional_is_unknown() {
+        // opening / closing は動作中 → unknown（確定していない）。
+        let raw = json!({"properties":[{"name":"open_close_state","value":{"state":"opening"}}]});
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+        let raw = json!({"properties":[{"name":"open_close_state","value":{"state":"closing"}}]});
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
     }
 
     #[test]
