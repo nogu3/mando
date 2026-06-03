@@ -10,8 +10,17 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
+    /// 0x41 fully_open
     Open,
+    /// 0x42 fully_closed
     Closed,
+    /// 0x43 opening（開動作中）
+    Opening,
+    /// 0x44 closing（閉動作中）
+    Closing,
+    /// 0x45 stopped_midway（途中停止）
+    Stopped,
+    /// スキーマ・値が想定外。
     Unknown,
 }
 
@@ -51,9 +60,12 @@ fn classify(value: &Value) -> State {
     match value {
         Value::String(s) => classify_str(s),
         Value::Number(n) => match n.as_i64() {
-            // ECHONET Lite open_close_state: 0x41 = 全開, 0x42 = 全閉。
+            // ECHONET Lite open_close_state EDT。
             Some(0x41) => State::Open,
             Some(0x42) => State::Closed,
+            Some(0x43) => State::Opening,
+            Some(0x44) => State::Closing,
+            Some(0x45) => State::Stopped,
             _ => State::Unknown,
         },
         // enl の実形式: value = { "state": "fully_closed" }。
@@ -71,8 +83,9 @@ fn classify_str(s: &str) -> State {
     match s.trim().to_ascii_lowercase().as_str() {
         "open" | "fully_open" | "0x41" | "41" => State::Open,
         "closed" | "close" | "fully_closed" | "0x42" | "42" => State::Closed,
-        // opening(0x43) / closing(0x44) は動作中。open/closed に確定していないので
-        // unknown を返す（楽観表示しない。ポーリングで確定すれば open/closed に変わる）。
+        "opening" | "0x43" | "43" => State::Opening,
+        "closing" | "0x44" | "44" => State::Closing,
+        "stopped" | "stopped_midway" | "0x45" | "45" => State::Stopped,
         _ => State::Unknown,
     }
 }
@@ -129,12 +142,32 @@ mod tests {
     }
 
     #[test]
-    fn transitional_is_unknown() {
-        // opening / closing は動作中 → unknown（確定していない）。
-        let raw = json!({"properties":[{"name":"open_close_state","value":{"state":"opening"}}]});
-        assert_eq!(normalize_enl_state(&raw), State::Unknown);
-        let raw = json!({"properties":[{"name":"open_close_state","value":{"state":"closing"}}]});
-        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    fn all_five_states() {
+        let cases = [
+            ("fully_open", State::Open),
+            ("fully_closed", State::Closed),
+            ("opening", State::Opening),
+            ("closing", State::Closing),
+            ("stopped_midway", State::Stopped),
+        ];
+        for (s, want) in cases {
+            let raw = json!({"properties":[{"name":"open_close_state","value":{"state":s}}]});
+            assert_eq!(normalize_enl_state(&raw), want, "state={s}");
+        }
+    }
+
+    #[test]
+    fn numeric_edt_all() {
+        for (edt, want) in [
+            (0x41, State::Open),
+            (0x42, State::Closed),
+            (0x43, State::Opening),
+            (0x44, State::Closing),
+            (0x45, State::Stopped),
+        ] {
+            let raw = json!({"properties":[{"name":"open_close_state","value":edt}]});
+            assert_eq!(normalize_enl_state(&raw), want, "edt={edt:#x}");
+        }
     }
 
     #[test]
