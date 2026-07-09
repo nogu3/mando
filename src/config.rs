@@ -25,6 +25,10 @@ pub struct Preset {
     /// UI 表示名（任意）。未指定なら name。
     #[serde(default, alias = "alias")]
     pub label: Option<String>,
+    /// UI の色玉スウォッチ用 CSS color（任意）。未指定はテキストチップ表示。
+    /// 形式検証はしない — config を書けるのは設置者本人のみ。
+    #[serde(default)]
+    pub color: Option<String>,
     /// exec するコマンド配列。
     pub cmd: Vec<String>,
 }
@@ -327,7 +331,7 @@ mod tests {
     fn loads_valid_config() {
         let p = write_tmp(
             "valid",
-            r#"
+            r##"
             bind = "127.0.0.1:9999"
             [[device]]
             name = "shutter"
@@ -335,7 +339,7 @@ mod tests {
             get_state = ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
             open = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "close"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:9999");
@@ -355,14 +359,14 @@ mod tests {
     fn alias_key_works_as_label() {
         let p = write_tmp(
             "alias",
-            r#"
+            r##"
             [[device]]
             name = "shutter1"
             alias = "リビング"
             get_state = ["enl", "get", "x", "026301", "open_close_state"]
             open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.find("shutter1").unwrap().label(), "リビング");
@@ -373,7 +377,7 @@ mod tests {
     fn group_parsed_and_validated() {
         let p = write_tmp(
             "group",
-            r#"
+            r##"
             [[device]]
             name = "s1"
             get_state = ["enl","get","x","026301","open_close_state"]
@@ -388,7 +392,7 @@ mod tests {
             name = "all"
             alias = "全部"
             members = ["s1","s2"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         let g = cfg.find_group("all").unwrap();
@@ -401,7 +405,7 @@ mod tests {
     fn group_rejects_unknown_member() {
         let p = write_tmp(
             "badgroup",
-            r#"
+            r##"
             [[device]]
             name = "s1"
             get_state = ["enl","get","x","026301","open_close_state"]
@@ -410,7 +414,7 @@ mod tests {
             [[group]]
             name = "all"
             members = ["s1","ghost"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -423,7 +427,7 @@ mod tests {
     fn light_device_parses() {
         let p = write_tmp(
             "light",
-            r#"
+            r##"
             [[device]]
             name  = "living_lights"
             alias = "リビング照明"
@@ -434,11 +438,12 @@ mod tests {
             [[device.preset]]
             name  = "warm"
             label = "電球色"
+            color = "#ffd9a0"
             cmd   = ["mat", "color-temp", "--node", "5", "--kelvin", "2700"]
             [[device.preset]]
             name  = "pink"
             cmd   = ["mat", "color", "--node", "5", "--name", "pink"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         let d = cfg.find("living_lights").unwrap();
@@ -450,6 +455,8 @@ mod tests {
         assert!(d.preset_cmd("nope").is_none());
         assert_eq!(d.presets[0].label(), "電球色");
         assert_eq!(d.presets[1].label(), "pink"); // label 未指定は name
+        assert_eq!(d.presets[0].color.as_deref(), Some("#ffd9a0"));
+        assert_eq!(d.presets[1].color, None); // color 未指定は None
         std::fs::remove_file(p).ok();
     }
 
@@ -457,13 +464,13 @@ mod tests {
     fn default_kind_is_shutter() {
         let p = write_tmp(
             "defkind",
-            r#"
+            r##"
             [[device]]
             name = "shutter"
             get_state = ["enl", "get", "x", "026301", "open_close_state"]
             open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.find("shutter").unwrap().kind, Kind::Shutter);
@@ -474,13 +481,13 @@ mod tests {
     fn light_requires_on_off() {
         let p = write_tmp(
             "lightreq",
-            r#"
+            r##"
             [[device]]
             name = "l1"
             kind = "light"
             get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
             on = ["mat", "on", "--node", "5"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -493,7 +500,7 @@ mod tests {
     fn light_rejects_shutter_fields() {
         let p = write_tmp(
             "lightforbid",
-            r#"
+            r##"
             [[device]]
             name = "l1"
             kind = "light"
@@ -501,7 +508,7 @@ mod tests {
             on = ["mat", "on", "--node", "5"]
             off = ["mat", "off", "--node", "5"]
             open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -514,14 +521,14 @@ mod tests {
     fn shutter_rejects_light_fields() {
         let p = write_tmp(
             "shutterforbid",
-            r#"
+            r##"
             [[device]]
             name = "s1"
             get_state = ["enl", "get", "x", "026301", "open_close_state"]
             open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
             on = ["mat", "on", "--node", "5"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -534,7 +541,7 @@ mod tests {
     fn preset_duplicate_name_rejected() {
         let p = write_tmp(
             "presetdup",
-            r#"
+            r##"
             [[device]]
             name = "l1"
             kind = "light"
@@ -547,7 +554,7 @@ mod tests {
             [[device.preset]]
             name = "warm"
             cmd = ["mat", "color-temp", "--node", "5", "--kelvin", "3000"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -560,7 +567,7 @@ mod tests {
     fn preset_empty_cmd_rejected() {
         let p = write_tmp(
             "presetempty",
-            r#"
+            r##"
             [[device]]
             name = "l1"
             kind = "light"
@@ -570,7 +577,7 @@ mod tests {
             [[device.preset]]
             name = "warm"
             cmd = []
-            "#,
+            "##,
         );
         assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
         std::fs::remove_file(p).ok();
@@ -580,7 +587,7 @@ mod tests {
     fn light_in_group_rejected() {
         let p = write_tmp(
             "lightgroup",
-            r#"
+            r##"
             [[device]]
             name = "s1"
             get_state = ["enl", "get", "x", "026301", "open_close_state"]
@@ -595,7 +602,7 @@ mod tests {
             [[group]]
             name = "all"
             members = ["s1", "l1"]
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),
@@ -626,14 +633,14 @@ mod tests {
     fn stop_optional_and_parsed() {
         let p = write_tmp(
             "stop",
-            r#"
+            r##"
             [[device]]
             name = "shutter"
             get_state = ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
             open = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "close"]
             stop = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop"]
-            "#,
+            "##,
         );
         let cfg = Config::load(&p).unwrap();
         let d = cfg.find("shutter").unwrap();
@@ -645,14 +652,14 @@ mod tests {
     fn rejects_empty_stop() {
         let p = write_tmp(
             "emptystop",
-            r#"
+            r##"
             [[device]]
             name = "shutter"
             get_state = ["enl", "get", "x", "026301", "open_close_state"]
             open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
             close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
             stop = []
-            "#,
+            "##,
         );
         assert!(matches!(
             Config::load(&p),

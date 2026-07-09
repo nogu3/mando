@@ -113,6 +113,8 @@ async fn index() -> Html<&'static str> {
 struct PresetInfo {
     name: String,
     label: String,
+    /// 色玉スウォッチ用 CSS color。None なら UI はテキストチップで出す。
+    color: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +144,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
                 .map(|p| PresetInfo {
                     name: p.name.clone(),
                     label: p.label().to_string(),
+                    color: p.color.clone(),
                 })
                 .collect(),
         })
@@ -470,7 +473,7 @@ mod tests {
     /// get_state は mat read / enl の実出力形式を printf で返す。
     fn test_app() -> Shared {
         let cfg: Config = toml::from_str(
-            r#"
+            r##"
             [[device]]
             name = "light"
             kind = "light"
@@ -480,13 +483,14 @@ mod tests {
             [[device.preset]]
             name  = "warm"
             label = "電球色"
+            color = "#ffd9a0"
             cmd   = ["sh", "-c", "printf '{}'"]
             [[device]]
             name = "shutter"
             get_state = ["sh", "-c", "printf '{\"properties\":[{\"name\":\"open_close_state\",\"value\":\"open\"}]}'"]
             open  = ["sh", "-c", "printf '{}'"]
             close = ["sh", "-c", "printf '{}'"]
-            "#,
+            "##,
         )
         .unwrap();
         Arc::new(App {
@@ -521,6 +525,7 @@ mod tests {
         assert_eq!(light["kind"], "light");
         assert_eq!(light["presets"][0]["name"], "warm");
         assert_eq!(light["presets"][0]["label"], "電球色");
+        assert_eq!(light["presets"][0]["color"], "#ffd9a0");
         let sh = arr.iter().find(|d| d["name"] == "shutter").unwrap();
         assert_eq!(sh["kind"], "shutter");
         assert_eq!(sh["presets"].as_array().unwrap().len(), 0);
