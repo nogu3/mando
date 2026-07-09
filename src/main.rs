@@ -233,6 +233,29 @@ async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
     }
 }
 
+/// light の set 結果。state は同梱しない — UI が押下 ~2 秒後に 1 回だけ
+/// 追いつき取得する（設計原則 7 の light 例外。shutter は run_action を維持）。
+#[derive(Serialize)]
+struct LightActionView {
+    action: ExecOutcome,
+}
+
+/// exec のみ実行して送信結果を返す（state 再取得なし）。light 用。
+async fn run_light_action(app: &App, device: &Device, cmd: &[String]) -> LightActionView {
+    let result = app.executor.run(cmd).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::warn!(
+            device = %device.name,
+            outcome = ?result.outcome,
+            stderr = %result.stderr.trim(),
+            "set 非成功"
+        );
+    }
+    LightActionView {
+        action: result.outcome,
+    }
+}
+
 /// 操作の種類。
 #[derive(Clone, Copy)]
 enum Op {
@@ -274,7 +297,7 @@ async fn off_device(State(app): State<Shared>, Path(name): Path<String>) -> Resp
     device_op(&app, &name, Op::Off).await
 }
 
-/// 名前付きプリセット exec → state 再取得（設計原則 7）。
+/// 名前付きプリセット exec → 送信結果のみ返す（light 例外: state は UI が追いつき取得）。
 async fn preset_device(
     State(app): State<Shared>,
     Path((name, preset)): Path<(String, String)>,
@@ -283,7 +306,8 @@ async fn preset_device(
         return not_found(&name);
     };
     match device.preset_cmd(&preset) {
-        Some(cmd) => Json(run_action(&app, device, cmd).await).into_response(),
+        // preset は light 専用（config 検証済み）なので exec 結果のみ返す。
+        Some(cmd) => Json(run_light_action(&app, device, cmd).await).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
@@ -302,6 +326,10 @@ async fn device_op(app: &App, name: &str, op: Op) -> Response {
         return not_found(name);
     };
     match device_cmd(device, op) {
+        // light は exec 結果のみ返す（state は UI が非同期に追いつき取得）。
+        Some(cmd) if device.kind == Kind::Light => {
+            Json(run_light_action(app, device, &cmd).await).into_response()
+        }
         Some(cmd) => Json(run_action(app, device, &cmd).await).into_response(),
         // この kind では対応しない操作。
         None => (
@@ -513,20 +541,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn light_on_returns_confirmed_state() {
+    async fn light_on_returns_action_only() {
         let (st, v) = call("POST", "/api/devices/light/on").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "success");
-        // 楽観表示ではなく再取得した確定値。
-        assert_eq!(v["state"], "on");
+        // 非同期確認: state は同梱しない（UI が後で 1 回だけ GET state する）。
+        assert!(v.get("state").is_none());
+        assert!(v.get("exec").is_none());
+        assert!(v.get("raw").is_none());
     }
 
     #[tokio::test]
-    async fn preset_runs_and_confirms_state() {
+    async fn preset_returns_action_only() {
         let (st, v) = call("POST", "/api/devices/light/presets/warm").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "success");
-        assert_eq!(v["state"], "on");
+        assert!(v.get("state").is_none());
+    }
+
+    #[tokio::test]
+    async fn shutter_open_still_returns_confirmed_state() {
+        let (st, v) = call("POST", "/api/devices/shutter/open").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        // 設計原則 7: shutter は set 後の同期確認を維持。
+        assert_eq!(v["state"], "open");
     }
 
     #[tokio::test]
