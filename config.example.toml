@@ -74,3 +74,14 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # 注意: light はグループ（[[group]] members）に入れられない（当面シャッター専用）。
 # 注意: light は定期ポーリングしない（mat 直叩きは 1 コール数秒 + exec 直列のため）。
 #       表示時 1 回 + 操作後の確定表示のみ。
+#
+# ── mat の wire group（groupcast）でまとめて操作する場合 ──────────────
+# group は無応答マルチキャストで state を読めないため、get_state は代表ノード
+# 1 台の on/off を読む。groupcast が届く前に確認読みすると古い状態を拾うので、
+# sh ラッパーで 0.5 秒待ってから読むのが実運用の型（下例）。
+# 応答を速くするには matd を常駐させる（mando の unit に MAT_MATD_SOCKET を
+# 教える。matd 無しだと 1 コールごとに chip-tool 起動 + CASE 確立で数秒かかる）。
+# get_state = ["sh", "-c", "sleep 0.5; exec mat read --node 5 --cluster onoff --attribute on-off"]
+# on    = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "on"]
+# off   = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "off"]
+# （preset も同様に ["mat", "group", "color-temp", "--group", "10", "--kelvin", "2700"] 等）
