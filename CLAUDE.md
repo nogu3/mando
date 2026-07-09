@@ -50,6 +50,13 @@
    | 4 | device rejected (SNA) | 「機器が拒否」 |
    | 5 | network/bind failure | 「ネットワーク異常」 |
 
+   > **light の例外:** light（特に mat wire group の groupcast）は無応答マルチキャストで、
+   > 確認読み自体が代表ノード 1 台のプロキシ読みにすぎず確認として弱い。操作 POST は
+   > 送信結果（`{"action": ...}`）のみ正直に返し、state は UI が押下 ~2 秒後に 1 回だけ
+   > 非同期で追いつき取得するベストエフォート表示とする
+   > （`docs/superpowers/specs/2026-07-10-light-async-state-design.md`）。
+   > shutter は本原則どおり set 後の同期確認を維持する。
+
 8. **`index.html` はバイナリに焼く（`include_str!`）、config は外に置く。** UI はプログラムの一部なので焼き込み、単一バイナリで配る。実 IP / EPC は設置環境ごとのデプロイデータで、再コンパイルなしに書き換えられるべき＝外出し。`casa` の「設定は外」原則とも揃う。成果物は **バイナリ 1 個 + `config.toml`**。
 
 ---
