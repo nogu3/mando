@@ -192,6 +192,7 @@ const VERB = {
 };
 
 const POLL_MS = 4000; // 3〜5 秒ポーリング（状態は pull）。
+const LIGHT_CATCHUP_MS = 2000; // light: 操作後に 1 回だけ state を追いつき取得するまでの待ち。
 
 const app = document.getElementById("app");
 const cards = new Map();  // device name -> {statusEl, labelEl, msgEl, buttons, state}
@@ -319,6 +320,7 @@ function buildLightCard(dev) {
     msgEl: el.querySelector(".status .msg"),
     buttons: [...el.querySelectorAll("button")], // act + chip 全部を busy 対象に
     state: "unknown",
+    catchupTimer: null, // 追いつき取得タイマー（device ごとに 1 本、連打時は張り直し）
   };
   for (const btn of el.querySelectorAll("button.act")) {
     btn.addEventListener("click", () => deviceAct(dev.name, btn.dataset.op));
@@ -327,26 +329,57 @@ function buildLightCard(dev) {
   return el;
 }
 
-/* ── プリセット実行 ─────────────────────────────── */
+/* ── プリセット実行（light 専用）───────────────────── */
 async function presetAct(name, preset) {
+  return lightAct(
+    name,
+    VERB.preset,
+    `/api/devices/${encodeURIComponent(name)}/presets/${encodeURIComponent(preset)}`
+  );
+}
+
+/* ── light 操作: POST は送信結果のみ。state は ~2 秒後に 1 回だけ追いつき取得 ── */
+async function lightAct(name, verb, path) {
+  const c = cards.get(name);
   busyCount++;
   setDeviceBusy(name, true);
-  const c = cards.get(name);
-  if (c) c.msgEl.textContent = VERB.preset;
+  if (c) c.msgEl.textContent = verb;
   try {
-    const view = await api(
-      "POST",
-      `/api/devices/${encodeURIComponent(name)}/presets/${encodeURIComponent(preset)}`
-    );
-    renderState(name, view);
+    const view = await api("POST", path);
     const am = ACTION_MSG[view.action] || "";
-    if (am) { c.msgEl.textContent = "⚠ " + am; c.statusEl.classList.add("error"); }
+    if (am) {
+      c.msgEl.textContent = "⚠ " + am;
+      c.statusEl.classList.add("error");
+    } else {
+      // 成功 = 送信できただけ。中間表示にして追いつき取得を予約する。
+      c.statusEl.classList.remove("error");
+      c.msgEl.textContent = "";
+      c.labelEl.textContent = "反映中…";
+      scheduleLightCatchup(name);
+    }
   } catch (e) {
     if (c) { c.msgEl.textContent = "⚠ 通信エラー"; c.statusEl.classList.add("error"); }
   } finally {
     setDeviceBusy(name, false);
     busyCount--;
   }
+}
+
+function scheduleLightCatchup(name) {
+  const c = cards.get(name);
+  if (!c) return;
+  if (c.catchupTimer) clearTimeout(c.catchupTimer); // 連打時は張り直し
+  c.catchupTimer = setTimeout(async () => {
+    c.catchupTimer = null;
+    // busy（連打中・一括操作中）なら取得をスキップ。ベストエフォート表示でよい。
+    if (c.buttons.some((b) => b.disabled)) return;
+    try {
+      const view = await api("GET", `/api/devices/${encodeURIComponent(name)}/state`);
+      renderState(name, view);
+    } catch (e) {
+      // 外れていても次の操作 or ページ再表示で直る。
+    }
+  }, LIGHT_CATCHUP_MS);
 }
 
 function renderState(name, view) {
@@ -373,9 +406,12 @@ function setAllButtonsDisabled(disabled) {
 
 /* ── 単一デバイス操作 ───────────────────────────── */
 async function deviceAct(name, op) {
+  const c = cards.get(name);
+  if (c && c.kind === "light") {
+    return lightAct(name, VERB[op] || "実行中…", `/api/devices/${encodeURIComponent(name)}/${op}`);
+  }
   busyCount++;
   setDeviceBusy(name, true);
-  const c = cards.get(name);
   if (c) c.msgEl.textContent = VERB[op] || "実行中…";
   try {
     const view = await api("POST", `/api/devices/${encodeURIComponent(name)}/${op}`);
