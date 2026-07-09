@@ -15,9 +15,12 @@ User=__USER__
 ExecStart=__BIN__
 Environment=MANDO_CONFIG=__CONFIG__
 Environment=RUST_LOG=mando=info
-# enl/casa を PATH から探す。cargo install 先 (~/.cargo/bin) は systemd の
+# enl/casa/mat を PATH から探す。cargo install 先 (~/.cargo/bin) と
+# ユーザローカル (~/.local/bin, mat/chip-tool の置き場) は systemd の
 # 既定 PATH に無いので明示する。install 時に実ユーザの home へ置換。
-Environment=PATH=__CARGO_BIN__:/usr/local/bin:/usr/bin:/bin
+# mat は子プロセスの chip-tool も PATH から探すため、ここに無いと
+# config で mat を絶対パス指定しても child_not_found で失敗する。
+Environment=PATH=__HOME__/.cargo/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 # 落ちても自動再起動（常駐の肝）。
 Restart=on-failure
 RestartSec=2
