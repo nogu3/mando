@@ -126,6 +126,18 @@ tasks:
       - sudo systemctl daemon-reload
       - 'echo "[task] 削除完了。config は {{.CONFIG_DIR}} に残置（不要なら手動削除）"'
 
+  deploy:
+    desc: "開発機でクロスビルド → リモートへ転送 → 再起動（例: task deploy / task deploy HOST=jarvis）"
+    vars:
+      HOST: '{{.HOST | default "jarvis"}}'
+      TARGET: '{{.TARGET | default "aarch64-unknown-linux-musl"}}'
+      CROSS_BIN: "target/{{.TARGET}}/release/mando"
+    cmds:
+      # musl 静的リンクなので実機の glibc に依存しない。cross は docker を使う。
+      - cross build --release --target {{.TARGET}}
+      - scp {{.CROSS_BIN}} {{.HOST}}:/tmp/mando.new
+      - ssh {{.HOST}} 'sudo install -m755 /tmp/mando.new {{.BIN_DST}} && rm -f /tmp/mando.new && sudo systemctl restart mando && systemctl status mando --no-pager --lines=0'
+
   update:
     desc: git pull → 再ビルド → バイナリ更新 → 再起動（デプロイ反映。index.html 変更もこれで反映）
     cmds:
