@@ -215,8 +215,8 @@ enum Op {
 /// device の該当操作コマンドを返す。stop 非対応なら None。
 fn device_cmd(device: &Device, op: Op) -> Option<Vec<String>> {
     match op {
-        Op::Open => Some(device.open.clone()),
-        Op::Close => Some(device.close.clone()),
+        Op::Open => device.open_cmd().map(|c| c.to_vec()),
+        Op::Close => device.close_cmd().map(|c| c.to_vec()),
         Op::Stop => device.stop_cmd().map(|c| c.to_vec()),
     }
 }

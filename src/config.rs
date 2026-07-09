@@ -4,8 +4,38 @@
 //! そのまま exec するだけ（バックエンド非依存）。enl → casa の移行は
 //! コード変更ではなく config の差し替えで済む。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// デバイス種別。UI の動詞と正規化のディスパッチに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Shutter,
+    Light,
+}
+
+/// light 用の名前付きプリセット（完成済みコマンド配列）。
+/// 色・kelvin の任意値入力は作らない — config に並べたものだけ実行できる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Preset {
+    /// URL に使う識別子。
+    pub name: String,
+    /// UI 表示名（任意）。未指定なら name。
+    #[serde(default, alias = "alias")]
+    #[allow(dead_code)]
+    pub label: Option<String>,
+    /// exec するコマンド配列。
+    pub cmd: Vec<String>,
+}
+
+impl Preset {
+    #[allow(dead_code)]
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -46,15 +76,29 @@ pub struct Device {
     /// 表示名（任意）。未指定なら name。config では `label` でも `alias` でも書ける。
     #[serde(default, alias = "alias")]
     pub label: Option<String>,
-    /// 状態取得コマンド。例: ["enl", "get", "192.0.2.10", "026301", "open_close_state"]
+    /// デバイス種別。省略時 shutter（既存 config 互換）。
+    #[serde(default)]
+    pub kind: Kind,
+    /// 状態取得コマンド。全 kind で必須。
     pub get_state: Vec<String>,
-    /// open コマンド。
-    pub open: Vec<String>,
-    /// close コマンド。
-    pub close: Vec<String>,
-    /// stop コマンド（任意）。電動シャッター等の途中停止。未指定なら UI に停止ボタンを出さない。
+    /// open コマンド（shutter 必須 / light 不可）。
+    #[serde(default)]
+    pub open: Option<Vec<String>>,
+    /// close コマンド（shutter 必須 / light 不可）。
+    #[serde(default)]
+    pub close: Option<Vec<String>>,
+    /// stop コマンド（shutter 任意 / light 不可）。
     #[serde(default)]
     pub stop: Option<Vec<String>>,
+    /// on コマンド（light 必須 / shutter 不可）。
+    #[serde(default)]
+    pub on: Option<Vec<String>>,
+    /// off コマンド（light 必須 / shutter 不可）。
+    #[serde(default)]
+    pub off: Option<Vec<String>>,
+    /// 色・色温度プリセット（light のみ）。
+    #[serde(default, rename = "preset")]
+    pub presets: Vec<Preset>,
 }
 
 impl Device {
@@ -62,9 +106,35 @@ impl Device {
         self.label.as_deref().unwrap_or(&self.name)
     }
 
+    pub fn open_cmd(&self) -> Option<&[String]> {
+        self.open.as_deref()
+    }
+
+    pub fn close_cmd(&self) -> Option<&[String]> {
+        self.close.as_deref()
+    }
+
     /// stop に対応していれば、その exec コマンドを返す。
     pub fn stop_cmd(&self) -> Option<&[String]> {
         self.stop.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn on_cmd(&self) -> Option<&[String]> {
+        self.on.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn off_cmd(&self) -> Option<&[String]> {
+        self.off.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn preset_cmd(&self, name: &str) -> Option<&[String]> {
+        self.presets
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.cmd.as_slice())
     }
 }
 
@@ -78,6 +148,10 @@ pub enum ConfigError {
     EmptyGroup(String),
     UnknownMember { group: String, member: String },
     DuplicateGroup(String),
+    MissingCommand { device: String, field: &'static str },
+    ForbiddenField { device: String, field: &'static str },
+    DuplicatePreset { device: String, preset: String },
+    LightInGroup { group: String, member: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -88,21 +162,62 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Empty => write!(f, "config に [[device]] が 1 つもない"),
             ConfigError::DuplicateName(n) => write!(f, "device 名が重複: {n}"),
             ConfigError::EmptyCommand(n) => {
-                write!(
-                    f,
-                    "device {n}: コマンド配列が空。get_state/open/close すべて必須"
-                )
+                write!(f, "device {n}: コマンド配列が空")
             }
             ConfigError::EmptyGroup(n) => write!(f, "group {n}: members が空"),
             ConfigError::UnknownMember { group, member } => {
                 write!(f, "group {group}: 未知の device を参照: {member}")
             }
             ConfigError::DuplicateGroup(n) => write!(f, "group 名が重複: {n}"),
+            ConfigError::MissingCommand { device, field } => {
+                write!(f, "device {device}: {field} がない（この kind では必須）")
+            }
+            ConfigError::ForbiddenField { device, field } => {
+                write!(f, "device {device}: {field} はこの kind では指定できない")
+            }
+            ConfigError::DuplicatePreset { device, preset } => {
+                write!(f, "device {device}: preset 名が重複: {preset}")
+            }
+            ConfigError::LightInGroup { group, member } => {
+                write!(f, "group {group}: light はグループに入れられない: {member}")
+            }
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
+
+/// kind に応じた必須コマンドの検査。None は Missing、空配列は Empty。
+fn require(
+    device: &str,
+    field: &'static str,
+    v: &Option<Vec<String>>,
+) -> Result<(), ConfigError> {
+    match v {
+        Some(c) if !c.is_empty() => Ok(()),
+        Some(_) => Err(ConfigError::EmptyCommand(device.to_string())),
+        None => Err(ConfigError::MissingCommand {
+            device: device.to_string(),
+            field,
+        }),
+    }
+}
+
+/// この kind では書けないフィールドの検査。
+fn forbid(
+    device: &str,
+    field: &'static str,
+    v: &Option<Vec<String>>,
+) -> Result<(), ConfigError> {
+    if v.is_some() {
+        Err(ConfigError::ForbiddenField {
+            device: device.to_string(),
+            field,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -121,12 +236,45 @@ impl Config {
             if !seen.insert(&d.name) {
                 return Err(ConfigError::DuplicateName(d.name.clone()));
             }
-            if d.get_state.is_empty() || d.open.is_empty() || d.close.is_empty() {
+            if d.get_state.is_empty() {
                 return Err(ConfigError::EmptyCommand(d.name.clone()));
             }
-            // stop は任意だが、指定するなら空配列は不可。
-            if d.stop.as_ref().is_some_and(|s| s.is_empty()) {
-                return Err(ConfigError::EmptyCommand(d.name.clone()));
+            match d.kind {
+                Kind::Shutter => {
+                    require(&d.name, "open", &d.open)?;
+                    require(&d.name, "close", &d.close)?;
+                    forbid(&d.name, "on", &d.on)?;
+                    forbid(&d.name, "off", &d.off)?;
+                    if !d.presets.is_empty() {
+                        return Err(ConfigError::ForbiddenField {
+                            device: d.name.clone(),
+                            field: "preset",
+                        });
+                    }
+                    // stop は任意だが、指定するなら空配列は不可。
+                    if d.stop.as_ref().is_some_and(|s| s.is_empty()) {
+                        return Err(ConfigError::EmptyCommand(d.name.clone()));
+                    }
+                }
+                Kind::Light => {
+                    require(&d.name, "on", &d.on)?;
+                    require(&d.name, "off", &d.off)?;
+                    forbid(&d.name, "open", &d.open)?;
+                    forbid(&d.name, "close", &d.close)?;
+                    forbid(&d.name, "stop", &d.stop)?;
+                    let mut pseen = std::collections::HashSet::new();
+                    for p in &d.presets {
+                        if !pseen.insert(&p.name) {
+                            return Err(ConfigError::DuplicatePreset {
+                                device: d.name.clone(),
+                                preset: p.name.clone(),
+                            });
+                        }
+                        if p.cmd.is_empty() {
+                            return Err(ConfigError::EmptyCommand(d.name.clone()));
+                        }
+                    }
+                }
             }
         }
 
@@ -139,11 +287,21 @@ impl Config {
                 return Err(ConfigError::EmptyGroup(g.name.clone()));
             }
             for m in &g.members {
-                if self.find(m).is_none() {
-                    return Err(ConfigError::UnknownMember {
-                        group: g.name.clone(),
-                        member: m.clone(),
-                    });
+                match self.find(m) {
+                    None => {
+                        return Err(ConfigError::UnknownMember {
+                            group: g.name.clone(),
+                            member: m.clone(),
+                        })
+                    }
+                    // グループは当面シャッター専用（一括開閉の意味論が light に合わない）。
+                    Some(d) if d.kind == Kind::Light => {
+                        return Err(ConfigError::LightInGroup {
+                            group: g.name.clone(),
+                            member: m.clone(),
+                        })
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -267,14 +425,203 @@ mod tests {
     }
 
     #[test]
+    fn light_device_parses() {
+        let p = write_tmp(
+            "light",
+            r#"
+            [[device]]
+            name  = "living_lights"
+            alias = "リビング照明"
+            kind  = "light"
+            get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
+            on  = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            [[device.preset]]
+            name  = "warm"
+            label = "電球色"
+            cmd   = ["mat", "color-temp", "--node", "5", "--kelvin", "2700"]
+            [[device.preset]]
+            name  = "pink"
+            cmd   = ["mat", "color", "--node", "5", "--name", "pink"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("living_lights").unwrap();
+        assert_eq!(d.kind, Kind::Light);
+        assert_eq!(d.label(), "リビング照明");
+        assert_eq!(d.on_cmd().unwrap()[1], "on");
+        assert_eq!(d.off_cmd().unwrap()[1], "off");
+        assert_eq!(d.preset_cmd("warm").unwrap().last().unwrap(), "2700");
+        assert!(d.preset_cmd("nope").is_none());
+        assert_eq!(d.presets[0].label(), "電球色");
+        assert_eq!(d.presets[1].label(), "pink"); // label 未指定は name
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn default_kind_is_shutter() {
+        let p = write_tmp(
+            "defkind",
+            r#"
+            [[device]]
+            name = "shutter"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("shutter").unwrap().kind, Kind::Shutter);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_requires_on_off() {
+        let p = write_tmp(
+            "lightreq",
+            r#"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::MissingCommand { field: "off", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_rejects_shutter_fields() {
+        let p = write_tmp(
+            "lightforbid",
+            r#"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "open", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn shutter_rejects_light_fields() {
+        let p = write_tmp(
+            "shutterforbid",
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            on = ["mat", "on", "--node", "5"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "on", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn preset_duplicate_name_rejected() {
+        let p = write_tmp(
+            "presetdup",
+            r#"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            [[device.preset]]
+            name = "warm"
+            cmd = ["mat", "color-temp", "--node", "5", "--kelvin", "2700"]
+            [[device.preset]]
+            name = "warm"
+            cmd = ["mat", "color-temp", "--node", "5", "--kelvin", "3000"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicatePreset { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn preset_empty_cmd_rejected() {
+        let p = write_tmp(
+            "presetempty",
+            r#"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            [[device.preset]]
+            name = "warm"
+            cmd = []
+            "#,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_in_group_rejected() {
+        let p = write_tmp(
+            "lightgroup",
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            [[group]]
+            name = "all"
+            members = ["s1", "l1"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::LightInGroup { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
     fn default_label_is_name() {
         let d = Device {
             name: "x".into(),
             label: None,
+            kind: Kind::Shutter,
             get_state: vec!["a".into()],
-            open: vec!["a".into()],
-            close: vec!["a".into()],
+            open: Some(vec!["a".into()]),
+            close: Some(vec!["a".into()]),
             stop: None,
+            on: None,
+            off: None,
+            presets: vec![],
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());
