@@ -20,6 +20,10 @@ pub enum State {
     Closing,
     /// 0x45 stopped_midway（途中停止）
     Stopped,
+    /// light 点灯（mat onoff value=true）。
+    On,
+    /// light 消灯（mat onoff value=false）。
+    Off,
     /// スキーマ・値が想定外。
     Unknown,
 }
@@ -86,6 +90,24 @@ fn classify_str(s: &str) -> State {
         "opening" | "0x43" | "43" => State::Opening,
         "closing" | "0x44" | "44" => State::Closing,
         "stopped" | "stopped_midway" | "0x45" | "45" => State::Stopped,
+        _ => State::Unknown,
+    }
+}
+
+/// mat read（onoff / on-off）の出力 JSON を正規化する。
+///
+/// mat の実出力例:
+/// `{"timestamp":"...","node_id":5,"endpoint":1,"cluster":"onoff",
+///   "attribute":"on-off","value":true}`
+/// → `value` の bool で点灯/消灯を判定する。スキーマや値が想定外なら Unknown。
+/// casa 移行時はこの関数の中身だけ差し替える（設計原則 4）。
+///
+/// Task 3 で wire される。
+#[allow(dead_code)]
+pub fn normalize_mat_onoff(raw: &Value) -> State {
+    match raw.get("value") {
+        Some(Value::Bool(true)) => State::On,
+        Some(Value::Bool(false)) => State::Off,
         _ => State::Unknown,
     }
 }
@@ -179,5 +201,33 @@ mod tests {
         );
         let raw = json!({"properties":[{"name":"open_close_state","value":"???"}]});
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn mat_onoff_real_format() {
+        // mat read の実出力形式。
+        let raw = json!({
+            "timestamp": "2026-07-09T12:00:00+09:00",
+            "node_id": 5, "endpoint": 1,
+            "cluster": "onoff", "attribute": "on-off",
+            "value": true
+        });
+        assert_eq!(normalize_mat_onoff(&raw), State::On);
+        let raw = json!({"value": false});
+        assert_eq!(normalize_mat_onoff(&raw), State::Off);
+    }
+
+    #[test]
+    fn mat_onoff_garbage_is_unknown() {
+        assert_eq!(normalize_mat_onoff(&json!({})), State::Unknown);
+        assert_eq!(normalize_mat_onoff(&json!({"value": "on"})), State::Unknown);
+        assert_eq!(normalize_mat_onoff(&json!({"value": 1})), State::Unknown);
+        assert_eq!(normalize_mat_onoff(&json!(null)), State::Unknown);
+    }
+
+    #[test]
+    fn on_off_serialize_snake_case() {
+        assert_eq!(serde_json::to_string(&State::On).unwrap(), "\"on\"");
+        assert_eq!(serde_json::to_string(&State::Off).unwrap(), "\"off\"");
     }
 }
