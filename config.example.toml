@@ -43,3 +43,34 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # get_state = ["enl", "get", "192.0.2.11", "026301", "open_close_state"]
 # open      = ["enl", "set", "192.0.2.11", "026301", "open_close_operation", "open"]
 # close     = ["enl", "set", "192.0.2.11", "026301", "open_close_operation", "close"]
+
+# ── Matter ライト（mat 直叩き）─────────────────────────
+# kind = "light" は on / off / get_state 必須。色・色温度は [[device.preset]] に
+# 完成済みコマンドを並べる（UI にチップボタンが出る。任意値入力は作らない）。
+# node 番号は `mat discover` で確認。将来 casa に差し替えるときも配列の差し替えのみ。
+# [[device]]
+# name  = "living_lights"
+# alias = "リビング照明"
+# kind  = "light"
+# get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
+# on    = ["mat", "on",  "--node", "5"]
+# off   = ["mat", "off", "--node", "5"]
+#
+# [[device.preset]]
+# name  = "warm"
+# label = "電球色"
+# cmd   = ["mat", "color-temp", "--node", "5", "--kelvin", "2700"]
+#
+# [[device.preset]]
+# name  = "daylight"
+# label = "白色"
+# cmd   = ["mat", "color-temp", "--node", "5", "--kelvin", "5000"]
+#
+# [[device.preset]]
+# name  = "pink"
+# label = "ピンク"
+# cmd   = ["mat", "color", "--node", "5", "--name", "pink"]
+#
+# 注意: light はグループ（[[group]] members）に入れられない（当面シャッター専用）。
+# 注意: light は定期ポーリングしない（mat 直叩きは 1 コール数秒 + exec 直列のため）。
+#       表示時 1 回 + 操作後の確定表示のみ。

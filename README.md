@@ -24,6 +24,9 @@ MANDO_CONFIG=./config.toml ./target/release/mando
 - `GET  /api/devices/{name}/state` — `{ state: "open|closed|unknown", exec, raw }`
 - `POST /api/devices/{name}/open` — open → **直後に state 再取得** → `{ action, state, exec, raw }`
 - `POST /api/devices/{name}/close` — 同上（close）
+- `POST /api/devices/{name}/on` — light を点灯 → **直後に state 再取得**（`state: "on|off|unknown"`）
+- `POST /api/devices/{name}/off` — 同上（消灯）
+- `POST /api/devices/{name}/presets/{preset}` — config の名前付きプリセット（色・色温度）を実行 → state 再取得
 
 `state` は set 後に必ず取り直した確定値（楽観表示しない）。`action` / `exec` は
 subprocess の終了コードを写したもの: `success` / `timeout` / `rejected` /
