@@ -19,9 +19,9 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 
-use config::{Config, Device};
+use config::{Config, Device, Kind};
 use exec::{ExecOutcome, Executor};
-use normalize::{normalize_enl_state, State as DeviceState};
+use normalize::{normalize_enl_state, normalize_mat_onoff, State as DeviceState};
 
 /// 焼き込んだ UI（設計原則 8）。config は外、UI はバイナリの一部。
 const INDEX_HTML: &str = include_str!("../index.html");
@@ -64,19 +64,7 @@ async fn main() {
         executor: Executor::new(),
     });
 
-    let router = Router::new()
-        .route("/", get(index))
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/api/devices", get(list_devices))
-        .route("/api/devices/:name/state", get(get_state))
-        .route("/api/devices/:name/open", post(open_device))
-        .route("/api/devices/:name/close", post(close_device))
-        .route("/api/devices/:name/stop", post(stop_device))
-        .route("/api/groups", get(list_groups))
-        .route("/api/groups/:name/open", post(group_open))
-        .route("/api/groups/:name/close", post(group_close))
-        .route("/api/groups/:name/stop", post(group_stop))
-        .with_state(app);
+    let router = router(app);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,
@@ -97,16 +85,45 @@ async fn shutdown_signal() {
     tracing::info!("shutdown");
 }
 
+/// 安定ミニ API のルーティング（テストからも oneshot で叩く）。
+fn router(app: Shared) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/api/devices", get(list_devices))
+        .route("/api/devices/:name/state", get(get_state))
+        .route("/api/devices/:name/open", post(open_device))
+        .route("/api/devices/:name/close", post(close_device))
+        .route("/api/devices/:name/stop", post(stop_device))
+        .route("/api/devices/:name/on", post(on_device))
+        .route("/api/devices/:name/off", post(off_device))
+        .route("/api/devices/:name/presets/:preset", post(preset_device))
+        .route("/api/groups", get(list_groups))
+        .route("/api/groups/:name/open", post(group_open))
+        .route("/api/groups/:name/close", post(group_close))
+        .route("/api/groups/:name/stop", post(group_stop))
+        .with_state(app)
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+#[derive(Serialize)]
+struct PresetInfo {
+    name: String,
+    label: String,
 }
 
 #[derive(Serialize)]
 struct DeviceInfo {
     name: String,
     label: String,
+    kind: Kind,
     /// stop 操作に対応しているか（UI が停止ボタンを出すか判断する）。
     stop: bool,
+    /// light のプリセット（shutter は空）。
+    presets: Vec<PresetInfo>,
 }
 
 async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
@@ -117,7 +134,16 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
         .map(|d| DeviceInfo {
             name: d.name.clone(),
             label: d.label().to_string(),
+            kind: d.kind,
             stop: d.stop_cmd().is_some(),
+            presets: d
+                .presets
+                .iter()
+                .map(|p| PresetInfo {
+                    name: p.name.clone(),
+                    label: p.label().to_string(),
+                })
+                .collect(),
         })
         .collect();
     Json(devices)
@@ -154,7 +180,10 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
 
     match serde_json::from_str::<Value>(&result.stdout) {
         Ok(raw) => StateView {
-            state: normalize_enl_state(&raw),
+            state: match device.kind {
+                Kind::Shutter => normalize_enl_state(&raw),
+                Kind::Light => normalize_mat_onoff(&raw),
+            },
             exec: result.outcome,
             raw: Some(raw),
         },
@@ -210,14 +239,18 @@ enum Op {
     Open,
     Close,
     Stop,
+    On,
+    Off,
 }
 
-/// device の該当操作コマンドを返す。stop 非対応なら None。
+/// device の該当操作コマンドを返す。kind が対応しない操作は None。
 fn device_cmd(device: &Device, op: Op) -> Option<Vec<String>> {
     match op {
         Op::Open => device.open_cmd().map(|c| c.to_vec()),
         Op::Close => device.close_cmd().map(|c| c.to_vec()),
         Op::Stop => device.stop_cmd().map(|c| c.to_vec()),
+        Op::On => device.on_cmd().map(|c| c.to_vec()),
+        Op::Off => device.off_cmd().map(|c| c.to_vec()),
     }
 }
 
@@ -233,18 +266,49 @@ async fn stop_device(State(app): State<Shared>, Path(name): Path<String>) -> Res
     device_op(&app, &name, Op::Stop).await
 }
 
+async fn on_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    device_op(&app, &name, Op::On).await
+}
+
+async fn off_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    device_op(&app, &name, Op::Off).await
+}
+
+/// 名前付きプリセット exec → state 再取得（設計原則 7）。
+async fn preset_device(
+    State(app): State<Shared>,
+    Path((name, preset)): Path<(String, String)>,
+) -> Response {
+    let Some(device) = app.config.find(&name) else {
+        return not_found(&name);
+    };
+    match device.preset_cmd(&preset) {
+        Some(cmd) => Json(run_action(&app, device, cmd).await).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unknown preset\",\"name\":{},\"preset\":{}}}",
+                json_str(&name),
+                json_str(&preset)
+            ),
+        )
+            .into_response(),
+    }
+}
+
 async fn device_op(app: &App, name: &str, op: Op) -> Response {
     let Some(device) = app.config.find(name) else {
         return not_found(name);
     };
     match device_cmd(device, op) {
         Some(cmd) => Json(run_action(app, device, &cmd).await).into_response(),
-        // stop 非対応のデバイス。
+        // この kind では対応しない操作。
         None => (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
             format!(
-                "{{\"error\":\"stop unsupported\",\"name\":{}}}",
+                "{{\"error\":\"unsupported operation\",\"name\":{}}}",
                 json_str(name)
             ),
         )
@@ -364,4 +428,129 @@ fn not_found(name: &str) -> Response {
 
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// sh で下層 CLI を偽装したテスト用 App。
+    /// get_state は mat read / enl の実出力形式を printf で返す。
+    fn test_app() -> Shared {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[device]]
+            name = "light"
+            kind = "light"
+            get_state = ["sh", "-c", "printf '{\"value\":true}'"]
+            on  = ["sh", "-c", "printf '{}'"]
+            off = ["sh", "-c", "printf '{}'"]
+            [[device.preset]]
+            name  = "warm"
+            label = "電球色"
+            cmd   = ["sh", "-c", "printf '{}'"]
+            [[device]]
+            name = "shutter"
+            get_state = ["sh", "-c", "printf '{\"properties\":[{\"name\":\"open_close_state\",\"value\":\"open\"}]}'"]
+            open  = ["sh", "-c", "printf '{}'"]
+            close = ["sh", "-c", "printf '{}'"]
+            "#,
+        )
+        .unwrap();
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+        })
+    }
+
+    async fn call(method: &str, path: &str) -> (axum::http::StatusCode, Value) {
+        let res = router(test_app())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn devices_list_has_kind_and_presets() {
+        let (st, v) = call("GET", "/api/devices").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let light = arr.iter().find(|d| d["name"] == "light").unwrap();
+        assert_eq!(light["kind"], "light");
+        assert_eq!(light["presets"][0]["name"], "warm");
+        assert_eq!(light["presets"][0]["label"], "電球色");
+        let sh = arr.iter().find(|d| d["name"] == "shutter").unwrap();
+        assert_eq!(sh["kind"], "shutter");
+        assert_eq!(sh["presets"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn light_state_normalized_as_on() {
+        let (st, v) = call("GET", "/api/devices/light/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "on");
+    }
+
+    #[tokio::test]
+    async fn shutter_state_still_normalized_as_open() {
+        let (st, v) = call("GET", "/api/devices/shutter/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "open");
+    }
+
+    #[tokio::test]
+    async fn light_on_returns_confirmed_state() {
+        let (st, v) = call("POST", "/api/devices/light/on").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        // 楽観表示ではなく再取得した確定値。
+        assert_eq!(v["state"], "on");
+    }
+
+    #[tokio::test]
+    async fn preset_runs_and_confirms_state() {
+        let (st, v) = call("POST", "/api/devices/light/presets/warm").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        assert_eq!(v["state"], "on");
+    }
+
+    #[tokio::test]
+    async fn kind_mismatch_is_404() {
+        let (st, _) = call("POST", "/api/devices/light/open").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = call("POST", "/api/devices/light/stop").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = call("POST", "/api/devices/shutter/on").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = call("POST", "/api/devices/shutter/presets/warm").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_preset_is_404() {
+        let (st, v) = call("POST", "/api/devices/light/presets/nope").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "unknown preset");
+    }
+
+    #[tokio::test]
+    async fn unknown_device_is_404() {
+        let (st, _) = call("POST", "/api/devices/ghost/on").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
 }

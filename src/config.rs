@@ -24,14 +24,12 @@ pub struct Preset {
     pub name: String,
     /// UI 表示名（任意）。未指定なら name。
     #[serde(default, alias = "alias")]
-    #[allow(dead_code)]
     pub label: Option<String>,
     /// exec するコマンド配列。
     pub cmd: Vec<String>,
 }
 
 impl Preset {
-    #[allow(dead_code)]
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
     }
@@ -119,17 +117,14 @@ impl Device {
         self.stop.as_deref()
     }
 
-    #[allow(dead_code)]
     pub fn on_cmd(&self) -> Option<&[String]> {
         self.on.as_deref()
     }
 
-    #[allow(dead_code)]
     pub fn off_cmd(&self) -> Option<&[String]> {
         self.off.as_deref()
     }
 
-    #[allow(dead_code)]
     pub fn preset_cmd(&self, name: &str) -> Option<&[String]> {
         self.presets
             .iter()

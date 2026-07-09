@@ -101,9 +101,6 @@ fn classify_str(s: &str) -> State {
 ///   "attribute":"on-off","value":true}`
 /// → `value` の bool で点灯/消灯を判定する。スキーマや値が想定外なら Unknown。
 /// casa 移行時はこの関数の中身だけ差し替える（設計原則 4）。
-///
-/// Task 3 で wire される。
-#[allow(dead_code)]
 pub fn normalize_mat_onoff(raw: &Value) -> State {
     match raw.get("value") {
         Some(Value::Bool(true)) => State::On,
