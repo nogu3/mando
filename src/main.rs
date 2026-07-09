@@ -152,7 +152,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
 /// state テンプレを exec → 正規化した結果。
 #[derive(Serialize)]
 struct StateView {
-    /// 正規化された開閉。open | closed | unknown。
+    /// 正規化された状態。shutter: open | closed | … / light: on | off。想定外は unknown。
     state: DeviceState,
     /// get_state の exec 結果（成否を正直に出す）。
     exec: ExecOutcome,

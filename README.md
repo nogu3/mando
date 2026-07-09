@@ -21,7 +21,7 @@ MANDO_CONFIG=./config.toml ./target/release/mando
 
 - `GET  /` — 焼き込んだ UI
 - `GET  /api/devices` — 論理デバイス一覧
-- `GET  /api/devices/{name}/state` — `{ state: "open|closed|unknown", exec, raw }`
+- `GET  /api/devices/{name}/state` — `{ state, exec, raw }`（`state` は shutter: `open|closed|…`、light: `on|off`、想定外は `unknown`）
 - `POST /api/devices/{name}/open` — open → **直後に state 再取得** → `{ action, state, exec, raw }`
 - `POST /api/devices/{name}/close` — 同上（close）
 - `POST /api/devices/{name}/on` — light を点灯 → **直後に state 再取得**（`state: "on|off|unknown"`）
