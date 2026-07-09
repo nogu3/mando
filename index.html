@@ -105,10 +105,25 @@
   .status.opening .dot,
   .status.closing .dot { background: var(--moving); box-shadow: 0 0 10px rgba(217,178,78,.6); animation: pulse 1s ease-in-out infinite; }
   .status.stopped .dot { background: var(--stopped); box-shadow: 0 0 0 3px rgba(93,143,208,.16); }
+  .status.on  .dot { background: var(--open);   box-shadow: 0 0 0 3px rgba(24,184,138,.16), 0 0 10px rgba(24,184,138,.5); }
+  .status.off .dot { background: var(--unknown); }
   @keyframes pulse { 50% { opacity: .35; transform: scale(.85); } }
   .status .label { font-size: 13px; color: var(--fg); font-weight: 600; }
   .status .msg { font-size: 11px; color: var(--muted); margin-left: 4px; }
   .status.error .msg { color: var(--warn); }
+
+  /* ── light プリセットチップ ─────────────────────── */
+  .presets { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+  .presets:empty { display: none; }
+  button.chip {
+    appearance: none; border: 1px solid var(--line2); border-radius: 999px;
+    background: rgba(255,255,255,.06); color: var(--fg);
+    padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+    min-height: 38px; touch-action: manipulation; user-select: none;
+    transition: transform var(--tap), opacity var(--tap), background var(--tap);
+  }
+  button.chip:active:not(:disabled) { transform: scale(.95); background: rgba(255,255,255,.12); }
+  button.chip:disabled { opacity: .4; cursor: progress; }
 
   .controls { display: flex; gap: 8px; flex: none; }
   button.act {
@@ -126,6 +141,8 @@
   button.open  { background: linear-gradient(160deg, var(--open),   var(--open2)); }
   button.close { background: linear-gradient(160deg, var(--closed), var(--closed2)); }
   button.stop  { background: linear-gradient(160deg, var(--stop),   var(--stop2)); }
+  button.on  { background: linear-gradient(160deg, var(--open),   var(--open2)); }
+  button.off { background: linear-gradient(160deg, var(--stop),   var(--stop2)); }
   button.act:active:not(:disabled) { transform: scale(.95); filter: brightness(1.1); box-shadow: 0 2px 6px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.22); }
   button.act:disabled { opacity: .4; cursor: progress; box-shadow: none; }
 
@@ -167,9 +184,12 @@ const STATE_MSG = {
 };
 const STATE_LABEL = {
   open: "開", closed: "閉", opening: "開いています…", closing: "閉じています…",
-  stopped: "途中で停止", unknown: "不明",
+  stopped: "途中で停止", on: "点灯", off: "消灯", unknown: "不明",
 };
-const VERB = { open: "開けています…", close: "閉めています…", stop: "止めています…" };
+const VERB = {
+  open: "開けています…", close: "閉めています…", stop: "止めています…",
+  on: "つけています…", off: "消しています…", preset: "変更中…",
+};
 
 const POLL_MS = 4000; // 3〜5 秒ポーリング（状態は pull）。
 
@@ -260,11 +280,73 @@ function buildCard(dev) {
     labelEl: el.querySelector(".status .label"),
     msgEl: el.querySelector(".status .msg"),
     buttons: [...el.querySelectorAll("button.act")],
+    kind: "shutter",
     state: "unknown",
   };
   for (const btn of c.buttons) btn.addEventListener("click", () => deviceAct(dev.name, btn.dataset.op));
   cards.set(dev.name, c);
   return el;
+}
+
+/* ── light カード（つける/消す + プリセットチップ）── */
+function buildLightCard(dev) {
+  const el = document.createElement("div");
+  el.className = "device";
+  el.innerHTML = `
+    <div class="info">
+      <div class="name"></div>
+      <div class="status unknown"><span class="dot"></span><span class="label">不明</span><span class="msg"></span></div>
+      <div class="presets"></div>
+    </div>
+    <div class="controls">
+      <button class="act on" data-op="on">点</button>
+      <button class="act off" data-op="off">消</button>
+    </div>
+  `;
+  el.querySelector(".name").textContent = dev.label;
+  const pr = el.querySelector(".presets");
+  for (const p of dev.presets) {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.textContent = p.label;
+    b.addEventListener("click", () => presetAct(dev.name, p.name));
+    pr.appendChild(b);
+  }
+  const c = {
+    kind: "light",
+    statusEl: el.querySelector(".status"),
+    labelEl: el.querySelector(".status .label"),
+    msgEl: el.querySelector(".status .msg"),
+    buttons: [...el.querySelectorAll("button")], // act + chip 全部を busy 対象に
+    state: "unknown",
+  };
+  for (const btn of el.querySelectorAll("button.act")) {
+    btn.addEventListener("click", () => deviceAct(dev.name, btn.dataset.op));
+  }
+  cards.set(dev.name, c);
+  return el;
+}
+
+/* ── プリセット実行 ─────────────────────────────── */
+async function presetAct(name, preset) {
+  busyCount++;
+  setDeviceBusy(name, true);
+  const c = cards.get(name);
+  if (c) c.msgEl.textContent = VERB.preset;
+  try {
+    const view = await api(
+      "POST",
+      `/api/devices/${encodeURIComponent(name)}/presets/${encodeURIComponent(preset)}`
+    );
+    renderState(name, view);
+    const am = ACTION_MSG[view.action] || "";
+    if (am) { c.msgEl.textContent = "⚠ " + am; c.statusEl.classList.add("error"); }
+  } catch (e) {
+    if (c) { c.msgEl.textContent = "⚠ 通信エラー"; c.statusEl.classList.add("error"); }
+  } finally {
+    setDeviceBusy(name, false);
+    busyCount--;
+  }
 }
 
 function renderState(name, view) {
@@ -335,13 +417,15 @@ async function groupAct(g, op) {
 /* ── ポーリング ─────────────────────────────────── */
 async function pollOnce() {
   if (busyCount > 0) return;
-  for (const name of cards.keys()) {
+  for (const [name, c] of cards) {
     if (busyCount > 0) return;
+    // light は定期ポーリングしない（mat 直叩きは遅く、exec 直列を詰まらせる）。
+    // 表示時 1 回 + 操作後の再取得のみ（fetchLightStatesOnce / deviceAct）。
+    if (c.kind === "light") continue;
     try {
       const view = await api("GET", `/api/devices/${encodeURIComponent(name)}/state`);
       renderState(name, view);
     } catch (e) {
-      const c = cards.get(name);
       if (c) { c.msgEl.textContent = "接続なし"; c.statusEl.classList.add("error"); }
     }
   }
@@ -353,6 +437,20 @@ function startPolling() {
   polling = true;
   const tick = async () => { await pollOnce(); setTimeout(tick, POLL_MS); };
   tick();
+}
+
+/* ── light の初回 state 取得（1 回だけ・ポーリングなし）── */
+async function fetchLightStatesOnce(devices) {
+  for (const dev of devices) {
+    if (dev.kind !== "light") continue;
+    try {
+      const view = await api("GET", `/api/devices/${encodeURIComponent(dev.name)}/state`);
+      renderState(dev.name, view);
+    } catch (e) {
+      const c = cards.get(dev.name);
+      if (c) { c.msgEl.textContent = "接続なし"; c.statusEl.classList.add("error"); }
+    }
+  }
 }
 
 async function boot() {
@@ -372,8 +470,11 @@ async function boot() {
   }
   app.innerHTML = "";
   for (const g of grps) app.appendChild(buildGroup(g));
-  for (const dev of devices) app.appendChild(buildCard(dev));
+  for (const dev of devices) {
+    app.appendChild(dev.kind === "light" ? buildLightCard(dev) : buildCard(dev));
+  }
   startPolling();
+  fetchLightStatesOnce(devices);
 }
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
