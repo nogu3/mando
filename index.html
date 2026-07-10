@@ -63,7 +63,6 @@
 
   /* ── 一括グループバー（上部・sticky）──────────────── */
   .group {
-    position: sticky; top: 8px; z-index: 5;
     background: var(--panel2); border: 1px solid var(--line2);
     border-radius: 20px; padding: 14px 16px; margin: 8px 0 16px;
     box-shadow: 0 10px 30px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.05);
@@ -156,6 +155,30 @@
   .device, .group { animation: rise .35s cubic-bezier(.2,.8,.3,1) both; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+  /* ── セクション見出し ─────────────────────────── */
+  .sec {
+    font-size: 12px; color: var(--muted); font-weight: 700;
+    letter-spacing: .08em; margin: 18px 4px 2px;
+  }
+  .sec:first-child { margin-top: 6px; }
+
+  /* ── シャッター個別の折りたたみ ─────────────────── */
+  button.expander {
+    appearance: none; width: 100%; margin-top: 11px; padding: 9px;
+    background: none; border: none; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer;
+    touch-action: manipulation; user-select: none;
+  }
+  button.expander:active { color: var(--fg); }
+  .drow {
+    display: flex; align-items: center; gap: 10px;
+    border-top: 1px solid var(--line); padding: 9px 2px;
+  }
+  .drow .dinfo { flex: 1; min-width: 0; }
+  .drow .dname { font-size: 13px; font-weight: 700; }
+  .drow .status { margin-top: 3px; min-height: 16px; }
+  .drow button.act { width: 46px; min-height: 44px; font-size: 15px; border-radius: 12px; }
+
   .boot { color: var(--muted); padding: 28px 6px; text-align: center; }
 </style>
 </head>
@@ -207,7 +230,7 @@ async function api(method, path) {
 }
 
 /* ── 一括グループバー ───────────────────────────── */
-function buildGroup(g) {
+function buildGroup(g, byName) {
   const el = document.createElement("div");
   el.className = "group";
   el.innerHTML = `
@@ -220,6 +243,8 @@ function buildGroup(g) {
       <button class="act close" data-op="close">閉める</button>
     </div>
     <div class="gbusy"></div>
+    <button class="expander" type="button">個別に操作 ▾</button>
+    <div class="members" hidden></div>
   `;
   el.querySelector(".gname").textContent = g.label + " 一括";
   if (g.stop) {
@@ -227,7 +252,17 @@ function buildGroup(g) {
     b.className = "act stop"; b.dataset.op = "stop"; b.textContent = "止める";
     el.querySelector(".gctl").appendChild(b);
   }
-  const buttons = [...el.querySelectorAll("button.act")];
+  const membersEl = el.querySelector(".members");
+  for (const m of g.members) {
+    const dev = byName.get(m);
+    if (dev) membersEl.appendChild(buildMemberRow(dev));
+  }
+  const exp = el.querySelector(".expander");
+  exp.addEventListener("click", () => {
+    membersEl.hidden = !membersEl.hidden;
+    exp.textContent = membersEl.hidden ? "個別に操作 ▾" : "個別に操作 ▴";
+  });
+  const buttons = [...el.querySelectorAll(".gctl button.act")];
   const rec = {
     name: g.name, el, buttons, members: g.members,
     busyEl: el.querySelector(".gbusy"),
@@ -254,6 +289,44 @@ function updateGroupSummaries() {
     if (counts.other) parts.push("他 " + counts.other);
     g.summaryEl.textContent = parts.join(" / ");
   }
+}
+
+/* ── グループ内の個別シャッター行（折りたたみ内）───── */
+function buildMemberRow(dev) {
+  const el = document.createElement("div");
+  el.className = "drow";
+  el.innerHTML = `
+    <div class="dinfo">
+      <div class="dname"></div>
+      <div class="status unknown"><span class="dot"></span><span class="label">不明</span><span class="msg"></span></div>
+    </div>
+    <button class="act open" data-op="open">開</button>
+    <button class="act close" data-op="close">閉</button>
+  `;
+  el.querySelector(".dname").textContent = dev.label;
+  if (dev.stop) {
+    const b = document.createElement("button");
+    b.className = "act stop"; b.dataset.op = "stop"; b.textContent = "停";
+    el.appendChild(b);
+  }
+  const c = {
+    statusEl: el.querySelector(".status"),
+    labelEl: el.querySelector(".status .label"),
+    msgEl: el.querySelector(".status .msg"),
+    buttons: [...el.querySelectorAll("button.act")],
+    kind: "shutter",
+    state: "unknown",
+  };
+  for (const btn of c.buttons) btn.addEventListener("click", () => deviceAct(dev.name, btn.dataset.op));
+  cards.set(dev.name, c);
+  return el;
+}
+
+function sectionHeading(text) {
+  const el = document.createElement("div");
+  el.className = "sec";
+  el.textContent = text;
+  return el;
 }
 
 /* ── デバイスカード（コンパクト）─────────────────── */
@@ -512,9 +585,22 @@ async function boot() {
     return;
   }
   app.innerHTML = "";
-  for (const g of grps) app.appendChild(buildGroup(g));
-  for (const dev of devices) {
-    app.appendChild(dev.kind === "light" ? buildLightCard(dev) : buildCard(dev));
+  const byName = new Map(devices.map((d) => [d.name, d]));
+  const lights = devices.filter((d) => d.kind === "light");
+  const shutters = devices.filter((d) => d.kind !== "light");
+  const grouped = new Set(grps.flatMap((g) => g.members));
+
+  if (lights.length) {
+    app.appendChild(sectionHeading("💡 照明"));
+    for (const dev of lights) app.appendChild(buildLightCard(dev));
+  }
+  if (shutters.length) {
+    app.appendChild(sectionHeading("🪟 シャッター"));
+    for (const g of grps) app.appendChild(buildGroup(g, byName));
+    // グループ非所属の shutter は従来カードで並べる（グループ所属は行で登録済み）。
+    for (const dev of shutters) {
+      if (!grouped.has(dev.name)) app.appendChild(buildCard(dev));
+    }
   }
   startPolling();
   fetchLightStatesOnce(devices);
