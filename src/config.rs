@@ -98,6 +98,10 @@ pub struct Device {
     /// off コマンド（light 必須 / shutter 不可）。
     #[serde(default)]
     pub off: Option<Vec<String>>,
+    /// 任意色コマンドテンプレ（light のみ・任意）。{color} プレースホルダを
+    /// 配列全体でちょうど 1 個含み、検証済み hex（例 "#ff69b4"）に置換して exec される。
+    #[serde(default)]
+    pub color: Option<Vec<String>>,
     /// 色・色温度プリセット（light のみ）。
     #[serde(default, rename = "preset")]
     pub presets: Vec<Preset>,
@@ -135,6 +139,11 @@ impl Device {
             .find(|p| p.name == name)
             .map(|p| p.cmd.as_slice())
     }
+
+    #[allow(dead_code)]
+    pub fn color_cmd(&self) -> Option<&[String]> {
+        self.color.as_deref()
+    }
 }
 
 #[derive(Debug)]
@@ -152,6 +161,7 @@ pub enum ConfigError {
     DuplicatePreset { device: String, preset: String },
     LightInGroup { group: String, member: String },
     DuplicateGroupMember { device: String },
+    ColorPlaceholder { device: String, count: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -183,6 +193,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::DuplicateGroupMember { device } => {
                 write!(f, "device {device}: 複数のグループに所属できない（UI が個別行をデバイスごとに 1 つしか持てないため）")
+            }
+            ConfigError::ColorPlaceholder { device, count } => {
+                write!(f, "device {device}: color テンプレは {{color}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
             }
         }
     }
@@ -248,6 +261,7 @@ impl Config {
                     require(&d.name, "close", &d.close)?;
                     forbid(&d.name, "on", &d.on)?;
                     forbid(&d.name, "off", &d.off)?;
+                    forbid(&d.name, "color", &d.color)?;
                     if !d.presets.is_empty() {
                         return Err(ConfigError::ForbiddenField {
                             device: d.name.clone(),
@@ -275,6 +289,19 @@ impl Config {
                         }
                         if p.cmd.is_empty() {
                             return Err(ConfigError::EmptyCommand(d.name.clone()));
+                        }
+                    }
+                    if let Some(color) = &d.color {
+                        if color.is_empty() {
+                            return Err(ConfigError::EmptyCommand(d.name.clone()));
+                        }
+                        let count: usize =
+                            color.iter().map(|s| s.matches("{color}").count()).sum();
+                        if count != 1 {
+                            return Err(ConfigError::ColorPlaceholder {
+                                device: d.name.clone(),
+                                count,
+                            });
                         }
                     }
                 }
@@ -634,6 +661,7 @@ mod tests {
             stop: None,
             on: None,
             off: None,
+            color: None,
             presets: vec![],
         };
         assert_eq!(d.label(), "x");
@@ -723,6 +751,106 @@ mod tests {
             Config::load(&p),
             Err(ConfigError::DuplicateGroupMember { .. })
         ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn color_template_parses() {
+        let p = write_tmp(
+            "colorok",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            color = ["mat", "color", "--node", "5", "--rgb", "{color}"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("l1").unwrap();
+        assert_eq!(d.color_cmd().unwrap().last().unwrap(), "{color}");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn color_placeholder_zero_rejected() {
+        let p = write_tmp(
+            "colorzero",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            color = ["mat", "color", "--node", "5", "--rgb", "red"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ColorPlaceholder { count: 0, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn color_placeholder_two_rejected() {
+        let p = write_tmp(
+            "colortwo",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            color = ["mat", "color", "--node", "5", "--rgb", "{color}", "--x", "{color}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ColorPlaceholder { count: 2, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn color_on_shutter_rejected() {
+        let p = write_tmp(
+            "colorshutter",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            color = ["mat", "color", "--node", "5", "--rgb", "{color}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "color", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn color_empty_rejected() {
+        let p = write_tmp(
+            "colorempty",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            color = []
+            "##,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
         std::fs::remove_file(p).ok();
     }
 }

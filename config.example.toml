@@ -56,6 +56,10 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "on",  "--node", "5"]
 # off   = ["mat", "off", "--node", "5"]
+# 任意色スライダー用テンプレ（任意）。{color} が検証済み hex（例 "#ff69b4"）に
+# 置換されて exec される。{color} は配列全体でちょうど 1 個。指定すると UI の
+# 色選択シートに「すきな色」スライダーが出る（shutter には書けない）。
+# color = ["mat", "color", "--node", "5", "--rgb", "{color}"]
 #
 # [[device.preset]]
 # name  = "warm"
@@ -89,3 +93,4 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # on    = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "on"]
 # off   = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "off"]
 # （preset も同様に ["mat", "group", "color-temp", "--group", "10", "--kelvin", "2700"] 等）
+# color = ["mat", "group", "color", "--group", "10", "--rgb", "{color}"]
