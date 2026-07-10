@@ -151,6 +151,7 @@ pub enum ConfigError {
     ForbiddenField { device: String, field: &'static str },
     DuplicatePreset { device: String, preset: String },
     LightInGroup { group: String, member: String },
+    DuplicateGroupMember { device: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -179,6 +180,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::LightInGroup { group, member } => {
                 write!(f, "group {group}: light はグループに入れられない: {member}")
+            }
+            ConfigError::DuplicateGroupMember { device } => {
+                write!(f, "device {device}: 複数のグループに所属できない（UI が個別行をデバイスごとに 1 つしか持てないため）")
             }
         }
     }
@@ -278,6 +282,7 @@ impl Config {
         }
 
         let mut seen_g = std::collections::HashSet::new();
+        let mut seen_m = std::collections::HashSet::new();
         for g in &self.groups {
             if !seen_g.insert(&g.name) {
                 return Err(ConfigError::DuplicateGroup(g.name.clone()));
@@ -301,6 +306,12 @@ impl Config {
                         })
                     }
                     Some(_) => {}
+                }
+                // デバイスが複数グループに所属していないかチェック
+                if !seen_m.insert(m) {
+                    return Err(ConfigError::DuplicateGroupMember {
+                        device: m.clone(),
+                    });
                 }
             }
         }
@@ -664,6 +675,53 @@ mod tests {
         assert!(matches!(
             Config::load(&p),
             Err(ConfigError::EmptyCommand(_))
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn device_in_multiple_groups_rejected() {
+        let p = write_tmp(
+            "dupgroupmember",
+            r##"
+            [[device]]
+            name = "shutter"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[group]]
+            name = "group1"
+            members = ["shutter"]
+            [[group]]
+            name = "group2"
+            members = ["shutter"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicateGroupMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn device_duplicate_within_group_rejected() {
+        let p = write_tmp(
+            "dupwithingroup",
+            r##"
+            [[device]]
+            name = "shutter"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[group]]
+            name = "all"
+            members = ["shutter", "shutter"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicateGroupMember { .. })
         ));
         std::fs::remove_file(p).ok();
     }
