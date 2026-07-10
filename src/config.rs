@@ -140,7 +140,6 @@ impl Device {
             .map(|p| p.cmd.as_slice())
     }
 
-    #[allow(dead_code)]
     pub fn color_cmd(&self) -> Option<&[String]> {
         self.color.as_deref()
     }

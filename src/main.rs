@@ -16,7 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use config::{Config, Device, Kind};
@@ -98,6 +98,7 @@ fn router(app: Shared) -> Router {
         .route("/api/devices/:name/on", post(on_device))
         .route("/api/devices/:name/off", post(off_device))
         .route("/api/devices/:name/presets/:preset", post(preset_device))
+        .route("/api/devices/:name/color", post(color_device))
         .route("/api/groups", get(list_groups))
         .route("/api/groups/:name/open", post(group_open))
         .route("/api/groups/:name/close", post(group_close))
@@ -124,6 +125,8 @@ struct DeviceInfo {
     kind: Kind,
     /// stop 操作に対応しているか（UI が停止ボタンを出すか判断する）。
     stop: bool,
+    /// 任意色（color テンプレ）に対応しているか。UI がスライダーの出し分けに使う。
+    color_supported: bool,
     /// light のプリセット（shutter は空）。
     presets: Vec<PresetInfo>,
 }
@@ -138,6 +141,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
             label: d.label().to_string(),
             kind: d.kind,
             stop: d.stop_cmd().is_some(),
+            color_supported: d.color_cmd().is_some(),
             presets: d
                 .presets
                 .iter()
@@ -324,6 +328,57 @@ async fn preset_device(
     }
 }
 
+#[derive(Deserialize)]
+struct ColorReq {
+    color: String,
+}
+
+/// "#rrggbb"（大文字小文字可）のみ許す。検証済みの値だけが argv 置換に到達する。
+fn valid_hex_color(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 任意色 exec。テンプレの {color} を検証済み hex に置換して実行し、
+/// 送信結果のみ返す（light 例外: state は UI が追いつき取得）。
+async fn color_device(
+    State(app): State<Shared>,
+    Path(name): Path<String>,
+    Json(req): Json<ColorReq>,
+) -> Response {
+    let Some(device) = app.config.find(&name) else {
+        return not_found(&name);
+    };
+    // color テンプレの無い device（shutter 含む）は既存の kind 不整合と同じ 404。
+    let Some(template) = device.color_cmd() else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unsupported operation\",\"name\":{}}}",
+                json_str(&name)
+            ),
+        )
+            .into_response();
+    };
+    if !valid_hex_color(&req.color) {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"invalid color\",\"color\":{}}}",
+                json_str(&req.color)
+            ),
+        )
+            .into_response();
+    }
+    let cmd: Vec<String> = template
+        .iter()
+        .map(|s| s.replace("{color}", &req.color))
+        .collect();
+    Json(run_light_action(&app, device, &cmd).await).into_response()
+}
+
 async fn device_op(app: &App, name: &str, op: Op) -> Response {
     let Some(device) = app.config.find(name) else {
         return not_found(name);
@@ -480,11 +535,18 @@ mod tests {
             get_state = ["sh", "-c", "printf '{\"value\":true}'"]
             on  = ["sh", "-c", "printf '{}'"]
             off = ["sh", "-c", "printf '{}'"]
+            color = ["sh", "-c", "test \"$1\" = '#ff69b4' && printf '{}'", "sh", "{color}"]
             [[device.preset]]
             name  = "warm"
             label = "電球色"
             color = "#ffd9a0"
             cmd   = ["sh", "-c", "printf '{}'"]
+            [[device]]
+            name = "plain"
+            kind = "light"
+            get_state = ["sh", "-c", "printf '{\"value\":true}'"]
+            on  = ["sh", "-c", "printf '{}'"]
+            off = ["sh", "-c", "printf '{}'"]
             [[device]]
             name = "shutter"
             get_state = ["sh", "-c", "printf '{\"properties\":[{\"name\":\"open_close_state\",\"value\":\"open\"}]}'"]
@@ -506,6 +568,24 @@ mod tests {
                     .method(method)
                     .uri(path)
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    async fn call_json(method: &str, path: &str, body: &str) -> (axum::http::StatusCode, Value) {
+        let res = router(test_app())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -596,5 +676,60 @@ mod tests {
     async fn unknown_device_is_404() {
         let (st, _) = call("POST", "/api/devices/ghost/on").await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn color_valid_hex_returns_action_only() {
+        let (st, v) = call_json("POST", "/api/devices/light/color", r##"{"color":"#ff69b4"}"##).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        // light 例外: state は同梱しない。
+        assert!(v.get("state").is_none());
+    }
+
+    #[tokio::test]
+    async fn color_substitution_reaches_argv() {
+        // 偽装 sh は "$1" = "#ff69b4" のときだけ成功する。別の正常 hex を送ると
+        // 置換値がそのまま argv に渡っていれば failed になる。
+        let (st, v) = call_json("POST", "/api/devices/light/color", r##"{"color":"#00ff00"}"##).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "failed");
+    }
+
+    #[tokio::test]
+    async fn color_invalid_hex_is_400() {
+        for body in [
+            r##"{"color":"#GGGGGG"}"##,
+            r##"{"color":"red"}"##,
+            r##"{"color":"#fff"}"##,
+            r##"{"color":"#ff69b4aa"}"##,
+        ] {
+            let (st, _) = call_json("POST", "/api/devices/light/color", body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn color_without_template_is_404() {
+        // テンプレ無し light / shutter / 未知 device はすべて既存の kind 不整合と同じ 404。
+        for path in [
+            "/api/devices/plain/color",
+            "/api/devices/shutter/color",
+            "/api/devices/ghost/color",
+        ] {
+            let (st, _) = call_json("POST", path, r##"{"color":"#ff69b4"}"##).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "path: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn devices_list_has_color_supported() {
+        let (st, v) = call("GET", "/api/devices").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let find = |n: &str| arr.iter().find(|d| d["name"] == n).unwrap();
+        assert_eq!(find("light")["color_supported"], true);
+        assert_eq!(find("plain")["color_supported"], false);
+        assert_eq!(find("shutter")["color_supported"], false);
     }
 }
