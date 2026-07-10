@@ -20,8 +20,6 @@
     --open2: #0f9b73;
     --closed: #e8a13a;
     --closed2: #cf8420;
-    --lamp: #ffb84d;
-    --lamp2: #e8951f;
     --moving: #d9b24e;
     --stopped: #5d8fd0;
     --unknown: #545d72;
@@ -63,7 +61,7 @@
   header .sub { color: var(--muted); font-size: 12px; align-self: flex-end; padding-bottom: 3px; }
   main { padding: 8px 14px 32px; max-width: 560px; margin: 0 auto; }
 
-  /* ── 一括グループバー（上部・sticky）──────────────── */
+  /* ── 一括グループバー ──────────────── */
   .group {
     background: var(--panel2); border: 1px solid var(--line2);
     border-radius: 20px; padding: 14px 16px; margin: 8px 0 16px;
@@ -168,6 +166,7 @@
   button.sw:active:not(:disabled) { transform: scale(.9); }
   button.sw:disabled { opacity: .35; cursor: progress; }
   button.sw.sel { border-color: #ffca7a; opacity: 1; }
+  button.chip.sel { border-color: #ffca7a; }
 
   .controls { display: flex; gap: 8px; flex: none; }
   button.act {
