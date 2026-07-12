@@ -99,6 +99,7 @@ fn router(app: Shared) -> Router {
         .route("/api/devices/:name/off", post(off_device))
         .route("/api/devices/:name/presets/:preset", post(preset_device))
         .route("/api/devices/:name/color", post(color_device))
+        .route("/api/devices/:name/brightness", post(brightness_device))
         .route("/api/groups", get(list_groups))
         .route("/api/groups/:name/open", post(group_open))
         .route("/api/groups/:name/close", post(group_close))
@@ -127,6 +128,8 @@ struct DeviceInfo {
     stop: bool,
     /// 任意色（color テンプレ）に対応しているか。UI がスライダーの出し分けに使う。
     color_supported: bool,
+    /// 明るさ（brightness テンプレ）に対応しているか。UI がスライダーの出し分けに使う。
+    brightness_supported: bool,
     /// light のプリセット（shutter は空）。
     presets: Vec<PresetInfo>,
 }
@@ -142,6 +145,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
             kind: d.kind,
             stop: d.stop_cmd().is_some(),
             color_supported: d.color_cmd().is_some(),
+            brightness_supported: d.brightness_cmd().is_some(),
             presets: d
                 .presets
                 .iter()
@@ -379,6 +383,53 @@ async fn color_device(
     Json(run_light_action(&app, device, &cmd).await).into_response()
 }
 
+#[derive(Deserialize)]
+struct BrightnessReq {
+    brightness: Value,
+}
+
+/// 明るさ exec。テンプレの {brightness} を検証済みの整数 1〜100 に置換して実行し、
+/// 送信結果のみ返す（light 例外: state は UI が追いつき取得）。color_device の鏡像。
+async fn brightness_device(
+    State(app): State<Shared>,
+    Path(name): Path<String>,
+    Json(req): Json<BrightnessReq>,
+) -> Response {
+    let Some(device) = app.config.find(&name) else {
+        return not_found(&name);
+    };
+    // brightness テンプレの無い device（shutter 含む）は既存の kind 不整合と同じ 404。
+    let Some(template) = device.brightness_cmd() else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unsupported operation\",\"name\":{}}}",
+                json_str(&name)
+            ),
+        )
+            .into_response();
+    };
+    // JSON 数値の整数のみ受ける。文字列・小数・0・101 以上・負値はすべて 400。
+    let Some(level) = req.brightness.as_u64().filter(|n| (1..=100).contains(n)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"invalid brightness\",\"brightness\":{}}}",
+                req.brightness
+            ),
+        )
+            .into_response();
+    };
+    let level = level.to_string();
+    let cmd: Vec<String> = template
+        .iter()
+        .map(|s| s.replace("{brightness}", &level))
+        .collect();
+    Json(run_light_action(&app, device, &cmd).await).into_response()
+}
+
 async fn device_op(app: &App, name: &str, op: Op) -> Response {
     let Some(device) = app.config.find(name) else {
         return not_found(name);
@@ -536,6 +587,7 @@ mod tests {
             on  = ["sh", "-c", "printf '{}'"]
             off = ["sh", "-c", "printf '{}'"]
             color = ["sh", "-c", "test \"$1\" = '#ff69b4' && printf '{}'", "sh", "{color}"]
+            brightness = ["sh", "-c", "test \"$1\" = '50' && printf '{}'", "sh", "{brightness}"]
             [[device.preset]]
             name  = "warm"
             label = "電球色"
@@ -731,5 +783,61 @@ mod tests {
         assert_eq!(find("light")["color_supported"], true);
         assert_eq!(find("plain")["color_supported"], false);
         assert_eq!(find("shutter")["color_supported"], false);
+    }
+
+    #[tokio::test]
+    async fn brightness_valid_returns_action_only() {
+        let (st, v) = call_json("POST", "/api/devices/light/brightness", r##"{"brightness":50}"##).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        // light 例外: state は同梱しない。
+        assert!(v.get("state").is_none());
+    }
+
+    #[tokio::test]
+    async fn brightness_substitution_reaches_argv() {
+        // 偽装 sh は "$1" = "50" のときだけ成功する。別の正常値を送ると
+        // 置換値がそのまま argv に渡っていれば failed になる。
+        let (st, v) = call_json("POST", "/api/devices/light/brightness", r##"{"brightness":75}"##).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "failed");
+    }
+
+    #[tokio::test]
+    async fn brightness_invalid_is_400() {
+        for body in [
+            r##"{"brightness":0}"##,
+            r##"{"brightness":101}"##,
+            r##"{"brightness":"50"}"##,
+            r##"{"brightness":50.5}"##,
+            r##"{"brightness":-1}"##,
+        ] {
+            let (st, _) = call_json("POST", "/api/devices/light/brightness", body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn brightness_without_template_is_404() {
+        // テンプレ無し light / shutter / 未知 device はすべて既存の kind 不整合と同じ 404。
+        for path in [
+            "/api/devices/plain/brightness",
+            "/api/devices/shutter/brightness",
+            "/api/devices/ghost/brightness",
+        ] {
+            let (st, _) = call_json("POST", path, r##"{"brightness":50}"##).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "path: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn devices_list_has_brightness_supported() {
+        let (st, v) = call("GET", "/api/devices").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let find = |n: &str| arr.iter().find(|d| d["name"] == n).unwrap();
+        assert_eq!(find("light")["brightness_supported"], true);
+        assert_eq!(find("plain")["brightness_supported"], false);
+        assert_eq!(find("shutter")["brightness_supported"], false);
     }
 }
