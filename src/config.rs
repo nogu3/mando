@@ -102,6 +102,10 @@ pub struct Device {
     /// 配列全体でちょうど 1 個含み、検証済み hex（例 "#ff69b4"）に置換して exec される。
     #[serde(default)]
     pub color: Option<Vec<String>>,
+    /// 明るさ（調光）コマンドテンプレ（light のみ・任意）。{brightness} プレースホルダを
+    /// 配列全体でちょうど 1 個含み、検証済みの整数 1〜100 に置換して exec される。
+    #[serde(default)]
+    pub brightness: Option<Vec<String>>,
     /// 色・色温度プリセット（light のみ）。
     #[serde(default, rename = "preset")]
     pub presets: Vec<Preset>,
@@ -143,6 +147,10 @@ impl Device {
     pub fn color_cmd(&self) -> Option<&[String]> {
         self.color.as_deref()
     }
+
+    pub fn brightness_cmd(&self) -> Option<&[String]> {
+        self.brightness.as_deref()
+    }
 }
 
 #[derive(Debug)]
@@ -161,6 +169,7 @@ pub enum ConfigError {
     LightInGroup { group: String, member: String },
     DuplicateGroupMember { device: String },
     ColorPlaceholder { device: String, count: usize },
+    BrightnessPlaceholder { device: String, count: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -195,6 +204,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::ColorPlaceholder { device, count } => {
                 write!(f, "device {device}: color テンプレは {{color}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
+            }
+            ConfigError::BrightnessPlaceholder { device, count } => {
+                write!(f, "device {device}: brightness テンプレは {{brightness}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
             }
         }
     }
@@ -261,6 +273,7 @@ impl Config {
                     forbid(&d.name, "on", &d.on)?;
                     forbid(&d.name, "off", &d.off)?;
                     forbid(&d.name, "color", &d.color)?;
+                    forbid(&d.name, "brightness", &d.brightness)?;
                     if !d.presets.is_empty() {
                         return Err(ConfigError::ForbiddenField {
                             device: d.name.clone(),
@@ -298,6 +311,21 @@ impl Config {
                             color.iter().map(|s| s.matches("{color}").count()).sum();
                         if count != 1 {
                             return Err(ConfigError::ColorPlaceholder {
+                                device: d.name.clone(),
+                                count,
+                            });
+                        }
+                    }
+                    if let Some(brightness) = &d.brightness {
+                        if brightness.is_empty() {
+                            return Err(ConfigError::EmptyCommand(d.name.clone()));
+                        }
+                        let count: usize = brightness
+                            .iter()
+                            .map(|s| s.matches("{brightness}").count())
+                            .sum();
+                        if count != 1 {
+                            return Err(ConfigError::BrightnessPlaceholder {
                                 device: d.name.clone(),
                                 count,
                             });
@@ -661,6 +689,7 @@ mod tests {
             on: None,
             off: None,
             color: None,
+            brightness: None,
             presets: vec![],
         };
         assert_eq!(d.label(), "x");
@@ -847,6 +876,106 @@ mod tests {
             on = ["mat", "on", "--node", "5"]
             off = ["mat", "off", "--node", "5"]
             color = []
+            "##,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn brightness_template_parses() {
+        let p = write_tmp(
+            "brightok",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            brightness = ["mat", "level", "--node", "5", "--percent", "{brightness}"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("l1").unwrap();
+        assert_eq!(d.brightness_cmd().unwrap().last().unwrap(), "{brightness}");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn brightness_placeholder_zero_rejected() {
+        let p = write_tmp(
+            "brightzero",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            brightness = ["mat", "level", "--node", "5", "--percent", "50"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::BrightnessPlaceholder { count: 0, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn brightness_placeholder_two_rejected() {
+        let p = write_tmp(
+            "brighttwo",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            brightness = ["mat", "level", "--node", "5", "--percent", "{brightness}", "--x", "{brightness}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::BrightnessPlaceholder { count: 2, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn brightness_on_shutter_rejected() {
+        let p = write_tmp(
+            "brightshutter",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            brightness = ["mat", "level", "--node", "5", "--percent", "{brightness}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "brightness", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn brightness_empty_rejected() {
+        let p = write_tmp(
+            "brightempty",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on = ["mat", "on", "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            brightness = []
             "##,
         );
         assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));

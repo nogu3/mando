@@ -60,6 +60,11 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # 置換されて exec される。{color} は配列全体でちょうど 1 個。指定すると UI の
 # 色選択シートに「すきな色」スライダーが出る（shutter には書けない）。
 # color = ["mat", "color", "--node", "5", "--rgb", "{color}"]
+# 明るさ（調光）スライダー用テンプレ（任意）。{brightness} が検証済みの整数 1〜100 に
+# 置換されて exec される。{brightness} は配列全体でちょうど 1 個。指定すると UI の
+# あかり調整シートに明るさスライダーが出る（shutter には書けない）。% → 機器生値の
+# 変換が要る場合は mat 側で吸収する（mando は % のまま渡す）。
+# brightness = ["mat", "level", "--node", "5", "--percent", "{brightness}"]
 #
 # [[device.preset]]
 # name  = "warm"

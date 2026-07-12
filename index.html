@@ -481,12 +481,12 @@ function buildLightTile(dev) {
     <div class="status unknown"><span class="label">不明</span><span class="msg"></span></div>
   `;
   el.querySelector(".tname").textContent = dev.label;
-  // preset も color テンプレも無い light はボタン自体を出さない。
-  if (dev.presets.length || dev.color_supported) {
+  // preset も color も brightness も無い light はボタン自体を出さない。
+  if (dev.presets.length || dev.color_supported || dev.brightness_supported) {
     const btn = document.createElement("button");
     btn.className = "colorbtn";
     btn.type = "button";
-    btn.innerHTML = `<span class="cdot"></span>色を変える`;
+    btn.innerHTML = `<span class="cdot"></span>あかり調整`;
     btn.addEventListener("click", () => openSheet(dev));
     el.appendChild(btn);
   }
@@ -502,6 +502,7 @@ function buildLightTile(dev) {
     lastSel: null, // このセッションで最後に押した色（"preset:<name>" | "custom"）
     lastHue: 30,   // シート再訪時のスライダー初期位置
     lastSat: 100,
+    lastBright: 100, // シート再訪時の明るさスライダー初期位置（現在値は state に出ない）
     catchupTimer: null, // 追いつき取得タイマー（device ごとに 1 本、連打時は張り直し）
   };
   el.querySelector(".bulb").addEventListener("click", () =>
@@ -549,8 +550,30 @@ function openSheet(dev) {
   sheetEl.innerHTML = "";
 
   const h = document.createElement("h2");
-  h.textContent = `${dev.label} の色`;
+  h.textContent = `${dev.label} のあかり`;
   sheetEl.appendChild(h);
+
+  if (dev.brightness_supported) {
+    const bwrap = document.createElement("div");
+    bwrap.className = "sliders";
+    const blabel = document.createElement("div");
+    blabel.className = "divider";
+    blabel.textContent = "あかりの強さ";
+    const bright = document.createElement("input");
+    bright.type = "range"; bright.min = "1"; bright.max = "100"; bright.step = "1";
+    bright.value = String(c.lastBright);
+    bright.className = "cslider";
+    bright.setAttribute("aria-label", "あかりの強さ");
+    bwrap.appendChild(bright);
+    sheetEl.appendChild(blabel);
+    sheetEl.appendChild(bwrap);
+    // ドラッグ中（input）は送らず、離した時（change）に 1 回だけ送信
+    // — exec 直列（Semaphore(1)）と相性を保つ。
+    bright.addEventListener("change", () => {
+      c.lastBright = +bright.value;
+      brightnessAct(dev.name, +bright.value);
+    });
+  }
 
   for (const p of dev.presets) {
     const row = document.createElement("button");
@@ -629,6 +652,16 @@ async function colorAct(name, hex) {
     VERB.preset,
     `/api/devices/${encodeURIComponent(name)}/color`,
     { color: hex }
+  );
+}
+
+/* ── 明るさ実行（light 専用）─────────────────────── */
+async function brightnessAct(name, level) {
+  return lightAct(
+    name,
+    VERB.preset,
+    `/api/devices/${encodeURIComponent(name)}/brightness`,
+    { brightness: level }
   );
 }
 
