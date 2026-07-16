@@ -76,6 +76,8 @@ impl Executor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // タイムアウト等で future が drop されたとき子プロセスを残さない。
+            .kill_on_drop(true)
             .output()
             .await;
 

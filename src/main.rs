@@ -642,7 +642,7 @@ async fn get_graph(
         .iter()
         .map(|s| s.replace("{period}", period))
         .collect();
-    let result = app.graph_executor.run(&cmd).await;
+    let result = run_graph_cmd(&app.graph_executor, &cmd, GRAPH_QUERY_TIMEOUT).await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
             graph = %name,
@@ -668,6 +668,27 @@ async fn get_graph(
         series,
     })
     .into_response()
+}
+
+/// graph query の実行上限。下層 CLI の出力契約にタイムアウト保証がないため、
+/// ハングした CLI が graph_executor（Semaphore(1)）を永久に握るのを防ぐ。
+const GRAPH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// graph query を timeout 付きで exec する。超過は Timeout として返す
+/// （future の drop で permit は解放され、子プロセスは kill_on_drop で回収される）。
+async fn run_graph_cmd(
+    executor: &Executor,
+    cmd: &[String],
+    timeout: std::time::Duration,
+) -> exec::ExecResult {
+    match tokio::time::timeout(timeout, executor.run(cmd)).await {
+        Ok(r) => r,
+        Err(_) => exec::ExecResult {
+            outcome: ExecOutcome::Timeout,
+            stdout: String::new(),
+            stderr: "graph query timeout".into(),
+        },
+    }
 }
 
 /// 下層の読み出しに失敗（exec 非成功・契約 JSON でない）→ 502。
@@ -1066,5 +1087,21 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_GATEWAY);
         let (st, _) = call("GET", "/api/graphs/notarray").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn graph_query_timeout_maps_to_timeout_outcome() {
+        let ex = Executor::new();
+        let r = run_graph_cmd(
+            &ex,
+            &["sh".into(), "-c".into(), "sleep 5".into()],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(r.outcome, ExecOutcome::Timeout);
+        // permit が解放されていること（後続の run が即座に走れる）。
+        let r2 = ex.run(&["sh".into(), "-c".into(), "printf ok".into()]).await;
+        assert_eq!(r2.outcome, ExecOutcome::Success);
+        assert_eq!(r2.stdout, "ok");
     }
 }
