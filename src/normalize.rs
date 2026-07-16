@@ -109,6 +109,54 @@ pub fn normalize_mat_onoff(raw: &Value) -> State {
     }
 }
 
+/// グラフ 1 系列。契約 JSON の行を series 別に束ねたもの。
+#[derive(Debug, PartialEq, Serialize)]
+pub struct GraphSeries {
+    pub label: String,
+    /// (ts, value)。ts 昇順。JSON では [["ts", value], ...] になる。
+    pub points: Vec<(String, f64)>,
+}
+
+/// embalse 読み出し CLI の契約 JSON（フラット行配列）→ チャート系列。
+///
+/// 契約: `[{"ts": "ISO8601", "series": "ラベル(任意)", "value": 数値}, ...]`
+/// series 省略行は default_label（グラフの表示名）に束ねる。ts / value が
+/// 欠けた・型不正の行は drop（部分的に壊れたデータで全体を落とさない）。
+/// 系列は初出順、各系列内は ts 昇順（同一オフセットの ISO8601 は辞書順=時刻順）。
+/// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
+pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSeries> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_label: std::collections::HashMap<String, Vec<(String, f64)>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let Some(ts) = row.get("ts").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = row.get("value").and_then(Value::as_f64) else {
+            continue;
+        };
+        let label = row
+            .get("series")
+            .and_then(Value::as_str)
+            .unwrap_or(default_label);
+        if !by_label.contains_key(label) {
+            order.push(label.to_string());
+        }
+        by_label
+            .entry(label.to_string())
+            .or_default()
+            .push((ts.to_string(), value));
+    }
+    order
+        .into_iter()
+        .map(|label| {
+            let mut points = by_label.remove(&label).unwrap_or_default();
+            points.sort_by(|a, b| a.0.cmp(&b.0));
+            GraphSeries { label, points }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +274,75 @@ mod tests {
     fn on_off_serialize_snake_case() {
         assert_eq!(serde_json::to_string(&State::On).unwrap(), "\"on\"");
         assert_eq!(serde_json::to_string(&State::Off).unwrap(), "\"off\"");
+    }
+
+    #[test]
+    fn graph_rows_single_series_gets_default_label() {
+        let rows = [
+            json!({"ts": "2026-07-15T10:00:00+09:00", "value": 100.0}),
+            json!({"ts": "2026-07-15T10:05:00+09:00", "value": 200.0}),
+        ];
+        let s = normalize_graph_rows(&rows, "太陽光発電");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "太陽光発電");
+        assert_eq!(s[0].points.len(), 2);
+        assert_eq!(s[0].points[0].1, 100.0);
+    }
+
+    #[test]
+    fn graph_rows_grouped_by_series_in_first_appearance_order() {
+        let rows = [
+            json!({"ts": "t1", "series": "書斎", "value": 800.0}),
+            json!({"ts": "t1", "series": "リビング", "value": 600.0}),
+            json!({"ts": "t2", "series": "書斎", "value": 820.0}),
+        ];
+        let s = normalize_graph_rows(&rows, "CO2");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].label, "書斎");
+        assert_eq!(s[0].points.len(), 2);
+        assert_eq!(s[1].label, "リビング");
+        assert_eq!(s[1].points.len(), 1);
+    }
+
+    #[test]
+    fn graph_rows_sorted_by_ts_ascending() {
+        let rows = [
+            json!({"ts": "2026-07-15T10:05:00+09:00", "value": 2.0}),
+            json!({"ts": "2026-07-15T10:00:00+09:00", "value": 1.0}),
+        ];
+        let s = normalize_graph_rows(&rows, "x");
+        assert_eq!(s[0].points[0].1, 1.0);
+        assert_eq!(s[0].points[1].1, 2.0);
+    }
+
+    #[test]
+    fn graph_rows_invalid_rows_dropped() {
+        let rows = [
+            json!({"ts": "t1", "value": "not-a-number"}), // value 非数値
+            json!({"value": 1.0}),                         // ts 欠落
+            json!({"ts": "t2"}),                           // value 欠落
+            json!("garbage"),                              // オブジェクトですらない
+            json!({"ts": "t3", "value": 3.0}),             // 唯一の正常行
+        ];
+        let s = normalize_graph_rows(&rows, "x");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].points, vec![("t3".to_string(), 3.0)]);
+    }
+
+    #[test]
+    fn graph_rows_empty_is_empty() {
+        assert!(normalize_graph_rows(&[], "x").is_empty());
+    }
+
+    #[test]
+    fn graph_series_serializes_points_as_pairs() {
+        let s = GraphSeries {
+            label: "発電".into(),
+            points: vec![("t1".into(), 1.5)],
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"label":"発電","points":[["t1",1.5]]}"#
+        );
     }
 }
