@@ -68,6 +68,8 @@
 - `GET  /api/devices/{name}/state` — state テンプレを exec → 正規化 `{ "state": "open|closed|unknown", "raw": {...} }`
 - `POST /api/devices/{name}/open` — open テンプレを exec → **直後に state 再取得** → 結果を返す
 - `POST /api/devices/{name}/close` — 同上（close）
+- `GET  /api/graphs` — config 上のグラフ一覧（きろくセクション）
+- `GET  /api/graphs/{name}?period=today|week|month` — graph query テンプレを exec → 正規化した系列 `{ "series": [...] }`
 
 ---
 

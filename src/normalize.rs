@@ -110,8 +110,6 @@ pub fn normalize_mat_onoff(raw: &Value) -> State {
 }
 
 /// グラフ 1 系列。契約 JSON の行を series 別に束ねたもの。
-// dead_code allow は一時措置 — Task 3（API ハンドラ）が使い始めたら外す。
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Serialize)]
 pub struct GraphSeries {
     pub label: String,
@@ -126,8 +124,6 @@ pub struct GraphSeries {
 /// 欠けた・型不正の行は drop（部分的に壊れたデータで全体を落とさない）。
 /// 系列は初出順、各系列内は ts 昇順（同一オフセットの ISO8601 は辞書順=時刻順）。
 /// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
-// dead_code allow は一時措置 — Task 3（API ハンドラ）が使い始めたら外す。
-#[allow(dead_code)]
 pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSeries> {
     let mut order: Vec<String> = Vec::new();
     let mut by_label: std::collections::HashMap<String, Vec<(String, f64)>> =

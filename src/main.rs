@@ -10,7 +10,7 @@ mod normalize;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use config::{Config, Device, Kind};
 use exec::{ExecOutcome, Executor};
-use normalize::{normalize_enl_state, normalize_mat_onoff, State as DeviceState};
+use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, State as DeviceState};
 
 /// 焼き込んだ UI（設計原則 8）。config は外、UI はバイナリの一部。
 const INDEX_HTML: &str = include_str!("../index.html");
@@ -29,6 +29,10 @@ const INDEX_HTML: &str = include_str!("../index.html");
 struct App {
     config: Config,
     executor: Executor,
+    /// グラフ読み出し専用の直列化器。devices の executor（3610 衝突対策）とは
+    /// 別枠 — 重い読み出し（duckdb 等）がシャッター操作をブロックしないため。
+    /// グラフ同士は直列（ホストの CPU/メモリ保護）。
+    graph_executor: Executor,
 }
 
 type Shared = Arc<App>;
@@ -62,6 +66,7 @@ async fn main() {
     let app = Arc::new(App {
         config,
         executor: Executor::new(),
+        graph_executor: Executor::new(),
     });
 
     let router = router(app);
@@ -104,6 +109,8 @@ fn router(app: Shared) -> Router {
         .route("/api/groups/:name/open", post(group_open))
         .route("/api/groups/:name/close", post(group_close))
         .route("/api/groups/:name/stop", post(group_stop))
+        .route("/api/graphs", get(list_graphs))
+        .route("/api/graphs/:name", get(get_graph))
         .with_state(app)
 }
 
@@ -567,6 +574,115 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
+#[derive(Serialize)]
+struct GraphInfo {
+    name: String,
+    label: String,
+}
+
+async fn list_graphs(State(app): State<Shared>) -> Json<Vec<GraphInfo>> {
+    let graphs = app
+        .config
+        .graphs
+        .iter()
+        .map(|g| GraphInfo {
+            name: g.name.clone(),
+            label: g.label().to_string(),
+        })
+        .collect();
+    Json(graphs)
+}
+
+#[derive(Deserialize)]
+struct GraphQuery {
+    period: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphView {
+    name: String,
+    period: String,
+    unit: String,
+    series: Vec<GraphSeries>,
+}
+
+/// グラフデータ取得。query テンプレの {period} を検証済み値に置換して exec し、
+/// 契約 JSON（フラット行配列）をチャート系列へ正規化して返す。
+async fn get_graph(
+    State(app): State<Shared>,
+    Path(name): Path<String>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    let Some(graph) = app.config.find_graph(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unknown graph\",\"name\":{}}}",
+                json_str(&name)
+            ),
+        )
+            .into_response();
+    };
+    // enum 検証してからテンプレ置換する（任意文字列を subprocess に渡さない）。
+    let period = q.period.as_deref().unwrap_or("today");
+    if !matches!(period, "today" | "week" | "month") {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"invalid period\",\"period\":{}}}",
+                json_str(period)
+            ),
+        )
+            .into_response();
+    }
+    let cmd: Vec<String> = graph
+        .query
+        .iter()
+        .map(|s| s.replace("{period}", period))
+        .collect();
+    let result = app.graph_executor.run(&cmd).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::warn!(
+            graph = %name,
+            outcome = ?result.outcome,
+            stderr = %result.stderr.trim(),
+            "graph query 非成功"
+        );
+        return graph_unavailable(&name);
+    }
+    let rows = match serde_json::from_str::<Value>(&result.stdout) {
+        Ok(Value::Array(rows)) => rows,
+        // 配列以外・パース不能は契約違反（原則 7: 誤魔化さず 502 で正直に返す）。
+        Ok(_) | Err(_) => {
+            tracing::warn!(graph = %name, "graph query の stdout が契約 JSON 配列でない");
+            return graph_unavailable(&name);
+        }
+    };
+    let series = normalize::normalize_graph_rows(&rows, graph.label());
+    Json(GraphView {
+        name: graph.name.clone(),
+        period: period.to_string(),
+        unit: graph.unit_for(period).to_string(),
+        series,
+    })
+    .into_response()
+}
+
+/// 下層の読み出しに失敗（exec 非成功・契約 JSON でない）→ 502。
+fn graph_unavailable(name: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!(
+            "{{\"error\":\"graph query failed\",\"name\":{}}}",
+            json_str(name)
+        ),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,12 +720,40 @@ mod tests {
             get_state = ["sh", "-c", "printf '{\"properties\":[{\"name\":\"open_close_state\",\"value\":\"open\"}]}'"]
             open  = ["sh", "-c", "printf '{}'"]
             close = ["sh", "-c", "printf '{}'"]
+            [[graph]]
+            name       = "generation"
+            label      = "太陽光発電"
+            unit       = "W"
+            unit_daily = "kWh"
+            query      = ["sh", "-c", "printf '[{\"ts\":\"2026-07-15T10:05:00+09:00\",\"value\":200},{\"ts\":\"2026-07-15T10:00:00+09:00\",\"value\":100}]'", "sh", "{period}"]
+            [[graph]]
+            name  = "co2"
+            label = "CO2"
+            unit  = "ppm"
+            query = ["sh", "-c", "printf '[{\"ts\":\"t1\",\"series\":\"書斎\",\"value\":800},{\"ts\":\"t1\",\"series\":\"リビング\",\"value\":600}]'", "sh", "{period}"]
+            [[graph]]
+            name  = "strict"
+            unit  = "W"
+            query = ["sh", "-c", "test \"$1\" = today && printf '[]'", "sh", "{period}"]
+            [[graph]]
+            name  = "broken"
+            unit  = "W"
+            query = ["sh", "-c", "exit 1", "sh", "{period}"]
+            [[graph]]
+            name  = "garbage"
+            unit  = "W"
+            query = ["sh", "-c", "printf 'not-json'", "sh", "{period}"]
+            [[graph]]
+            name  = "notarray"
+            unit  = "W"
+            query = ["sh", "-c", "printf '{}'", "sh", "{period}"]
             "##,
         )
         .unwrap();
         Arc::new(App {
             config: cfg,
             executor: Executor::new(),
+            graph_executor: Executor::new(),
         })
     }
 
@@ -839,5 +983,88 @@ mod tests {
         assert_eq!(find("light")["brightness_supported"], true);
         assert_eq!(find("plain")["brightness_supported"], false);
         assert_eq!(find("shutter")["brightness_supported"], false);
+    }
+
+    #[tokio::test]
+    async fn graphs_list_has_name_and_label() {
+        let (st, v) = call("GET", "/api/graphs").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let gen = arr.iter().find(|g| g["name"] == "generation").unwrap();
+        assert_eq!(gen["label"], "太陽光発電");
+    }
+
+    #[tokio::test]
+    async fn graph_today_normalized_and_sorted() {
+        let (st, v) = call("GET", "/api/graphs/generation").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["name"], "generation");
+        assert_eq!(v["period"], "today"); // period 未指定は today
+        assert_eq!(v["unit"], "W");
+        let s = &v["series"][0];
+        assert_eq!(s["label"], "太陽光発電"); // series 省略行は graph label に束ねる
+        // ts 昇順にソートされる（スタブは逆順で返す）。
+        assert_eq!(s["points"][0][1], 100.0);
+        assert_eq!(s["points"][1][1], 200.0);
+    }
+
+    #[tokio::test]
+    async fn graph_week_uses_unit_daily() {
+        let (st, v) = call("GET", "/api/graphs/generation?period=week").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["period"], "week");
+        assert_eq!(v["unit"], "kWh");
+    }
+
+    #[tokio::test]
+    async fn graph_multi_series_first_appearance_order() {
+        let (st, v) = call("GET", "/api/graphs/co2").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["unit"], "ppm"); // unit_daily 未指定は unit
+        let arr = v["series"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["label"], "書斎");
+        assert_eq!(arr[1]["label"], "リビング");
+    }
+
+    #[tokio::test]
+    async fn graph_period_substitution_reaches_argv() {
+        // 偽装 sh は "$1" = "today" のときだけ成功する。
+        let (st, v) = call("GET", "/api/graphs/strict?period=today").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["series"].as_array().unwrap().len(), 0); // 0 行 → 200 + 空 series
+        // week を送ると置換値がそのまま argv に渡っていれば exit 1 → 502。
+        let (st, _) = call("GET", "/api/graphs/strict?period=week").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn graph_invalid_period_is_400() {
+        for p in ["yesterday", "TODAY", "today%20x", ""] {
+            let (st, _) = call("GET", &format!("/api/graphs/generation?period={p}")).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "period: {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_unknown_is_404() {
+        let (st, v) = call("GET", "/api/graphs/ghost").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "unknown graph");
+    }
+
+    #[tokio::test]
+    async fn graph_exec_failure_is_502() {
+        let (st, v) = call("GET", "/api/graphs/broken").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "graph query failed");
+    }
+
+    #[tokio::test]
+    async fn graph_non_json_stdout_is_502() {
+        let (st, _) = call("GET", "/api/graphs/garbage").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        let (st, _) = call("GET", "/api/graphs/notarray").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
     }
 }

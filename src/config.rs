@@ -88,9 +88,6 @@ pub struct Graph {
     pub query: Vec<String>,
 }
 
-// dead_code allow は一時措置 — Task 3（API ハンドラ）が使い始めたら外す。
-// bin クレートでは #[cfg(test)] からの参照は dead_code を抑止しないため必要。
-#[allow(dead_code)]
 impl Graph {
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
@@ -444,8 +441,6 @@ impl Config {
         self.groups.iter().find(|g| g.name == name)
     }
 
-    // dead_code allow は一時措置 — Task 3 が使い始めたら外す。
-    #[allow(dead_code)]
     pub fn find_graph(&self, name: &str) -> Option<&Graph> {
         self.graphs.iter().find(|g| g.name == name)
     }
