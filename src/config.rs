@@ -47,6 +47,8 @@ pub struct Config {
     pub devices: Vec<Device>,
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
+    #[serde(default, rename = "graph")]
+    pub graphs: Vec<Graph>,
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -64,6 +66,43 @@ pub struct Group {
 impl Group {
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// embalse 等の読み出し CLI をテンプレで指定するグラフ定義（きろくセクション）。
+/// mando はコマンド名を知らない — {period} を検証済み値に置換して exec するだけ
+/// （設計原則 2: バックエンド非依存）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Graph {
+    /// URL に使う識別子。
+    pub name: String,
+    /// UI 表示名（任意）。未指定なら name。
+    #[serde(default, alias = "alias")]
+    pub label: Option<String>,
+    /// 今日ビュー（時系列カーブ）の単位表示。
+    pub unit: String,
+    /// 週/月ビュー（日別集計）の単位表示。未指定なら unit。
+    #[serde(default)]
+    pub unit_daily: Option<String>,
+    /// exec するコマンドテンプレ。{period} プレースホルダをちょうど 1 個含む。
+    pub query: Vec<String>,
+}
+
+// dead_code allow は一時措置 — Task 3（API ハンドラ）が使い始めたら外す。
+// bin クレートでは #[cfg(test)] からの参照は dead_code を抑止しないため必要。
+#[allow(dead_code)]
+impl Graph {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// period に応じた表示単位（today は unit、週/月は unit_daily 優先）。
+    pub fn unit_for(&self, period: &str) -> &str {
+        if period == "today" {
+            &self.unit
+        } else {
+            self.unit_daily.as_deref().unwrap_or(&self.unit)
+        }
     }
 }
 
@@ -170,6 +209,9 @@ pub enum ConfigError {
     DuplicateGroupMember { device: String },
     ColorPlaceholder { device: String, count: usize },
     BrightnessPlaceholder { device: String, count: usize },
+    DuplicateGraph(String),
+    EmptyGraphQuery(String),
+    PeriodPlaceholder { graph: String, count: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -207,6 +249,11 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::BrightnessPlaceholder { device, count } => {
                 write!(f, "device {device}: brightness テンプレは {{brightness}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
+            }
+            ConfigError::DuplicateGraph(n) => write!(f, "graph 名が重複: {n}"),
+            ConfigError::EmptyGraphQuery(n) => write!(f, "graph {n}: query が空"),
+            ConfigError::PeriodPlaceholder { graph, count } => {
+                write!(f, "graph {graph}: query は {{period}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
             }
         }
     }
@@ -369,6 +416,23 @@ impl Config {
                 }
             }
         }
+
+        let mut seen_gr = std::collections::HashSet::new();
+        for g in &self.graphs {
+            if !seen_gr.insert(&g.name) {
+                return Err(ConfigError::DuplicateGraph(g.name.clone()));
+            }
+            if g.query.is_empty() {
+                return Err(ConfigError::EmptyGraphQuery(g.name.clone()));
+            }
+            let count: usize = g.query.iter().map(|s| s.matches("{period}").count()).sum();
+            if count != 1 {
+                return Err(ConfigError::PeriodPlaceholder {
+                    graph: g.name.clone(),
+                    count,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -378,6 +442,12 @@ impl Config {
 
     pub fn find_group(&self, name: &str) -> Option<&Group> {
         self.groups.iter().find(|g| g.name == name)
+    }
+
+    // dead_code allow は一時措置 — Task 3 が使い始めたら外す。
+    #[allow(dead_code)]
+    pub fn find_graph(&self, name: &str) -> Option<&Graph> {
+        self.graphs.iter().find(|g| g.name == name)
     }
 }
 
@@ -979,6 +1049,155 @@ mod tests {
             "##,
         );
         assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_parses() {
+        let p = write_tmp(
+            "graphok",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name       = "generation"
+            label      = "太陽光発電"
+            unit       = "W"
+            unit_daily = "kWh"
+            query      = ["embalse-query", "generation", "{period}"]
+            [[graph]]
+            name  = "co2"
+            unit  = "ppm"
+            query = ["embalse-query", "co2", "{period}"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let g = cfg.find_graph("generation").unwrap();
+        assert_eq!(g.label(), "太陽光発電");
+        assert_eq!(g.unit_for("today"), "W");
+        assert_eq!(g.unit_for("week"), "kWh");
+        assert_eq!(g.unit_for("month"), "kWh");
+        let c = cfg.find_graph("co2").unwrap();
+        assert_eq!(c.label(), "co2"); // label 未指定は name
+        assert_eq!(c.unit_for("week"), "ppm"); // unit_daily 未指定は unit
+        assert!(cfg.find_graph("nope").is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_zero_entries_ok() {
+        // [[graph]] 無しでも従来どおり起動できる（既存機能への影響ゼロ）。
+        let p = write_tmp(
+            "graphzero",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.graphs.is_empty());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_duplicate_name_rejected() {
+        let p = write_tmp(
+            "graphdup",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name = "g"
+            unit = "W"
+            query = ["embalse-query", "g", "{period}"]
+            [[graph]]
+            name = "g"
+            unit = "W"
+            query = ["embalse-query", "g", "{period}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicateGraph(_))
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_empty_query_rejected() {
+        let p = write_tmp(
+            "graphempty",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name = "g"
+            unit = "W"
+            query = []
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyGraphQuery(_))
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_period_placeholder_zero_rejected() {
+        let p = write_tmp(
+            "graphp0",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name = "g"
+            unit = "W"
+            query = ["embalse-query", "g", "today"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::PeriodPlaceholder { count: 0, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_period_placeholder_two_rejected() {
+        let p = write_tmp(
+            "graphp2",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name = "g"
+            unit = "W"
+            query = ["embalse-query", "{period}", "{period}"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::PeriodPlaceholder { count: 2, .. })
+        ));
         std::fs::remove_file(p).ok();
     }
 }
