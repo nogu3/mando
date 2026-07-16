@@ -283,6 +283,42 @@
   .drow .status { margin-top: 3px; min-height: 16px; }
   .drow button.act { width: 46px; min-height: 44px; font-size: 15px; border-radius: 12px; }
 
+  /* ── きろく（embalse グラフ）─────────────────── */
+  .sec.krow { display: flex; align-items: center; gap: 10px; }
+  .ptabs {
+    display: flex; gap: 2px; margin-left: auto;
+    background: rgba(255,255,255,.05); border: 1px solid var(--line);
+    border-radius: 999px; padding: 3px;
+  }
+  .ptabs button {
+    appearance: none; border: none; border-radius: 999px;
+    background: none; color: var(--muted); font-size: 12px; font-weight: 700;
+    padding: 6px 14px; cursor: pointer; touch-action: manipulation; user-select: none;
+    transition: background var(--tap), color var(--tap);
+  }
+  .ptabs button.sel { background: var(--accent); color: #0b1020; }
+  .gcard {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 16px; padding: 12px 14px; margin: 10px 0;
+    box-shadow: 0 4px 16px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.04);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    animation: rise .35s cubic-bezier(.2,.8,.3,1) both;
+  }
+  .gcard .ghd { display: flex; align-items: baseline; gap: 8px; }
+  .gcard .gtitle { font-size: 14px; font-weight: 700; }
+  .gcard .gval { margin-left: auto; font-size: 16px; font-weight: 800; }
+  .gcard .gval .u { font-size: 11px; color: var(--muted); font-weight: 700; margin-left: 3px; }
+  .gcard .gsub { font-size: 11px; color: var(--muted); min-height: 15px; margin-top: 2px; }
+  .gcard .glegend {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px;
+    font-size: 11px; color: var(--muted);
+  }
+  .gcard .glegend .k { display: inline-flex; align-items: center; gap: 5px; }
+  .gcard .glegend .kd { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .gcard svg { display: block; width: 100%; height: auto; margin-top: 8px; touch-action: pan-y; }
+  .gcard .gmsg { font-size: 12px; color: var(--muted); padding: 22px 0; text-align: center; }
+  .gcard .gmsg.error { color: var(--warn); }
+
   .boot { color: var(--muted); padding: 28px 6px; text-align: center; }
 </style>
 </head>
@@ -842,12 +878,284 @@ async function fetchLightStatesOnce(devices) {
   }
 }
 
+/* ── きろく（embalse グラフ）─────────────────────── */
+// dataviz 検証済みカテゴリカルパレット（ダーク面 #10141d で全チェック PASS）。
+// 系列へ初出順に固定割当する。循環させない — 5 系列以上は先頭 4 系列のみ描画
+// （必要なら config 側でグラフを分割する）。
+const GRAPH_COLORS = ["#3987e5", "#008300", "#d55181", "#c98500"];
+const GRAPH_SURFACE = "#10141d"; // マーカのサーフェスリング用（パネルの実効色）
+const PERIODS = [["today", "今日"], ["week", "週"], ["month", "月"]];
+let graphPeriod = "today";
+const graphCards = new Map(); // name -> {valEl, subEl, legendEl, bodyEl}
+
+function buildGraphSection(graphList) {
+  const head = sectionHeading("📈 きろく");
+  head.classList.add("krow");
+  const tabs = document.createElement("div");
+  tabs.className = "ptabs";
+  for (const [p, label] of PERIODS) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label; b.dataset.period = p;
+    if (p === graphPeriod) b.classList.add("sel");
+    b.addEventListener("click", () => {
+      if (graphPeriod === p) return;
+      graphPeriod = p;
+      for (const t of tabs.querySelectorAll("button")) {
+        t.classList.toggle("sel", t.dataset.period === p);
+      }
+      loadGraphs();
+    });
+    tabs.appendChild(b);
+  }
+  head.appendChild(tabs);
+  app.appendChild(head);
+
+  for (const g of graphList) {
+    const card = document.createElement("div");
+    card.className = "gcard";
+    card.innerHTML = `
+      <div class="ghd"><span class="gtitle"></span><span class="gval"></span></div>
+      <div class="gsub"></div>
+      <div class="glegend" hidden></div>
+      <div class="gbody"><div class="gmsg">…</div></div>
+    `;
+    card.querySelector(".gtitle").textContent = g.label;
+    graphCards.set(g.name, {
+      valEl: card.querySelector(".gval"),
+      subEl: card.querySelector(".gsub"),
+      legendEl: card.querySelector(".glegend"),
+      bodyEl: card.querySelector(".gbody"),
+    });
+    app.appendChild(card);
+  }
+  // 取得はセクションが初めて画面に入ったときまで遅らせる
+  // （開いてすぐの操作を重い読み出しで邪魔しない・ポーリングはしない）。
+  const io = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      io.disconnect();
+      loadGraphs();
+    }
+  }, { rootMargin: "80px" });
+  io.observe(head);
+}
+
+async function loadGraphs() {
+  const period = graphPeriod;
+  for (const [name, gc] of graphCards) {
+    gc.bodyEl.innerHTML = `<div class="gmsg"><span class="spin"></span>読み込み中…</div>`;
+    gc.valEl.textContent = "";
+    gc.subEl.textContent = "";
+    gc.legendEl.hidden = true;
+    try {
+      const view = await api(
+        "GET",
+        `/api/graphs/${encodeURIComponent(name)}?period=${period}`
+      );
+      if (period !== graphPeriod) return; // タブが切り替わっていたら破棄
+      renderGraph(gc, view);
+    } catch (e) {
+      if (period !== graphPeriod) return;
+      // 原則 7: 取得できないものは取得できないと言う（ゼロ埋め・補間で誤魔化さない）。
+      gc.bodyEl.innerHTML = `<div class="gmsg error">データを取得できませんでした</div>`;
+    }
+  }
+}
+
+function renderGraph(gc, view) {
+  const series = view.series.filter((s) => s.points.length).slice(0, GRAPH_COLORS.length);
+  if (!series.length) {
+    gc.bodyEl.innerHTML = `<div class="gmsg">まだデータがありません</div>`;
+    return;
+  }
+  // 見出しの要約数値 = 先頭系列の最新値（数字が主、カーブは従）。
+  const first = series[0];
+  const latest = first.points[first.points.length - 1][1];
+  gc.valEl.textContent = fmtNum(latest);
+  const u = document.createElement("span");
+  u.className = "u";
+  u.textContent = view.unit;
+  gc.valEl.appendChild(u);
+  // generation の今日ビューは合計 kWh を併記（5 分ビン W の積分近似 Σv×(5/60)÷1000）。
+  if (view.name === "generation" && view.period === "today") {
+    const kwh = (first.points.reduce((a, p) => a + p[1], 0) * (5 / 60)) / 1000;
+    gc.subEl.textContent = `今日の合計 約 ${kwh.toFixed(1)} kWh`;
+  }
+  // 凡例は 2 系列以上のときだけ（単系列はタイトルが系列名を兼ねる）。
+  gc.legendEl.innerHTML = "";
+  gc.legendEl.hidden = series.length < 2;
+  if (series.length >= 2) {
+    series.forEach((s, i) => {
+      const k = document.createElement("span");
+      k.className = "k";
+      const d = document.createElement("span");
+      d.className = "kd";
+      d.style.background = GRAPH_COLORS[i];
+      k.append(d, s.label);
+      gc.legendEl.appendChild(k);
+    });
+  }
+  gc.bodyEl.innerHTML = "";
+  // 今日 = 時系列カーブ。週/月 = 日別集計（単系列は棒、複数系列は折れ線 —
+  // 30 日 × 複数系列のグループ棒はスマホで潰れる）。
+  const svg =
+    view.period !== "today" && series.length === 1
+      ? drawBarChart(series[0], view.period)
+      : drawLineChart(series, view.period);
+  gc.bodyEl.appendChild(svg);
+  attachReadout(svg, gc, series, view);
+}
+
+/* ── SVG チャート描画（手描き・外部ライブラリなし）───── */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const PLOT = { w: 320, h: 132, l: 40, r: 8, t: 8, b: 18 };
+
+function svgNode(tag, attrs) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+
+/* 軸の上端を切りの良い数へ丸める（1/2/5 × 10^n）。 */
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 5, 10]) if (v <= m * p) return m * p;
+  return 10 * p;
+}
+
+function fmtNum(v) {
+  return Math.abs(v) >= 1000
+    ? Math.round(v).toLocaleString("ja-JP")
+    : String(Math.round(v * 10) / 10);
+}
+
+function fmtTs(d, period) {
+  if (period === "today") {
+    return `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/* 罫線（hairline・控えめ）+ y 目盛 + x 端ラベルの共通描画。 */
+function drawFrame(svg, py, yMin, yMax, xLabels) {
+  const { w, h, l, r, b } = PLOT;
+  for (const f of [0, 0.5, 1]) {
+    const v = yMin + (yMax - yMin) * f;
+    const y = py(v);
+    svg.appendChild(svgNode("line", {
+      x1: l, y1: y, x2: w - r, y2: y,
+      stroke: "rgba(150,170,210,0.12)", "stroke-width": 1,
+    }));
+    const t = svgNode("text", {
+      x: l - 5, y: y + 3, "text-anchor": "end",
+      "font-size": 9, fill: "var(--muted)",
+    });
+    t.textContent = fmtNum(v);
+    svg.appendChild(t);
+  }
+  for (const [x, anchor, text] of xLabels) {
+    const t = svgNode("text", {
+      x, y: h - b + 13, "text-anchor": anchor,
+      "font-size": 9, fill: "var(--muted)",
+    });
+    t.textContent = text;
+    svg.appendChild(t);
+  }
+}
+
+function drawLineChart(series, period) {
+  const { w, h, l, r, t, b } = PLOT;
+  const svg = svgNode("svg", { viewBox: `0 0 ${w} ${h}`, role: "img" });
+  const xs = series.flatMap((s) => s.points.map((p) => Date.parse(p[0])));
+  const vs = series.flatMap((s) => s.points.map((p) => p[1]));
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const yMin = Math.min(0, ...vs);
+  const yMax = niceCeil(Math.max(...vs, 1));
+  const px = (x) =>
+    x1 === x0 ? l + (w - l - r) / 2 : l + ((x - x0) / (x1 - x0)) * (w - l - r);
+  const py = (v) => t + (1 - (v - yMin) / (yMax - yMin)) * (h - t - b);
+  drawFrame(svg, py, yMin, yMax, [
+    [px(x0), "start", fmtTs(new Date(x0), period)],
+    [px(x1), "end", fmtTs(new Date(x1), period)],
+  ]);
+  series.forEach((s, i) => {
+    const color = GRAPH_COLORS[i];
+    const d = s.points
+      .map((p, j) => `${j ? "L" : "M"}${px(Date.parse(p[0])).toFixed(1)},${py(p[1]).toFixed(1)}`)
+      .join("");
+    svg.appendChild(svgNode("path", {
+      d, fill: "none", stroke: color, "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round",
+    }));
+    // 終端マーカ（8px）+ サーフェスリング 2px — 線と重なっても読める。
+    const lp = s.points[s.points.length - 1];
+    svg.appendChild(svgNode("circle", {
+      cx: px(Date.parse(lp[0])).toFixed(1), cy: py(lp[1]).toFixed(1),
+      r: 4, fill: color, stroke: GRAPH_SURFACE, "stroke-width": 2,
+    }));
+  });
+  return svg;
+}
+
+function drawBarChart(s, period) {
+  const { w, h, l, r, t, b } = PLOT;
+  const svg = svgNode("svg", { viewBox: `0 0 ${w} ${h}`, role: "img" });
+  const n = s.points.length;
+  const yMax = niceCeil(Math.max(...s.points.map((p) => p[1]), 1));
+  const py = (v) => t + (1 - v / yMax) * (h - t - b);
+  const slot = (w - l - r) / n;
+  // 棒 ≤24px・隣接とは最低 2px の地の間隔。
+  const bw = Math.max(2, Math.min(24, slot - 2));
+  const first = s.points[0], last = s.points[n - 1];
+  drawFrame(svg, py, 0, yMax, [
+    [l + slot / 2, "start", fmtTs(new Date(first[0]), period)],
+    [l + slot * (n - 0.5), "end", fmtTs(new Date(last[0]), period)],
+  ]);
+  const y0 = py(0);
+  s.points.forEach((p, i) => {
+    const x = l + slot * i + (slot - bw) / 2;
+    const y = py(p[1]);
+    // 上端 4px 丸め・基線は角（データ端だけ丸める）。
+    const rr = Math.min(4, bw / 2, Math.max(0, y0 - y));
+    svg.appendChild(svgNode("path", {
+      d: `M${x},${y0} L${x},${y + rr} Q${x},${y} ${x + rr},${y}` +
+         ` L${x + bw - rr},${y} Q${x + bw},${y} ${x + bw},${y + rr} L${x + bw},${y0} Z`,
+      fill: GRAPH_COLORS[0],
+    }));
+  });
+  return svg;
+}
+
+/* ── ホバー/タッチ読み取り層: 最寄り時点の値を gsub に表示 ── */
+// 系列間の時点対応は index ベースの近似（同一クエリ由来のビンは揃っている前提）。
+function attachReadout(svg, gc, series, view) {
+  const baseSub = gc.subEl.textContent;
+  const pts0 = series[0].points;
+  const show = (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const fx = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    const idx = Math.round(fx * (pts0.length - 1));
+    const ts = new Date(Date.parse(pts0[idx][0]));
+    const vals = series.map((s, i) => {
+      const p = s.points[Math.min(idx, s.points.length - 1)];
+      return (series.length > 1 ? s.label + " " : "") + fmtNum(p[1]);
+    });
+    gc.subEl.textContent =
+      `${fmtTs(ts, view.period)}  ${vals.join(" / ")} ${view.unit}`;
+  };
+  svg.addEventListener("pointerdown", show);
+  svg.addEventListener("pointermove", show);
+  svg.addEventListener("pointerleave", () => { gc.subEl.textContent = baseSub; });
+  svg.addEventListener("pointerup", () => { gc.subEl.textContent = baseSub; });
+}
+
 async function boot() {
-  let devices, grps;
+  let devices, grps, graphList;
   try {
-    [devices, grps] = await Promise.all([
+    [devices, grps, graphList] = await Promise.all([
       api("GET", "/api/devices"),
       api("GET", "/api/groups").catch(() => []),
+      api("GET", "/api/graphs").catch(() => []),
     ]);
   } catch (e) {
     app.innerHTML = `<div class="boot">⚠ サーバに接続できません</div>`;
@@ -878,6 +1186,8 @@ async function boot() {
       if (!grouped.has(dev.name)) app.appendChild(buildCard(dev));
     }
   }
+  // グラフが config に無ければセクションごと出さない。
+  if (graphList.length) buildGraphSection(graphList);
   startPolling();
   fetchLightStatesOnce(devices);
 }
