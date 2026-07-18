@@ -355,13 +355,19 @@ const VERB = {
   on: "つけています…", off: "消しています…", preset: "変更中…",
 };
 
-const POLL_MS = 4000; // 3〜5 秒ポーリング（状態は pull）。
+const POLL_MS = 4000; // アクティブ窓の間のポーリング間隔。
+const POLL_WINDOW_MS = 2 * 60 * 1000;      // 操作後にポーリングを続ける窓。
+const POLL_EXTEND_MS = 30 * 1000;          // 動作中（opening/closing）が見えている間の延長単位。
+const POLL_EXTEND_CAP_MS = 10 * 60 * 1000; // 直近トリガーからの延長上限（固着時の無限ポーリング防止）。
+const MOVING_STATES = new Set(["opening", "closing"]);
 const LIGHT_CATCHUP_MS = 2000; // light: 操作後に 1 回だけ state を追いつき取得するまでの待ち。
 
 const app = document.getElementById("app");
 const cards = new Map();  // device name -> {statusEl, labelEl, msgEl, buttons, state}
 const groups = [];        // {name, el, buttons, busyEl, summaryEl, members}
-let polling = false;
+let pollUntil = 0;          // この時刻までポーリング（アクティブ窓）。窓の外は完全停止。
+let pollAnchor = 0;         // 直近トリガー（操作 / 表示）時刻。延長上限の基準。
+let pollLoopRunning = false;
 let busyCount = 0;        // 操作中はポーリングを止め、3610 の取り合いを避ける。
 
 async function api(method, path, body) {
@@ -856,13 +862,44 @@ async function pollOnce() {
     }
   }
   updateGroupSummaries();
+  // 動作中のシャッターが見えている間は窓を延長して完了まで追う（上限 POLL_EXTEND_CAP_MS）。
+  for (const c of cards.values()) {
+    if (c.kind !== "light" && MOVING_STATES.has(c.state)) {
+      extendPollWindow(POLL_EXTEND_MS);
+      break;
+    }
+  }
 }
 
-function startPolling() {
-  if (polling) return;
-  polling = true;
-  const tick = async () => { await pollOnce(); setTimeout(tick, POLL_MS); };
-  tick();
+/* 窓を「今から ms」まで延ばす（短縮はしない）。上限は直近トリガーから POLL_EXTEND_CAP_MS。 */
+function extendPollWindow(ms) {
+  const until = Math.min(Date.now() + ms, pollAnchor + POLL_EXTEND_CAP_MS);
+  if (until > pollUntil) pollUntil = until;
+  if (pollUntil > Date.now()) ensurePollLoop();
+}
+
+/* トリガー（操作）起点で窓を開く。延長上限の基準もここに移る。 */
+function bumpPollWindow(ms) {
+  pollAnchor = Date.now();
+  extendPollWindow(ms);
+}
+
+function ensurePollLoop() {
+  if (pollLoopRunning) return;
+  pollLoopRunning = true;
+  const tick = async () => {
+    if (Date.now() >= pollUntil) { pollLoopRunning = false; return; }
+    await pollOnce();
+    setTimeout(tick, POLL_MS);
+  };
+  // 窓が開く直前に必ず取得済み（操作の同期確認 / refreshOnce）なので 1 周期待ってから回す。
+  setTimeout(tick, POLL_MS);
+}
+
+/* 表示トリガー: 1 回だけ取得。動作中が見えたときだけ pollOnce 側で窓が開く。 */
+async function refreshOnce() {
+  pollAnchor = Date.now();
+  await pollOnce();
 }
 
 /* ── light の初回 state 取得（1 回だけ・ポーリングなし）── */
@@ -1189,11 +1226,11 @@ async function boot() {
   }
   // グラフが config に無ければセクションごと出さない。
   if (graphList.length) buildGraphSection(graphList);
-  startPolling();
+  refreshOnce();
   fetchLightStatesOnce(devices);
 }
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOnce(); });
 
 boot();
 </script>
