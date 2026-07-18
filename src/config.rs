@@ -49,6 +49,8 @@ pub struct Config {
     pub groups: Vec<Group>,
     #[serde(default, rename = "graph")]
     pub graphs: Vec<Graph>,
+    #[serde(default)]
+    pub health: Option<Health>,
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -86,6 +88,11 @@ pub struct Graph {
     pub unit_daily: Option<String>,
     /// exec するコマンドテンプレ。{period} プレースホルダをちょうど 1 個含む。
     pub query: Vec<String>,
+    /// series 名（下層の生ラベル）→ UI 表示名の置換マップ（任意）。
+    /// 下層固有の series 名の知識を config に留める（設計原則 2 と同型）。
+    /// マップに無い series は素通し。検証はしない — 知らないキーは単に使われない。
+    #[serde(default)]
+    pub series_labels: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Graph {
@@ -101,6 +108,21 @@ impl Graph {
             self.unit_daily.as_deref().unwrap_or(&self.unit)
         }
     }
+}
+
+/// マシン健全性レポートのコマンド定義（任意）。未設定なら /api/health ごと無効。
+/// しきい値判定は下層（embalse）の責務 — mando は exec して契約 JSON を
+/// 正規化するだけで、metric 名もコマンド名も本体は知らない（設計原則 2）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Health {
+    /// バナー表示の対象名（任意。例 "jarvis"）。未指定なら UI は名前なしで出す。
+    #[serde(default)]
+    pub label: Option<String>,
+    /// exec するコマンド配列。
+    pub command: Vec<String>,
+    /// metric 名 → UI 表示名の置換マップ（任意）。無いキーは metric 名を素通し。
+    #[serde(default)]
+    pub labels: Option<std::collections::HashMap<String, String>>,
 }
 
 fn default_bind() -> String {
@@ -209,6 +231,7 @@ pub enum ConfigError {
     DuplicateGraph(String),
     EmptyGraphQuery(String),
     PeriodPlaceholder { graph: String, count: usize },
+    EmptyHealthCommand,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -252,6 +275,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::PeriodPlaceholder { graph, count } => {
                 write!(f, "graph {graph}: query は {{period}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
             }
+            ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
         }
     }
 }
@@ -430,6 +454,13 @@ impl Config {
                 });
             }
         }
+
+        if let Some(h) = &self.health {
+            if h.command.is_empty() {
+                return Err(ConfigError::EmptyHealthCommand);
+            }
+        }
+
         Ok(())
     }
 
@@ -1192,6 +1223,103 @@ mod tests {
         assert!(matches!(
             Config::load(&p),
             Err(ConfigError::PeriodPlaceholder { count: 2, .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_series_labels_parses() {
+        let p = write_tmp(
+            "graphlabels",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name  = "plain"
+            unit  = "W"
+            query = ["embalse-query", "plain", "{period}"]
+            [[graph]]
+            name  = "machine"
+            label = "jarvis"
+            unit  = "%"
+            query = ["embalse-query", "machine", "{period}"]
+            [graph.series_labels]
+            cpu_used_pct = "CPU (%)"
+            cpu_temp_c   = "温度 (℃)"
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let g = cfg.find_graph("machine").unwrap();
+        let m = g.series_labels.as_ref().unwrap();
+        assert_eq!(m.get("cpu_used_pct").unwrap(), "CPU (%)");
+        assert_eq!(m.get("cpu_temp_c").unwrap(), "温度 (℃)");
+        // series_labels 無しの既存形は None のまま
+        assert!(cfg.find_graph("plain").unwrap().series_labels.is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn health_parses() {
+        let p = write_tmp(
+            "healthok",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [health]
+            label   = "jarvis"
+            command = ["embalse-query", "health"]
+            [health.labels]
+            cpu_used_pct = "CPU"
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let h = cfg.health.as_ref().unwrap();
+        assert_eq!(h.label.as_deref(), Some("jarvis"));
+        assert_eq!(h.command, vec!["embalse-query", "health"]);
+        assert_eq!(h.labels.as_ref().unwrap().get("cpu_used_pct").unwrap(), "CPU");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn health_absent_is_none() {
+        let p = write_tmp(
+            "healthnone",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.health.is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn health_empty_command_rejected() {
+        let p = write_tmp(
+            "healthempty",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [health]
+            command = []
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyHealthCommand)
         ));
         std::fs::remove_file(p).ok();
     }

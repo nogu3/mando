@@ -123,8 +123,13 @@ pub struct GraphSeries {
 /// series 省略行は default_label（グラフの表示名）に束ねる。ts / value が
 /// 欠けた・型不正の行は drop（部分的に壊れたデータで全体を落とさない）。
 /// 系列は初出順、各系列内は ts 昇順（同一オフセットの ISO8601 は辞書順=時刻順）。
+/// series_labels は series 名 → UI 表示名の置換マップ（無いキーは素通し）。
 /// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
-pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSeries> {
+pub fn normalize_graph_rows(
+    rows: &[Value],
+    default_label: &str,
+    series_labels: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<GraphSeries> {
     let mut order: Vec<String> = Vec::new();
     let mut by_label: std::collections::HashMap<String, Vec<(String, f64)>> =
         std::collections::HashMap::new();
@@ -135,10 +140,14 @@ pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSer
         let Some(value) = row.get("value").and_then(Value::as_f64) else {
             continue;
         };
-        let label = row
+        let raw = row
             .get("series")
             .and_then(Value::as_str)
             .unwrap_or(default_label);
+        let label = series_labels
+            .and_then(|m| m.get(raw))
+            .map(String::as_str)
+            .unwrap_or(raw);
         if !by_label.contains_key(label) {
             order.push(label.to_string());
         }
@@ -155,6 +164,70 @@ pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSer
             GraphSeries { label, points }
         })
         .collect()
+}
+
+/// health 1 項目。契約行の metric を UI 表示名に写したもの。
+#[derive(Debug, PartialEq, Serialize)]
+pub struct HealthItem {
+    pub label: String,
+    /// stale 行は value / ts を持たない（契約どおり省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+    pub level: String,
+}
+
+/// health レポート。worst は全項目の最悪 level。
+#[derive(Debug, PartialEq, Serialize)]
+pub struct HealthReport {
+    pub worst: String,
+    pub items: Vec<HealthItem>,
+}
+
+/// level の深刻度順位（インデックス = 深刻度）。stale（収集停止）は warn より上 —
+/// 「観測できていない」こと自体が気づくべき異常（crit ほどの緊急ではない）。
+const HEALTH_LEVELS: [&str; 4] = ["ok", "warn", "stale", "crit"];
+
+/// 下層 health CLI の契約 JSON（`[{"metric", "value"?, "ts"?, "level"}]`）→ UI 向けレポート。
+/// しきい値判定は下層の責務 — ここでは level を写すだけで判定しない。
+/// level が 4 値以外・metric 欠落の行は drop（解釈できないものを ok と偽らない）。
+/// items が空（0 行 / 全行 drop）なら worst = "stale"（判定材料ゼロ＝収集停止扱い）。
+/// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
+pub fn normalize_health_rows(
+    rows: &[Value],
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> HealthReport {
+    let mut items = Vec::new();
+    let mut worst = 0;
+    for row in rows {
+        let Some(metric) = row.get("metric").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(level) = row.get("level").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rank) = HEALTH_LEVELS.iter().position(|l| *l == level) else {
+            continue;
+        };
+        let label = labels
+            .and_then(|m| m.get(metric))
+            .map(String::as_str)
+            .unwrap_or(metric);
+        worst = worst.max(rank);
+        items.push(HealthItem {
+            label: label.to_string(),
+            value: row.get("value").and_then(Value::as_f64),
+            ts: row.get("ts").and_then(Value::as_str).map(str::to_string),
+            level: level.to_string(),
+        });
+    }
+    let worst = if items.is_empty() {
+        "stale".to_string()
+    } else {
+        HEALTH_LEVELS[worst].to_string()
+    };
+    HealthReport { worst, items }
 }
 
 #[cfg(test)]
@@ -282,7 +355,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 100.0}),
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 200.0}),
         ];
-        let s = normalize_graph_rows(&rows, "太陽光発電");
+        let s = normalize_graph_rows(&rows, "太陽光発電", None);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].label, "太陽光発電");
         assert_eq!(s[0].points.len(), 2);
@@ -296,7 +369,7 @@ mod tests {
             json!({"ts": "t1", "series": "リビング", "value": 600.0}),
             json!({"ts": "t2", "series": "書斎", "value": 820.0}),
         ];
-        let s = normalize_graph_rows(&rows, "CO2");
+        let s = normalize_graph_rows(&rows, "CO2", None);
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].label, "書斎");
         assert_eq!(s[0].points.len(), 2);
@@ -310,7 +383,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 2.0}),
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 1.0}),
         ];
-        let s = normalize_graph_rows(&rows, "x");
+        let s = normalize_graph_rows(&rows, "x", None);
         assert_eq!(s[0].points[0].1, 1.0);
         assert_eq!(s[0].points[1].1, 2.0);
     }
@@ -324,14 +397,28 @@ mod tests {
             json!("garbage"),                              // オブジェクトですらない
             json!({"ts": "t3", "value": 3.0}),             // 唯一の正常行
         ];
-        let s = normalize_graph_rows(&rows, "x");
+        let s = normalize_graph_rows(&rows, "x", None);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].points, vec![("t3".to_string(), 3.0)]);
     }
 
     #[test]
     fn graph_rows_empty_is_empty() {
-        assert!(normalize_graph_rows(&[], "x").is_empty());
+        assert!(normalize_graph_rows(&[], "x", None).is_empty());
+    }
+
+    #[test]
+    fn graph_rows_series_labels_mapped() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("cpu_used_pct".to_string(), "CPU (%)".to_string());
+        let rows = [
+            json!({"ts": "t1", "series": "cpu_used_pct", "value": 12.0}),
+            json!({"ts": "t1", "series": "mem_used_pct", "value": 45.0}),
+        ];
+        let s = normalize_graph_rows(&rows, "jarvis", Some(&m));
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].label, "CPU (%)"); // マップにあれば置換
+        assert_eq!(s[1].label, "mem_used_pct"); // 無ければ素通し
     }
 
     #[test]
@@ -343,6 +430,81 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
             r#"{"label":"発電","points":[["t1",1.5]]}"#
+        );
+    }
+
+    #[test]
+    fn health_rows_normalized_with_labels() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("disk_used_pct".to_string(), "ディスク".to_string());
+        let rows = [
+            json!({"metric": "disk_used_pct", "value": 83.2, "ts": "t1", "level": "warn"}),
+            json!({"metric": "cpu_temp_c", "value": 55.0, "ts": "t1", "level": "ok"}),
+        ];
+        let r = normalize_health_rows(&rows, Some(&m));
+        assert_eq!(r.worst, "warn");
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].label, "ディスク"); // マップにあれば置換
+        assert_eq!(r.items[0].value, Some(83.2));
+        assert_eq!(r.items[0].level, "warn");
+        assert_eq!(r.items[1].label, "cpu_temp_c"); // 無ければ素通し
+    }
+
+    #[test]
+    fn health_worst_ranking_crit_over_stale_over_warn() {
+        // crit > stale > warn > ok（stale = 収集停止も気づくべき異常）
+        let rows = [
+            json!({"metric": "a", "level": "warn", "value": 1.0, "ts": "t"}),
+            json!({"metric": "b", "level": "stale"}),
+        ];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "stale");
+        let rows = [
+            json!({"metric": "a", "level": "stale"}),
+            json!({"metric": "b", "level": "crit", "value": 99.0, "ts": "t"}),
+        ];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "crit");
+        let rows = [json!({"metric": "a", "level": "ok", "value": 1.0, "ts": "t"})];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "ok");
+    }
+
+    #[test]
+    fn health_stale_row_has_no_value_ts() {
+        let rows = [json!({"metric": "mem_used_pct", "level": "stale"})];
+        let r = normalize_health_rows(&rows, None);
+        assert_eq!(r.items[0].value, None);
+        assert_eq!(r.items[0].ts, None);
+        assert_eq!(r.items[0].level, "stale");
+    }
+
+    #[test]
+    fn health_invalid_rows_dropped() {
+        let rows = [
+            json!({"metric": "a", "level": "banana"}), // 未知 level
+            json!({"level": "ok"}),                    // metric 欠落
+            json!("garbage"),                          // オブジェクトですらない
+            json!({"metric": "d", "level": "ok", "value": 1.0, "ts": "t"}),
+        ];
+        let r = normalize_health_rows(&rows, None);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].label, "d");
+    }
+
+    #[test]
+    fn health_empty_is_stale() {
+        // 判定材料ゼロ＝収集停止と同じ扱い（ok と偽らない）。
+        let r = normalize_health_rows(&[], None);
+        assert!(r.items.is_empty());
+        assert_eq!(r.worst, "stale");
+        let rows = [json!({"metric": "a", "level": "banana"})];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "stale");
+    }
+
+    #[test]
+    fn health_item_serializes_without_none_fields() {
+        let r = normalize_health_rows(&[json!({"metric": "a", "level": "stale"})], None);
+        assert_eq!(
+            serde_json::to_string(&r.items[0]).unwrap(),
+            r#"{"label":"a","level":"stale"}"#
         );
     }
 }

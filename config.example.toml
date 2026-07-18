@@ -119,3 +119,27 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # label = "CO2"
 # unit  = "ppm"
 # query = ["embalse-query", "co2", "{period}"]
+#
+# [[graph]]
+# name  = "machine"
+# label = "jarvis"
+# unit  = "%"      # 温度だけ series_labels 側で ℃ を明示
+# query = ["embalse-query", "machine", "{period}"]
+# [graph.series_labels]  # series 名 → UI 表示名（任意。無いキーは素通し）
+# cpu_used_pct  = "CPU (%)"
+# mem_used_pct  = "メモリ (%)"
+# disk_used_pct = "ディスク (%)"
+# cpu_temp_c    = "温度 (℃)"
+
+# ── マシン健全性（任意）─────────────────────────────
+# 下層の health CLI（embalse-query health 等）を exec し、異常時のみ画面上部に
+# バナーを出す。未設定ならこの機能ごと無効。しきい値判定は下層の責務。
+#
+# [health]
+# label   = "jarvis"                       # バナーの対象名（任意）
+# command = ["embalse-query", "health"]
+# [health.labels]  # metric 名 → 表示名（任意。無いキーは素通し）
+# cpu_used_pct  = "CPU"
+# mem_used_pct  = "メモリ"
+# disk_used_pct = "ディスク"
+# cpu_temp_c    = "CPU温度"

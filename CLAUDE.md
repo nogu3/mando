@@ -70,6 +70,7 @@
 - `POST /api/devices/{name}/close` — 同上（close）
 - `GET  /api/graphs` — config 上のグラフ一覧（きろくセクション）
 - `GET  /api/graphs/{name}?period=today|week|month` — graph query テンプレを exec → 正規化した系列 `{ "series": [...] }`
+- `GET  /api/health` — health テンプレを exec → 正規化 `{ "label"?, "worst": "ok|warn|crit|stale", "items": [...] }`（`[health]` 未設定なら 404）
 
 ---
 
