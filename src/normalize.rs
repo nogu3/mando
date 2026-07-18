@@ -123,8 +123,13 @@ pub struct GraphSeries {
 /// series 省略行は default_label（グラフの表示名）に束ねる。ts / value が
 /// 欠けた・型不正の行は drop（部分的に壊れたデータで全体を落とさない）。
 /// 系列は初出順、各系列内は ts 昇順（同一オフセットの ISO8601 は辞書順=時刻順）。
+/// series_labels は series 名 → UI 表示名の置換マップ（無いキーは素通し）。
 /// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
-pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSeries> {
+pub fn normalize_graph_rows(
+    rows: &[Value],
+    default_label: &str,
+    series_labels: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<GraphSeries> {
     let mut order: Vec<String> = Vec::new();
     let mut by_label: std::collections::HashMap<String, Vec<(String, f64)>> =
         std::collections::HashMap::new();
@@ -135,10 +140,14 @@ pub fn normalize_graph_rows(rows: &[Value], default_label: &str) -> Vec<GraphSer
         let Some(value) = row.get("value").and_then(Value::as_f64) else {
             continue;
         };
-        let label = row
+        let raw = row
             .get("series")
             .and_then(Value::as_str)
             .unwrap_or(default_label);
+        let label = series_labels
+            .and_then(|m| m.get(raw))
+            .map(String::as_str)
+            .unwrap_or(raw);
         if !by_label.contains_key(label) {
             order.push(label.to_string());
         }
@@ -282,7 +291,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 100.0}),
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 200.0}),
         ];
-        let s = normalize_graph_rows(&rows, "太陽光発電");
+        let s = normalize_graph_rows(&rows, "太陽光発電", None);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].label, "太陽光発電");
         assert_eq!(s[0].points.len(), 2);
@@ -296,7 +305,7 @@ mod tests {
             json!({"ts": "t1", "series": "リビング", "value": 600.0}),
             json!({"ts": "t2", "series": "書斎", "value": 820.0}),
         ];
-        let s = normalize_graph_rows(&rows, "CO2");
+        let s = normalize_graph_rows(&rows, "CO2", None);
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].label, "書斎");
         assert_eq!(s[0].points.len(), 2);
@@ -310,7 +319,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 2.0}),
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 1.0}),
         ];
-        let s = normalize_graph_rows(&rows, "x");
+        let s = normalize_graph_rows(&rows, "x", None);
         assert_eq!(s[0].points[0].1, 1.0);
         assert_eq!(s[0].points[1].1, 2.0);
     }
@@ -324,14 +333,28 @@ mod tests {
             json!("garbage"),                              // オブジェクトですらない
             json!({"ts": "t3", "value": 3.0}),             // 唯一の正常行
         ];
-        let s = normalize_graph_rows(&rows, "x");
+        let s = normalize_graph_rows(&rows, "x", None);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].points, vec![("t3".to_string(), 3.0)]);
     }
 
     #[test]
     fn graph_rows_empty_is_empty() {
-        assert!(normalize_graph_rows(&[], "x").is_empty());
+        assert!(normalize_graph_rows(&[], "x", None).is_empty());
+    }
+
+    #[test]
+    fn graph_rows_series_labels_mapped() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("cpu_used_pct".to_string(), "CPU (%)".to_string());
+        let rows = [
+            json!({"ts": "t1", "series": "cpu_used_pct", "value": 12.0}),
+            json!({"ts": "t1", "series": "mem_used_pct", "value": 45.0}),
+        ];
+        let s = normalize_graph_rows(&rows, "jarvis", Some(&m));
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].label, "CPU (%)"); // マップにあれば置換
+        assert_eq!(s[1].label, "mem_used_pct"); // 無ければ素通し
     }
 
     #[test]

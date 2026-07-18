@@ -660,7 +660,8 @@ async fn get_graph(
             return graph_unavailable(&name);
         }
     };
-    let series = normalize::normalize_graph_rows(&rows, graph.label());
+    let series =
+        normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref());
     Json(GraphView {
         name: graph.name.clone(),
         period: period.to_string(),
@@ -768,6 +769,12 @@ mod tests {
             name  = "notarray"
             unit  = "W"
             query = ["sh", "-c", "printf '{}'", "sh", "{period}"]
+            [[graph]]
+            name  = "machine"
+            label = "jarvis"
+            unit  = "%"
+            query = ["sh", "-c", "printf '[{\"ts\":\"t1\",\"series\":\"cpu_used_pct\",\"value\":12.3},{\"ts\":\"t1\",\"series\":\"cpu_temp_c\",\"value\":52.0}]'", "sh", "{period}"]
+            series_labels = { cpu_used_pct = "CPU (%)", cpu_temp_c = "温度 (℃)" }
             "##,
         )
         .unwrap();
@@ -1087,6 +1094,19 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_GATEWAY);
         let (st, _) = call("GET", "/api/graphs/notarray").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn graph_series_labels_applied() {
+        let (st, v) = call("GET", "/api/graphs/machine").await;
+        assert_eq!(st, StatusCode::OK);
+        let labels: Vec<&str> = v["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["CPU (%)", "温度 (℃)"]);
     }
 
     #[tokio::test]

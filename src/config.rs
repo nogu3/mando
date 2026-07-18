@@ -90,7 +90,6 @@ pub struct Graph {
     /// 下層固有の series 名の知識を config に留める（設計原則 2 と同型）。
     /// マップに無い series は素通し。検証はしない — 知らないキーは単に使われない。
     #[serde(default)]
-    #[allow(dead_code)]
     pub series_labels: Option<std::collections::HashMap<String, String>>,
 }
 
