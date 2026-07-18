@@ -362,15 +362,25 @@ mod tests {
     }
 
     #[test]
-    fn casa_envelope_without_properties_is_unknown() {
-        // value はあるが properties を持たない（対象外スキーマ）→ Unknown。
-        // enl 直の後方互換を壊さないための番犬。
+    fn casa_envelope_unmatched_property_is_unknown() {
+        // value 内に properties はあるが open_close_state でも既知 state 値でもない
+        // （例: 照明の power）→ Unknown。エンベロープを剥がした先で誤分類しない番犬。
         let raw = json!({
             "device": "porch_light", "protocol": "echonet",
             "value": {"eoj":"029102","esv":"GetRes",
                       "properties":[{"epc":"80","name":"power","value":{"power":"on"}}]}
         });
-        // properties はあるが open_close_state でも既知 state 値でもない → Unknown。
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn casa_envelope_value_without_properties_is_unknown() {
+        // value はあるが properties キーを持たない → filter が外れて raw に戻り、
+        // raw にもトップレベル properties が無いので Unknown。フォールバック分岐の番犬。
+        let raw = json!({
+            "device": "porch_light", "protocol": "echonet",
+            "value": {"power": "on"}
+        });
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
     }
 
