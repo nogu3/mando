@@ -111,6 +111,7 @@ fn router(app: Shared) -> Router {
         .route("/api/groups/:name/stop", post(group_stop))
         .route("/api/graphs", get(list_graphs))
         .route("/api/graphs/:name", get(get_graph))
+        .route("/api/health", get(get_health))
         .with_state(app)
 }
 
@@ -705,6 +706,60 @@ fn graph_unavailable(name: &str) -> Response {
         .into_response()
 }
 
+#[derive(Serialize)]
+struct HealthView {
+    /// バナー表示の対象名（config の health.label。未指定なら省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(flatten)]
+    report: normalize::HealthReport,
+}
+
+/// マシン健全性レポート。health テンプレを exec し契約 JSON を正規化して返す。
+/// しきい値判定は下層（embalse）の責務 — mando は判定しない。
+/// exec はグラフ用 Executor に相乗り（3610 と無関係な読み系。devices の枠に入れない）。
+async fn get_health(State(app): State<Shared>) -> Response {
+    let Some(health) = &app.config.health else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"health not configured"}"#.to_string(),
+        )
+            .into_response();
+    };
+    let result = run_graph_cmd(&app.graph_executor, &health.command, GRAPH_QUERY_TIMEOUT).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::warn!(
+            outcome = ?result.outcome,
+            stderr = %result.stderr.trim(),
+            "health query 非成功"
+        );
+        return health_unavailable();
+    }
+    let rows = match serde_json::from_str::<Value>(&result.stdout) {
+        Ok(Value::Array(rows)) => rows,
+        Ok(_) | Err(_) => {
+            tracing::warn!("health query の stdout が契約 JSON 配列でない");
+            return health_unavailable();
+        }
+    };
+    Json(HealthView {
+        label: health.label.clone(),
+        report: normalize::normalize_health_rows(&rows, health.labels.as_ref()),
+    })
+    .into_response()
+}
+
+/// 下層の health 読み出しに失敗（exec 非成功・契約 JSON でない）→ 502。
+fn health_unavailable() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"health query failed"}"#.to_string(),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +830,12 @@ mod tests {
             unit  = "%"
             query = ["sh", "-c", "printf '[{\"ts\":\"t1\",\"series\":\"cpu_used_pct\",\"value\":12.3},{\"ts\":\"t1\",\"series\":\"cpu_temp_c\",\"value\":52.0}]'", "sh", "{period}"]
             series_labels = { cpu_used_pct = "CPU (%)", cpu_temp_c = "温度 (℃)" }
+            [health]
+            label   = "jarvis"
+            command = ["sh", "-c", "printf '[{\"metric\":\"cpu_used_pct\",\"value\":12.3,\"ts\":\"t1\",\"level\":\"ok\"},{\"metric\":\"disk_used_pct\",\"value\":83.2,\"ts\":\"t1\",\"level\":\"warn\"}]'"]
+            [health.labels]
+            cpu_used_pct  = "CPU"
+            disk_used_pct = "ディスク"
             "##,
         )
         .unwrap();
@@ -818,6 +879,75 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
+    }
+
+    async fn call_on(cfg_toml: &str, method: &str, path: &str) -> (axum::http::StatusCode, Value) {
+        let app = Arc::new(App {
+            config: toml::from_str(cfg_toml).unwrap(),
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+        });
+        let res = router(app)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn health_normalized_with_labels() {
+        let (st, v) = call("GET", "/api/health").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["label"], "jarvis");
+        assert_eq!(v["worst"], "warn");
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["label"], "CPU");
+        assert_eq!(items[1]["label"], "ディスク");
+        assert_eq!(items[1]["value"], 83.2);
+        assert_eq!(items[1]["level"], "warn");
+    }
+
+    const MINIMAL_DEVICE: &str = r##"
+        [[device]]
+        name = "s"
+        get_state = ["sh", "-c", "printf '{}'"]
+        open  = ["sh", "-c", "printf '{}'"]
+        close = ["sh", "-c", "printf '{}'"]
+    "##;
+
+    #[tokio::test]
+    async fn health_not_configured_is_404() {
+        let (st, _) = call_on(MINIMAL_DEVICE, "GET", "/api/health").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn health_exec_failure_is_502() {
+        let cfg = format!(
+            "{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n"
+        );
+        let (st, v) = call_on(&cfg, "GET", "/api/health").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "health query failed");
+    }
+
+    #[tokio::test]
+    async fn health_non_json_stdout_is_502() {
+        let cfg = format!(
+            "{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"printf 'not-json'\"]\n"
+        );
+        let (st, _) = call_on(&cfg, "GET", "/api/health").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

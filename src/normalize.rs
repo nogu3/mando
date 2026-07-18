@@ -167,7 +167,6 @@ pub fn normalize_graph_rows(
 }
 
 /// health 1 項目。契約行の metric を UI 表示名に写したもの。
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Serialize)]
 pub struct HealthItem {
     pub label: String,
@@ -180,7 +179,6 @@ pub struct HealthItem {
 }
 
 /// health レポート。worst は全項目の最悪 level。
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Serialize)]
 pub struct HealthReport {
     pub worst: String,
@@ -196,7 +194,6 @@ const HEALTH_LEVELS: [&str; 4] = ["ok", "warn", "stale", "crit"];
 /// level が 4 値以外・metric 欠落の行は drop（解釈できないものを ok と偽らない）。
 /// items が空（0 行 / 全行 drop）なら worst = "stale"（判定材料ゼロ＝収集停止扱い）。
 /// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
-#[allow(dead_code)]
 pub fn normalize_health_rows(
     rows: &[Value],
     labels: Option<&std::collections::HashMap<String, String>>,

@@ -114,7 +114,6 @@ impl Graph {
 /// しきい値判定は下層（embalse）の責務 — mando は exec して契約 JSON を
 /// 正規化するだけで、metric 名もコマンド名も本体は知らない（設計原則 2）。
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct Health {
     /// バナー表示の対象名（任意。例 "jarvis"）。未指定なら UI は名前なしで出す。
     #[serde(default)]
