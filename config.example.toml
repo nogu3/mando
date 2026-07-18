@@ -119,3 +119,14 @@ stop      = ["enl", "set", "192.0.2.10", "026301", "open_close_operation", "stop
 # label = "CO2"
 # unit  = "ppm"
 # query = ["embalse-query", "co2", "{period}"]
+#
+# [[graph]]
+# name  = "machine"
+# label = "jarvis"
+# unit  = "%"      # 温度だけ series_labels 側で ℃ を明示
+# query = ["embalse-query", "machine", "{period}"]
+# [graph.series_labels]  # series 名 → UI 表示名（任意。無いキーは素通し）
+# cpu_used_pct  = "CPU (%)"
+# mem_used_pct  = "メモリ (%)"
+# disk_used_pct = "ディスク (%)"
+# cpu_temp_c    = "温度 (℃)"

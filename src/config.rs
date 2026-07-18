@@ -86,6 +86,12 @@ pub struct Graph {
     pub unit_daily: Option<String>,
     /// exec するコマンドテンプレ。{period} プレースホルダをちょうど 1 個含む。
     pub query: Vec<String>,
+    /// series 名（下層の生ラベル）→ UI 表示名の置換マップ（任意）。
+    /// 下層固有の series 名の知識を config に留める（設計原則 2 と同型）。
+    /// マップに無い series は素通し。検証はしない — 知らないキーは単に使われない。
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub series_labels: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Graph {
@@ -1193,6 +1199,40 @@ mod tests {
             Config::load(&p),
             Err(ConfigError::PeriodPlaceholder { count: 2, .. })
         ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_series_labels_parses() {
+        let p = write_tmp(
+            "graphlabels",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[graph]]
+            name  = "plain"
+            unit  = "W"
+            query = ["embalse-query", "plain", "{period}"]
+            [[graph]]
+            name  = "machine"
+            label = "jarvis"
+            unit  = "%"
+            query = ["embalse-query", "machine", "{period}"]
+            [graph.series_labels]
+            cpu_used_pct = "CPU (%)"
+            cpu_temp_c   = "温度 (℃)"
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let g = cfg.find_graph("machine").unwrap();
+        let m = g.series_labels.as_ref().unwrap();
+        assert_eq!(m.get("cpu_used_pct").unwrap(), "CPU (%)");
+        assert_eq!(m.get("cpu_temp_c").unwrap(), "温度 (℃)");
+        // series_labels 無しの既存形は None のまま
+        assert!(cfg.find_graph("plain").unwrap().series_labels.is_none());
         std::fs::remove_file(p).ok();
     }
 }
