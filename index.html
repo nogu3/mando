@@ -320,6 +320,17 @@
   .gcard .gmsg { font-size: 12px; color: var(--muted); padding: 22px 0; text-align: center; }
   .gcard .gmsg.error { color: var(--warn); }
 
+  /* ── マシン健全性バナー（異常時のみ表示）─────────── */
+  #hbanner { max-width: 560px; margin: 0 auto; padding: 6px 14px 0; }
+  .hbanner {
+    padding: 10px 14px; border-radius: 12px; border: 1px solid;
+    font-size: 13px; font-weight: 600; line-height: 1.5;
+    cursor: pointer; touch-action: manipulation; user-select: none;
+  }
+  .hbanner.warn  { background: rgba(232,161,58,.12);  border-color: rgba(232,161,58,.4);  color: var(--closed); }
+  .hbanner.crit  { background: rgba(240,99,90,.12);   border-color: rgba(240,99,90,.45);  color: var(--warn); }
+  .hbanner.stale { background: rgba(139,147,167,.10); border-color: rgba(139,147,167,.35); color: var(--muted); }
+
   .boot { color: var(--muted); padding: 28px 6px; text-align: center; }
 </style>
 </head>
@@ -329,6 +340,7 @@
   <h1>mando</h1>
   <span class="sub">家のリモコン</span>
 </header>
+<div id="hbanner" hidden></div>
 <main id="app">
   <div class="boot">読み込み中…</div>
 </main>
@@ -919,6 +931,37 @@ async function fetchLightStatesOnce(devices) {
   }
 }
 
+/* ── マシン健全性バナー（異常時のみ表示）────────────── */
+const HEALTH_LEVEL_MSG = { warn: "注意", crit: "危険", stale: "収集停止" };
+
+// boot 時に 1 回だけ取得。ポーリングしない（マシン状態は 5 分粒度でしか動かない）。
+// 取得失敗・404（機能無効）は黙って出さない — 監視の失敗は操作の失敗ではない。
+async function fetchHealth() {
+  let report;
+  try {
+    report = await api("GET", "/api/health");
+  } catch (e) {
+    console.error("health 取得失敗", e);
+    return;
+  }
+  if (report.worst === "ok") return;
+  const bad = report.items.filter((i) => i.level !== "ok");
+  const parts = bad.map((i) => {
+    const v = i.value != null ? ` ${fmtNum(i.value)}` : "";
+    return `${i.label}${v} (${HEALTH_LEVEL_MSG[i.level] || i.level})`;
+  });
+  const prefix = report.label ? `${report.label}: ` : "";
+  const box = document.getElementById("hbanner");
+  const el = document.createElement("div");
+  el.className = `hbanner ${report.worst}`;
+  el.textContent = `⚠ ${prefix}${parts.join(" / ")}`;
+  // タップで閉じる（この表示中のみ。次回ロードで再判定）。
+  el.addEventListener("click", () => { box.hidden = true; box.innerHTML = ""; });
+  box.innerHTML = "";
+  box.appendChild(el);
+  box.hidden = false;
+}
+
 /* ── きろく（embalse グラフ）─────────────────────── */
 // dataviz 検証済みカテゴリカルパレット（ダーク面 #10141d で全チェック PASS）。
 // 系列へ初出順に固定割当する。循環させない — 5 系列以上は先頭 4 系列のみ描画
@@ -1229,6 +1272,7 @@ async function boot() {
   }
   // グラフが config に無ければセクションごと出さない。
   if (graphList.length) buildGraphSection(graphList);
+  fetchHealth();
   refreshOnce();
   fetchLightStatesOnce(devices);
 }
