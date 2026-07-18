@@ -166,6 +166,73 @@ pub fn normalize_graph_rows(
         .collect()
 }
 
+/// health 1 項目。契約行の metric を UI 表示名に写したもの。
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Serialize)]
+pub struct HealthItem {
+    pub label: String,
+    /// stale 行は value / ts を持たない（契約どおり省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+    pub level: String,
+}
+
+/// health レポート。worst は全項目の最悪 level。
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Serialize)]
+pub struct HealthReport {
+    pub worst: String,
+    pub items: Vec<HealthItem>,
+}
+
+/// level の深刻度順位（インデックス = 深刻度）。stale（収集停止）は warn より上 —
+/// 「観測できていない」こと自体が気づくべき異常（crit ほどの緊急ではない）。
+const HEALTH_LEVELS: [&str; 4] = ["ok", "warn", "stale", "crit"];
+
+/// 下層 health CLI の契約 JSON（`[{"metric", "value"?, "ts"?, "level"}]`）→ UI 向けレポート。
+/// しきい値判定は下層の責務 — ここでは level を写すだけで判定しない。
+/// level が 4 値以外・metric 欠落の行は drop（解釈できないものを ok と偽らない）。
+/// items が空（0 行 / 全行 drop）なら worst = "stale"（判定材料ゼロ＝収集停止扱い）。
+/// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
+#[allow(dead_code)]
+pub fn normalize_health_rows(
+    rows: &[Value],
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> HealthReport {
+    let mut items = Vec::new();
+    let mut worst = 0;
+    for row in rows {
+        let Some(metric) = row.get("metric").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(level) = row.get("level").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rank) = HEALTH_LEVELS.iter().position(|l| *l == level) else {
+            continue;
+        };
+        let label = labels
+            .and_then(|m| m.get(metric))
+            .map(String::as_str)
+            .unwrap_or(metric);
+        worst = worst.max(rank);
+        items.push(HealthItem {
+            label: label.to_string(),
+            value: row.get("value").and_then(Value::as_f64),
+            ts: row.get("ts").and_then(Value::as_str).map(str::to_string),
+            level: level.to_string(),
+        });
+    }
+    let worst = if items.is_empty() {
+        "stale".to_string()
+    } else {
+        HEALTH_LEVELS[worst].to_string()
+    };
+    HealthReport { worst, items }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +433,81 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
             r#"{"label":"発電","points":[["t1",1.5]]}"#
+        );
+    }
+
+    #[test]
+    fn health_rows_normalized_with_labels() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("disk_used_pct".to_string(), "ディスク".to_string());
+        let rows = [
+            json!({"metric": "disk_used_pct", "value": 83.2, "ts": "t1", "level": "warn"}),
+            json!({"metric": "cpu_temp_c", "value": 55.0, "ts": "t1", "level": "ok"}),
+        ];
+        let r = normalize_health_rows(&rows, Some(&m));
+        assert_eq!(r.worst, "warn");
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].label, "ディスク"); // マップにあれば置換
+        assert_eq!(r.items[0].value, Some(83.2));
+        assert_eq!(r.items[0].level, "warn");
+        assert_eq!(r.items[1].label, "cpu_temp_c"); // 無ければ素通し
+    }
+
+    #[test]
+    fn health_worst_ranking_crit_over_stale_over_warn() {
+        // crit > stale > warn > ok（stale = 収集停止も気づくべき異常）
+        let rows = [
+            json!({"metric": "a", "level": "warn", "value": 1.0, "ts": "t"}),
+            json!({"metric": "b", "level": "stale"}),
+        ];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "stale");
+        let rows = [
+            json!({"metric": "a", "level": "stale"}),
+            json!({"metric": "b", "level": "crit", "value": 99.0, "ts": "t"}),
+        ];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "crit");
+        let rows = [json!({"metric": "a", "level": "ok", "value": 1.0, "ts": "t"})];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "ok");
+    }
+
+    #[test]
+    fn health_stale_row_has_no_value_ts() {
+        let rows = [json!({"metric": "mem_used_pct", "level": "stale"})];
+        let r = normalize_health_rows(&rows, None);
+        assert_eq!(r.items[0].value, None);
+        assert_eq!(r.items[0].ts, None);
+        assert_eq!(r.items[0].level, "stale");
+    }
+
+    #[test]
+    fn health_invalid_rows_dropped() {
+        let rows = [
+            json!({"metric": "a", "level": "banana"}), // 未知 level
+            json!({"level": "ok"}),                    // metric 欠落
+            json!("garbage"),                          // オブジェクトですらない
+            json!({"metric": "d", "level": "ok", "value": 1.0, "ts": "t"}),
+        ];
+        let r = normalize_health_rows(&rows, None);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].label, "d");
+    }
+
+    #[test]
+    fn health_empty_is_stale() {
+        // 判定材料ゼロ＝収集停止と同じ扱い（ok と偽らない）。
+        let r = normalize_health_rows(&[], None);
+        assert!(r.items.is_empty());
+        assert_eq!(r.worst, "stale");
+        let rows = [json!({"metric": "a", "level": "banana"})];
+        assert_eq!(normalize_health_rows(&rows, None).worst, "stale");
+    }
+
+    #[test]
+    fn health_item_serializes_without_none_fields() {
+        let r = normalize_health_rows(&[json!({"metric": "a", "level": "stale"})], None);
+        assert_eq!(
+            serde_json::to_string(&r.items[0]).unwrap(),
+            r#"{"label":"a","level":"stale"}"#
         );
     }
 }
