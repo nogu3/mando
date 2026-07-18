@@ -39,7 +39,14 @@ pub enum State {
 /// オブジェクト `{"state": "fully_closed"}`、文字列 "open"/"closed"、数値 EDT
 /// (0x41=open / 0x42=closed) のいずれにも対応する。
 pub fn normalize_enl_state(raw: &Value) -> State {
-    let Some(props) = raw.get("properties").and_then(Value::as_array) else {
+    // casa get は enl 出力を {"value": {...}} でラップする。value の中に
+    // properties があればそれを内側とみなし、無ければ raw 自身を使う。
+    // これで casa 経由・enl 直の両方を受ける（設計原則4の一点変更）。
+    let inner = raw
+        .get("value")
+        .filter(|v| v.get("properties").is_some())
+        .unwrap_or(raw);
+    let Some(props) = inner.get("properties").and_then(Value::as_array) else {
         return State::Unknown;
     };
 
@@ -318,6 +325,62 @@ mod tests {
             State::Unknown
         );
         let raw = json!({"properties":[{"name":"open_close_state","value":"???"}]});
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn casa_envelope_closed() {
+        // casa get の出力は enl 出力を "value" でラップする。
+        let raw = json!({
+            "device": "shutter1", "protocol": "echonet",
+            "timestamp": "2026-07-18T21:00:00+09:00",
+            "value": {
+                "eoj": "026301", "esv": "GetRes", "ip": "192.168.1.222",
+                "properties": [{"edt_hex":"42","epc":"EA","name":"open_close_state",
+                                "pdc":1,"value":{"state":"fully_closed"}}]
+            }
+        });
+        assert_eq!(normalize_enl_state(&raw), State::Closed);
+    }
+
+    #[test]
+    fn casa_envelope_all_five_states() {
+        let cases = [
+            ("fully_open", State::Open),
+            ("fully_closed", State::Closed),
+            ("opening", State::Opening),
+            ("closing", State::Closing),
+            ("stopped_midway", State::Stopped),
+        ];
+        for (s, want) in cases {
+            let raw = json!({
+                "device": "shutter1", "protocol": "echonet",
+                "value": {"properties":[{"name":"open_close_state","value":{"state":s}}]}
+            });
+            assert_eq!(normalize_enl_state(&raw), want, "state={s}");
+        }
+    }
+
+    #[test]
+    fn casa_envelope_unmatched_property_is_unknown() {
+        // value 内に properties はあるが open_close_state でも既知 state 値でもない
+        // （例: 照明の power）→ Unknown。エンベロープを剥がした先で誤分類しない番犬。
+        let raw = json!({
+            "device": "porch_light", "protocol": "echonet",
+            "value": {"eoj":"029102","esv":"GetRes",
+                      "properties":[{"epc":"80","name":"power","value":{"power":"on"}}]}
+        });
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn casa_envelope_value_without_properties_is_unknown() {
+        // value はあるが properties キーを持たない → filter が外れて raw に戻り、
+        // raw にもトップレベル properties が無いので Unknown。フォールバック分岐の番犬。
+        let raw = json!({
+            "device": "porch_light", "protocol": "echonet",
+            "value": {"power": "on"}
+        });
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
     }
 
