@@ -950,6 +950,8 @@ async function fetchHealth() {
     const v = i.value != null ? ` ${fmtNum(i.value)}` : "";
     return `${i.label}${v} (${HEALTH_LEVEL_MSG[i.level] || i.level})`;
   });
+  // items が空の stale（契約 0 行）でも文言を出す — 空バナーで黙らない。
+  if (!parts.length) parts.push(HEALTH_LEVEL_MSG[report.worst] || report.worst);
   const prefix = report.label ? `${report.label}: ` : "";
   const box = document.getElementById("hbanner");
   const el = document.createElement("div");
