@@ -362,6 +362,7 @@ const STATE_LABEL = {
   open: "開", closed: "閉", opening: "開いています…", closing: "閉じています…",
   stopped: "途中で停止", on: "点灯", off: "消灯", unknown: "不明",
 };
+const SWITCH_LABEL = { on: "オン", off: "オフ", unknown: "不明" };
 const VERB = {
   open: "開けています…", close: "閉めています…", stop: "止めています…",
   on: "つけています…", off: "消しています…", preset: "変更中…",
@@ -560,6 +561,33 @@ function buildLightTile(dev) {
     lastBright: 100, // シート再訪時の明るさスライダー初期位置（現在値は state に出ない）
     catchupTimer: null, // 追いつき取得タイマー（device ごとに 1 本、連打時は張り直し）
   };
+  el.querySelector(".bulb").addEventListener("click", () =>
+    deviceAct(dev.name, c.state === "on" ? "off" : "on")
+  );
+  cards.set(dev.name, c);
+  return el;
+}
+
+/* ── switch タイル（電源ボタン = on/off トグル。振る舞いは shutter 系）──── */
+function buildSwitchTile(dev) {
+  const el = document.createElement("div");
+  el.className = "tile";
+  el.innerHTML = `
+    <button class="bulb" type="button" aria-label="オン/オフ">⏻</button>
+    <div class="tname"></div>
+    <div class="status unknown"><span class="label">不明</span><span class="msg"></span></div>
+  `;
+  el.querySelector(".tname").textContent = dev.label;
+  const c = {
+    kind: "switch",
+    rootEl: el,
+    statusEl: el.querySelector(".status"),
+    labelEl: el.querySelector(".status .label"),
+    msgEl: el.querySelector(".status .msg"),
+    buttons: [...el.querySelectorAll("button")],
+    state: "unknown",
+  };
+  // deviceAct は kind !== "light" なので同期パス（run_action = set 後に state 再取得）を通る。
   el.querySelector(".bulb").addEventListener("click", () =>
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
   );
@@ -786,7 +814,8 @@ function renderState(name, view) {
   const st = view.state || "unknown";
   c.state = st;
   c.statusEl.className = "status " + st;
-  c.labelEl.textContent = STATE_LABEL[st] || "不明";
+  const labelMap = c.kind === "switch" ? SWITCH_LABEL : STATE_LABEL;
+  c.labelEl.textContent = labelMap[st] || "不明";
   if (c.rootEl) c.rootEl.classList.toggle("lit", st === "on");
   const m = STATE_MSG[view.exec] || "";
   c.msgEl.textContent = m;
@@ -1254,7 +1283,8 @@ async function boot() {
   app.innerHTML = "";
   const byName = new Map(devices.map((d) => [d.name, d]));
   const lights = devices.filter((d) => d.kind === "light");
-  const shutters = devices.filter((d) => d.kind !== "light");
+  const switches = devices.filter((d) => d.kind === "switch");
+  const shutters = devices.filter((d) => d.kind === "shutter");
   const grouped = new Set(grps.flatMap((g) => g.members));
 
   if (lights.length) {
@@ -1262,6 +1292,13 @@ async function boot() {
     const tiles = document.createElement("div");
     tiles.className = "tiles";
     for (const dev of lights) tiles.appendChild(buildLightTile(dev));
+    app.appendChild(tiles);
+  }
+  if (switches.length) {
+    app.appendChild(sectionHeading("🔌 スイッチ"));
+    const tiles = document.createElement("div");
+    tiles.className = "tiles";
+    for (const dev of switches) tiles.appendChild(buildSwitchTile(dev));
     app.appendChild(tiles);
   }
   if (shutters.length) {
