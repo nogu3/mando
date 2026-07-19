@@ -19,7 +19,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use config::{Config, Device, Kind};
+use config::{Config, Device, Face, Kind};
 use exec::{ExecOutcome, Executor};
 use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, State as DeviceState};
 
@@ -140,6 +140,8 @@ struct DeviceInfo {
     brightness_supported: bool,
     /// light のプリセット（shutter は空）。
     presets: Vec<PresetInfo>,
+    /// switch の表示フェイス（表示専用。null なら素のスイッチ）。
+    face: Option<Face>,
 }
 
 async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
@@ -163,6 +165,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
                     color: p.color.clone(),
                 })
                 .collect(),
+            face: d.face,
         })
         .collect();
     Json(devices)

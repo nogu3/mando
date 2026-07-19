@@ -17,6 +17,16 @@ pub enum Kind {
     Switch,
 }
 
+/// switch の表示フェイス（表示専用。振る舞いは switch のまま）。UI のアイコン・
+/// セクション・ラベルを切り替えるだけで、正規化や操作には影響しない。
+// derive は既存 Kind と同じ Copy + PartialEq + Eq + Deserialize + Serialize。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Face {
+    /// 💡 として「💡 照明」セクションに並べ、状態は「点灯/消灯」で出す。
+    Light,
+}
+
 /// light 用の名前付きプリセット（完成済みコマンド配列）。
 /// 色・kelvin の任意値入力は作らない — config に並べたものだけ実行できる。
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +178,10 @@ pub struct Device {
     /// 色・色温度プリセット（light のみ）。
     #[serde(default, rename = "preset")]
     pub presets: Vec<Preset>,
+    /// 表示フェイス（switch 専用・任意）。UI のアイコン/セクション/ラベルを切り替える。
+    /// 未指定なら素のスイッチ表示。shutter / light では指定不可。
+    #[serde(default)]
+    pub face: Option<Face>,
 }
 
 impl Device {
@@ -343,6 +357,12 @@ impl Config {
                     forbid(&d.name, "off", &d.off)?;
                     forbid(&d.name, "color", &d.color)?;
                     forbid(&d.name, "brightness", &d.brightness)?;
+                    if d.face.is_some() {
+                        return Err(ConfigError::ForbiddenField {
+                            device: d.name.clone(),
+                            field: "face",
+                        });
+                    }
                     if !d.presets.is_empty() {
                         return Err(ConfigError::ForbiddenField {
                             device: d.name.clone(),
@@ -360,6 +380,12 @@ impl Config {
                     forbid(&d.name, "open", &d.open)?;
                     forbid(&d.name, "close", &d.close)?;
                     forbid(&d.name, "stop", &d.stop)?;
+                    if d.face.is_some() {
+                        return Err(ConfigError::ForbiddenField {
+                            device: d.name.clone(),
+                            field: "face",
+                        });
+                    }
                     let mut pseen = std::collections::HashSet::new();
                     for p in &d.presets {
                         if !pseen.insert(&p.name) {
@@ -880,6 +906,102 @@ mod tests {
     }
 
     #[test]
+    fn switch_face_light_parses() {
+        let p = write_tmp(
+            "switch_face",
+            r##"
+            [[device]]
+            name = "fan_light"
+            kind = "switch"
+            face = "light"
+            get_state = ["casa", "get", "fan_light", "power"]
+            on  = ["casa", "on",  "fan_light"]
+            off = ["casa", "off", "fan_light"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("fan_light").unwrap().face, Some(Face::Light));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_without_face_is_none() {
+        let p = write_tmp(
+            "switch_noface",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            get_state = ["casa", "get", "fan", "power"]
+            on  = ["casa", "on",  "fan"]
+            off = ["casa", "off", "fan"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("fan").unwrap().face, None);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn shutter_rejects_face() {
+        let p = write_tmp(
+            "shutter_face",
+            r##"
+            [[device]]
+            name = "s1"
+            face = "light"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "face", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_rejects_face() {
+        let p = write_tmp(
+            "light_face",
+            r##"
+            [[device]]
+            name = "l1"
+            kind = "light"
+            face = "light"
+            get_state = ["mat", "read", "--node", "5", "-c", "onoff", "-a", "on-off"]
+            on  = ["mat", "on",  "--node", "5"]
+            off = ["mat", "off", "--node", "5"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "face", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_unknown_face_rejected() {
+        let p = write_tmp(
+            "switch_badface",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            face = "fan"
+            get_state = ["casa", "get", "fan", "power"]
+            on  = ["casa", "on",  "fan"]
+            off = ["casa", "off", "fan"]
+            "##,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::Parse(_))));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
     fn default_label_is_name() {
         let d = Device {
             name: "x".into(),
@@ -894,6 +1016,7 @@ mod tests {
             color: None,
             brightness: None,
             presets: vec![],
+            face: None,
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());

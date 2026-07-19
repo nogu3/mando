@@ -572,14 +572,16 @@ function buildLightTile(dev) {
 function buildSwitchTile(dev) {
   const el = document.createElement("div");
   el.className = "tile";
+  const isLight = dev.face === "light";
   el.innerHTML = `
-    <button class="bulb" type="button" aria-label="オン/オフ">⏻</button>
+    <button class="bulb" type="button" aria-label="${isLight ? "点灯/消灯" : "オン/オフ"}">${isLight ? "💡" : "⏻"}</button>
     <div class="tname"></div>
     <div class="status unknown"><span class="label">不明</span><span class="msg"></span></div>
   `;
   el.querySelector(".tname").textContent = dev.label;
   const c = {
     kind: "switch",
+    face: dev.face || null, // "light" のとき点灯/消灯ラベル・💡
     rootEl: el,
     statusEl: el.querySelector(".status"),
     labelEl: el.querySelector(".status .label"),
@@ -814,7 +816,7 @@ function renderState(name, view) {
   const st = view.state || "unknown";
   c.state = st;
   c.statusEl.className = "status " + st;
-  const labelMap = c.kind === "switch" ? SWITCH_LABEL : STATE_LABEL;
+  const labelMap = (c.kind === "switch" && c.face !== "light") ? SWITCH_LABEL : STATE_LABEL;
   c.labelEl.textContent = labelMap[st] || "不明";
   if (c.rootEl) c.rootEl.classList.toggle("lit", st === "on");
   const m = STATE_MSG[view.exec] || "";
@@ -1283,22 +1285,24 @@ async function boot() {
   app.innerHTML = "";
   const byName = new Map(devices.map((d) => [d.name, d]));
   const lights = devices.filter((d) => d.kind === "light");
-  const switches = devices.filter((d) => d.kind === "switch");
+  const switchLights = devices.filter((d) => d.kind === "switch" && d.face === "light");
+  const plainSwitches = devices.filter((d) => d.kind === "switch" && d.face !== "light");
   const shutters = devices.filter((d) => d.kind === "shutter");
   const grouped = new Set(grps.flatMap((g) => g.members));
 
-  if (lights.length) {
+  if (lights.length || switchLights.length) {
     app.appendChild(sectionHeading("💡 照明"));
     const tiles = document.createElement("div");
     tiles.className = "tiles";
     for (const dev of lights) tiles.appendChild(buildLightTile(dev));
+    for (const dev of switchLights) tiles.appendChild(buildSwitchTile(dev));
     app.appendChild(tiles);
   }
-  if (switches.length) {
+  if (plainSwitches.length) {
     app.appendChild(sectionHeading("🔌 スイッチ"));
     const tiles = document.createElement("div");
     tiles.className = "tiles";
-    for (const dev of switches) tiles.appendChild(buildSwitchTile(dev));
+    for (const dev of plainSwitches) tiles.appendChild(buildSwitchTile(dev));
     app.appendChild(tiles);
   }
   if (shutters.length) {

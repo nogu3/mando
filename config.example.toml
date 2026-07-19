@@ -115,6 +115,8 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # name  = "kitchen_light"
 # alias = "キッチン照明"
 # kind  = "switch"
+# face = "light"  # 任意・switch 専用。指定すると 💡「照明」セクションに並び状態は「点灯/消灯」。
+#                 # 未指定なら ⏻「スイッチ」セクション。換気扇・床暖房等は未指定のまま。
 # casa 経由（推奨。名前解決は casa の devices.toml が持つ。on/off は専用動詞が簡潔）:
 # get_state = ["casa", "get", "kitchen_light", "power"]
 # on        = ["casa", "on",  "kitchen_light"]
