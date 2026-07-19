@@ -81,11 +81,13 @@ fn classify(value: &Value) -> State {
             Some(0x31) => State::Off,
             _ => State::Unknown,
         },
-        // enl の実形式: value = { "state": "fully_closed" }。
+        // enl/casa の実形式: value = { "<prop>": "<値>" }。値オブジェクトのキーは
+        // プロパティで振れる（shutter は "state"、casa の on/off は "power"）。
         // 後方互換で "open_close_state" キーも見る。
         Value::Object(o) => o
             .get("state")
             .or_else(|| o.get("open_close_state"))
+            .or_else(|| o.get("power"))
             .map(classify)
             .unwrap_or(State::Unknown),
         _ => State::Unknown,
@@ -366,13 +368,14 @@ mod tests {
     }
 
     #[test]
-    fn casa_envelope_unmatched_property_is_unknown() {
-        // value 内に properties はあるが open_close_state でも既知 state 値でもない
-        // （例: 照明の power）→ Unknown。エンベロープを剥がした先で誤分類しない番犬。
+    fn casa_envelope_unknown_property_is_unknown() {
+        // value 内に properties はあるが、状態プロパティ（open_close_state / power）
+        // でも既知の値でもない → Unknown。エンベロープを剥がした先で誤分類しない番犬。
+        // （注: 照明の power は switch 用に on/off へ分類する。switch_casa_power_envelope 参照）
         let raw = json!({
-            "device": "porch_light", "protocol": "echonet",
-            "value": {"eoj":"029102","esv":"GetRes",
-                      "properties":[{"epc":"80","name":"power","value":{"power":"on"}}]}
+            "device": "sensor", "protocol": "echonet",
+            "value": {"eoj":"001101","esv":"GetRes",
+                      "properties":[{"epc":"E0","name":"illuminance","value":{"illuminance":"bright"}}]}
         });
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
     }
@@ -434,6 +437,26 @@ mod tests {
     fn switch_unknown_on_garbage_value() {
         let raw = json!({"properties":[{"name":"operation_status","value":"heating"}]});
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn switch_casa_power_envelope() {
+        // casa get <light> power の実出力: value オブジェクトのキーは "power"
+        // （プロパティ名 power に対応）。shutter の "state" とは別キーなので、
+        // classify のオブジェクト分岐が "power" も見る必要がある。
+        let raw = json!({
+            "device": "kitchen_light", "protocol": "echonet",
+            "value": {"eoj":"029108","esv":"GetRes","ip":"192.168.1.22",
+                "properties":[{"edt_hex":"31","epc":"80","name":"power","pdc":1,
+                               "value":{"power":"off"}}]}
+        });
+        assert_eq!(normalize_enl_state(&raw), State::Off);
+
+        let raw = json!({
+            "device": "kitchen_light", "protocol": "echonet",
+            "value": {"properties":[{"epc":"80","name":"power","value":{"power":"on"}}]}
+        });
+        assert_eq!(normalize_enl_state(&raw), State::On);
     }
 
     #[test]

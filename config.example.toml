@@ -104,23 +104,25 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # （preset も同様に ["mat", "group", "color-temp", "--group", "10", "--kelvin", "2700"] 等）
 # color = ["mat", "group", "color", "--group", "10", "--rgb", "{color}"]
 
-# ── ECHONET on/off 機器（換気扇・床暖房 on/off・エアコン電源等。enl/casa 経由）──
+# ── ECHONET on/off 機器（換気扇・on/off だけの照明・床暖房 on/off 等。enl/casa 経由）──
 # kind = "switch" は on / off / get_state 必須。color・brightness・preset・open/close/stop は不可。
-# get_state は operation_status（共通プロパティ EPC 0x80）を読む。値域は機種で振れるため、
-# 投入前に `enl describe <IP> <EOJ>` で operation_status の返り形（on/off の表現）を確認する。
+# get_state は電源状態（EPC 0x80）を読む。プロパティ名・値域は機種で振れるため、投入前に
+# `casa describe <name>`（または `enl describe <IP> <EOJ>`）で get_map を確認する。
+# 例: casa の照明は EPC 0x80 の名前が `power`（30=on/31=off）で、get 出力の value は
+# {"power":"on"} 形。mando の正規化は state / open_close_state / power の各キーを受ける。
 # set 後は mando が同期で state を取り直して確定表示する（shutter と同じ正直な確認）。
 # [[device]]
-# name  = "fan"
-# alias = "換気扇"
+# name  = "kitchen_light"
+# alias = "キッチン照明"
 # kind  = "switch"
-# casa 経由（推奨。名前解決は casa の devices.toml が持つ）:
-# get_state = ["casa", "get", "fan", "operation_status"]
-# on        = ["casa", "set", "fan", "operation_status", "on"]
-# off       = ["casa", "set", "fan", "operation_status", "off"]
+# casa 経由（推奨。名前解決は casa の devices.toml が持つ。on/off は専用動詞が簡潔）:
+# get_state = ["casa", "get", "kitchen_light", "power"]
+# on        = ["casa", "on",  "kitchen_light"]
+# off       = ["casa", "off", "kitchen_light"]
 # enl を直接叩く形（casa を挟まない場合。正規化はこちらも受ける）:
-#   get_state = ["enl", "get", "192.0.2.20", "013001", "operation_status"]
-#   on        = ["enl", "set", "192.0.2.20", "013001", "operation_status", "on"]
-#   off       = ["enl", "set", "192.0.2.20", "013001", "operation_status", "off"]
+#   get_state = ["enl", "get", "192.0.2.20", "029108", "operation_status"]
+#   on        = ["enl", "set", "192.0.2.20", "029108", "operation_status", "on"]
+#   off       = ["enl", "set", "192.0.2.20", "029108", "operation_status", "off"]
 #
 # 注意: switch はグループ（[[group]] members）に入れられない（当面シャッター専用）。
 
