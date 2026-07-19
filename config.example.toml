@@ -129,30 +129,35 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # 注意: switch はグループ（[[group]] members）に入れられない（当面シャッター専用）。
 
 # ── グラフ（きろくセクション）──────────────────────────────
-# embalse 等の読み出し CLI をテンプレで指定する。{period} は today / week /
-# month（検証済みの 3 値のみ）に置換して exec される。CLI は stdout に
+# 下層の読み出しコマンドをテンプレで指定する。mando はこのコマンドを exec し
+# stdout の契約 JSON 配列を受け取るだけで、transport（HTTP か CLI か）は知らない。
+# {period} は today / week / month（検証済みの 3 値のみ）に置換される。
+# コマンドは stdout に
 #   [{"ts":"2026-07-15T10:00:00+09:00","series":"書斎","value":812.0}, ...]
-# の JSON 配列を返すこと（series は単系列なら省略可）。SQL・スキーマ・
-# データパスは embalse 側の責務で、mando はコマンド名すら知らない。
+# の JSON 配列を返すこと（series は単系列なら省略可）。SQL・スキーマ・データパスは
+# embalse 側の責務。現状は NAS 常駐の embalse-query serve（:8526）を curl で叩く:
+#   curl -fsS --max-time 30 <URL>
+#   -f=HTTP≥400 で失敗（→ mando は 502）／-s=進捗抑制／-S=エラーは stderr へ
+#   --max-time 30=契約の 30s 上限。ベース URL は下の各例に直書き（設置環境で書換）。
 #
 # [[graph]]
 # name       = "generation"
 # label      = "太陽光発電"
 # unit       = "W"      # 今日ビュー（時系列カーブ）の単位
 # unit_daily = "kWh"    # 週/月ビュー（日別集計）の単位。省略時 unit
-# query      = ["embalse-query", "generation", "{period}"]
+# query      = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/graphs/generation?period={period}"]
 #
 # [[graph]]
 # name  = "co2"
 # label = "CO2"
 # unit  = "ppm"
-# query = ["embalse-query", "co2", "{period}"]
+# query = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/graphs/co2?period={period}"]
 #
 # [[graph]]
 # name  = "machine"
 # label = "jarvis"
 # unit  = "%"      # 温度だけ series_labels 側で ℃ を明示
-# query = ["embalse-query", "machine", "{period}"]
+# query = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/graphs/machine?period={period}"]
 # [graph.series_labels]  # series 名 → UI 表示名（任意。無いキーは素通し）
 # cpu_used_pct  = "CPU (%)"
 # mem_used_pct  = "メモリ (%)"
@@ -160,12 +165,13 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # cpu_temp_c    = "温度 (℃)"
 
 # ── マシン健全性（任意）─────────────────────────────
-# 下層の health CLI（embalse-query health 等）を exec し、異常時のみ画面上部に
-# バナーを出す。未設定ならこの機能ごと無効。しきい値判定は下層の責務。
+# 下層の health 読み出しコマンドを exec し、異常時のみ画面上部にバナーを出す。
+# 未設定ならこの機能ごと無効。しきい値判定は下層の責務。グラフ同様、現状は NAS 常駐の
+# embalse-query serve（:8526）を curl で叩く（period なし）。
 #
 # [health]
 # label   = "jarvis"                       # バナーの対象名（任意）
-# command = ["embalse-query", "health"]
+# command = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/health"]
 # [health.labels]  # metric 名 → 表示名（任意。無いキーは素通し）
 # cpu_used_pct  = "CPU"
 # mem_used_pct  = "メモリ"
