@@ -142,19 +142,19 @@ pub struct Device {
     pub kind: Kind,
     /// 状態取得コマンド。全 kind で必須。
     pub get_state: Vec<String>,
-    /// open コマンド（shutter 必須 / light 不可）。
+    /// open コマンド（shutter 必須 / light・switch 不可）。
     #[serde(default)]
     pub open: Option<Vec<String>>,
-    /// close コマンド（shutter 必須 / light 不可）。
+    /// close コマンド（shutter 必須 / light・switch 不可）。
     #[serde(default)]
     pub close: Option<Vec<String>>,
-    /// stop コマンド（shutter 任意 / light 不可）。
+    /// stop コマンド（shutter 任意 / light・switch 不可）。
     #[serde(default)]
     pub stop: Option<Vec<String>>,
-    /// on コマンド（light 必須 / shutter 不可）。
+    /// on コマンド（light・switch 必須 / shutter 不可）。
     #[serde(default)]
     pub on: Option<Vec<String>>,
-    /// off コマンド（light 必須 / shutter 不可）。
+    /// off コマンド（light・switch 必須 / shutter 不可）。
     #[serde(default)]
     pub off: Option<Vec<String>>,
     /// 任意色コマンドテンプレ（light のみ・任意）。{color} プレースホルダを

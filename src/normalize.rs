@@ -405,6 +405,10 @@ mod tests {
         assert_eq!(normalize_enl_state(&raw), State::On);
         let raw = json!({"properties":[{"name":"operation_status","value":"off"}]});
         assert_eq!(normalize_enl_state(&raw), State::Off);
+        let raw = json!({"properties":[{"name":"operation_status","value":"0x30"}]});
+        assert_eq!(normalize_enl_state(&raw), State::On);
+        let raw = json!({"properties":[{"name":"operation_status","value":"31"}]});
+        assert_eq!(normalize_enl_state(&raw), State::Off);
     }
 
     #[test]
