@@ -202,6 +202,7 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
             state: match device.kind {
                 Kind::Shutter => normalize_enl_state(&raw),
                 Kind::Light => normalize_mat_onoff(&raw),
+                Kind::Switch => normalize_enl_state(&raw),
             },
             exec: result.outcome,
             raw: Some(raw),
