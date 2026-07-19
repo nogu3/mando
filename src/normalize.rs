@@ -77,6 +77,8 @@ fn classify(value: &Value) -> State {
             Some(0x43) => State::Opening,
             Some(0x44) => State::Closing,
             Some(0x45) => State::Stopped,
+            Some(0x30) => State::On,
+            Some(0x31) => State::Off,
             _ => State::Unknown,
         },
         // enl の実形式: value = { "state": "fully_closed" }。
@@ -97,6 +99,8 @@ fn classify_str(s: &str) -> State {
         "opening" | "0x43" | "43" => State::Opening,
         "closing" | "0x44" | "44" => State::Closing,
         "stopped" | "stopped_midway" | "0x45" | "45" => State::Stopped,
+        "on" | "0x30" | "30" => State::On,
+        "off" | "0x31" | "31" => State::Off,
         _ => State::Unknown,
     }
 }
@@ -381,6 +385,54 @@ mod tests {
             "device": "porch_light", "protocol": "echonet",
             "value": {"power": "on"}
         });
+        assert_eq!(normalize_enl_state(&raw), State::Unknown);
+    }
+
+    #[test]
+    fn switch_on_off_object() {
+        // enl の実出力: value はオブジェクト {"state": "on"}。
+        let raw = json!({"properties":[
+            {"epc":"80","name":"operation_status","value":{"state":"on"}}]});
+        assert_eq!(normalize_enl_state(&raw), State::On);
+        let raw = json!({"properties":[
+            {"epc":"80","name":"operation_status","value":{"state":"off"}}]});
+        assert_eq!(normalize_enl_state(&raw), State::Off);
+    }
+
+    #[test]
+    fn switch_on_off_string() {
+        let raw = json!({"properties":[{"name":"operation_status","value":"on"}]});
+        assert_eq!(normalize_enl_state(&raw), State::On);
+        let raw = json!({"properties":[{"name":"operation_status","value":"off"}]});
+        assert_eq!(normalize_enl_state(&raw), State::Off);
+        let raw = json!({"properties":[{"name":"operation_status","value":"0x30"}]});
+        assert_eq!(normalize_enl_state(&raw), State::On);
+        let raw = json!({"properties":[{"name":"operation_status","value":"31"}]});
+        assert_eq!(normalize_enl_state(&raw), State::Off);
+    }
+
+    #[test]
+    fn switch_on_off_numeric_edt() {
+        // ECHONET Lite operation_status EDT: 0x30=ON / 0x31=OFF。
+        let raw = json!({"properties":[{"name":"operation_status","value":0x30}]});
+        assert_eq!(normalize_enl_state(&raw), State::On);
+        let raw = json!({"properties":[{"name":"operation_status","value":0x31}]});
+        assert_eq!(normalize_enl_state(&raw), State::Off);
+    }
+
+    #[test]
+    fn switch_on_off_casa_envelope() {
+        let raw = json!({
+            "device": "fan", "protocol": "echonet",
+            "value": {"properties":[
+                {"name":"operation_status","value":{"state":"on"}}]}
+        });
+        assert_eq!(normalize_enl_state(&raw), State::On);
+    }
+
+    #[test]
+    fn switch_unknown_on_garbage_value() {
+        let raw = json!({"properties":[{"name":"operation_status","value":"heating"}]});
         assert_eq!(normalize_enl_state(&raw), State::Unknown);
     }
 

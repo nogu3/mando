@@ -14,6 +14,7 @@ pub enum Kind {
     #[default]
     Shutter,
     Light,
+    Switch,
 }
 
 /// light 用の名前付きプリセット（完成済みコマンド配列）。
@@ -141,19 +142,19 @@ pub struct Device {
     pub kind: Kind,
     /// 状態取得コマンド。全 kind で必須。
     pub get_state: Vec<String>,
-    /// open コマンド（shutter 必須 / light 不可）。
+    /// open コマンド（shutter 必須 / light・switch 不可）。
     #[serde(default)]
     pub open: Option<Vec<String>>,
-    /// close コマンド（shutter 必須 / light 不可）。
+    /// close コマンド（shutter 必須 / light・switch 不可）。
     #[serde(default)]
     pub close: Option<Vec<String>>,
-    /// stop コマンド（shutter 任意 / light 不可）。
+    /// stop コマンド（shutter 任意 / light・switch 不可）。
     #[serde(default)]
     pub stop: Option<Vec<String>>,
-    /// on コマンド（light 必須 / shutter 不可）。
+    /// on コマンド（light・switch 必須 / shutter 不可）。
     #[serde(default)]
     pub on: Option<Vec<String>>,
-    /// off コマンド（light 必須 / shutter 不可）。
+    /// off コマンド（light・switch 必須 / shutter 不可）。
     #[serde(default)]
     pub off: Option<Vec<String>>,
     /// 任意色コマンドテンプレ（light のみ・任意）。{color} プレースホルダを
@@ -224,7 +225,7 @@ pub enum ConfigError {
     MissingCommand { device: String, field: &'static str },
     ForbiddenField { device: String, field: &'static str },
     DuplicatePreset { device: String, preset: String },
-    LightInGroup { group: String, member: String },
+    NonShutterInGroup { group: String, member: String },
     DuplicateGroupMember { device: String },
     ColorPlaceholder { device: String, count: usize },
     BrightnessPlaceholder { device: String, count: usize },
@@ -258,8 +259,8 @@ impl std::fmt::Display for ConfigError {
             ConfigError::DuplicatePreset { device, preset } => {
                 write!(f, "device {device}: preset 名が重複: {preset}")
             }
-            ConfigError::LightInGroup { group, member } => {
-                write!(f, "group {group}: light はグループに入れられない: {member}")
+            ConfigError::NonShutterInGroup { group, member } => {
+                write!(f, "group {group}: シャッター以外はグループに入れられない: {member}")
             }
             ConfigError::DuplicateGroupMember { device } => {
                 write!(f, "device {device}: 複数のグループに所属できない（UI が個別行をデバイスごとに 1 つしか持てないため）")
@@ -400,6 +401,21 @@ impl Config {
                         }
                     }
                 }
+                Kind::Switch => {
+                    require(&d.name, "on", &d.on)?;
+                    require(&d.name, "off", &d.off)?;
+                    forbid(&d.name, "open", &d.open)?;
+                    forbid(&d.name, "close", &d.close)?;
+                    forbid(&d.name, "stop", &d.stop)?;
+                    forbid(&d.name, "color", &d.color)?;
+                    forbid(&d.name, "brightness", &d.brightness)?;
+                    if !d.presets.is_empty() {
+                        return Err(ConfigError::ForbiddenField {
+                            device: d.name.clone(),
+                            field: "preset",
+                        });
+                    }
+                }
             }
         }
 
@@ -420,9 +436,9 @@ impl Config {
                             member: m.clone(),
                         })
                     }
-                    // グループは当面シャッター専用（一括開閉の意味論が light に合わない）。
-                    Some(d) if d.kind == Kind::Light => {
-                        return Err(ConfigError::LightInGroup {
+                    // グループは当面シャッター専用（一括開閉の意味論が light/switch に合わない）。
+                    Some(d) if d.kind != Kind::Shutter => {
+                        return Err(ConfigError::NonShutterInGroup {
                             group: g.name.clone(),
                             member: m.clone(),
                         })
@@ -767,7 +783,98 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::LightInGroup { .. })
+            Err(ConfigError::NonShutterInGroup { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_device_parses() {
+        let p = write_tmp(
+            "switch",
+            r##"
+            [[device]]
+            name  = "fan"
+            alias = "換気扇"
+            kind  = "switch"
+            get_state = ["casa", "get", "fan", "operation_status"]
+            on  = ["casa", "set", "fan", "operation_status", "on"]
+            off = ["casa", "set", "fan", "operation_status", "off"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("fan").unwrap();
+        assert_eq!(d.kind, Kind::Switch);
+        assert_eq!(d.label(), "換気扇");
+        assert_eq!(d.on_cmd().unwrap()[1], "set");
+        assert_eq!(d.off_cmd().unwrap().last().unwrap(), "off");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_requires_on_off() {
+        let p = write_tmp(
+            "switch_missing",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            get_state = ["casa", "get", "fan", "operation_status"]
+            on  = ["casa", "set", "fan", "operation_status", "on"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::MissingCommand { field: "off", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_rejects_shutter_and_light_fields() {
+        let p = write_tmp(
+            "switch_forbidden",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            get_state = ["casa", "get", "fan", "operation_status"]
+            on  = ["casa", "set", "fan", "operation_status", "on"]
+            off = ["casa", "set", "fan", "operation_status", "off"]
+            open = ["casa", "set", "fan", "x", "open"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "open", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn switch_in_group_rejected() {
+        let p = write_tmp(
+            "switchgroup",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            get_state = ["casa", "get", "fan", "operation_status"]
+            on  = ["casa", "set", "fan", "operation_status", "on"]
+            off = ["casa", "set", "fan", "operation_status", "off"]
+            [[group]]
+            name = "all"
+            members = ["s1", "fan"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::NonShutterInGroup { .. })
         ));
         std::fs::remove_file(p).ok();
     }
