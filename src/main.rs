@@ -3,6 +3,7 @@
 //! プロトコルは喋らない。casa（ブートストラップ期は enl）を subprocess で呼ぶ
 //! だけの常駐 HTTP サービス。安定ミニ API を配り、フロントを下層から隔離する。
 
+mod cache;
 mod config;
 mod exec;
 mod normalize;
