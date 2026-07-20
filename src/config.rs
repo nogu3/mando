@@ -1173,6 +1173,13 @@ mod tests {
     }
 
     #[test]
+    fn example_config_parses_with_cache() {
+        let src = include_str!("../config.example.toml");
+        let cfg: Config = toml::from_str(src).expect("config.example.toml must parse");
+        assert_eq!(cfg.cache.state_ttl_ms, 2000);
+    }
+
+    #[test]
     fn stop_optional_and_parsed() {
         let p = write_tmp(
             "stop",
