@@ -134,9 +134,10 @@ tasks:
       CROSS_BIN: "target/{{.TARGET}}/release/mando"
     cmds:
       # musl 静的リンクなので実機の glibc に依存しない。cross は docker を使う。
+      # 配置は ~/.local/bin + user unit（2026-07-19 の user unit 移行後の標準。sudo 不要）。
       - cross build --release --target {{.TARGET}}
-      - scp {{.CROSS_BIN}} {{.HOST}}:/tmp/mando.new
-      - ssh {{.HOST}} 'sudo install -m755 /tmp/mando.new {{.BIN_DST}} && rm -f /tmp/mando.new && sudo systemctl restart mando && systemctl status mando --no-pager --lines=0'
+      - scp {{.CROSS_BIN}} {{.HOST}}:.local/bin/mando.new
+      - ssh {{.HOST}} 'install -m755 ~/.local/bin/mando.new ~/.local/bin/mando && rm -f ~/.local/bin/mando.new && systemctl --user restart mando && systemctl --user status mando --no-pager --lines=0'
 
   update:
     desc: git pull → 再ビルド → バイナリ更新 → 再起動（デプロイ反映。index.html 変更もこれで反映）
