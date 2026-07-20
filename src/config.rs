@@ -62,6 +62,29 @@ pub struct Config {
     pub graphs: Vec<Graph>,
     #[serde(default)]
     pub health: Option<Health>,
+    /// デバイス exec の全体設定（任意）。
+    #[serde(default)]
+    pub exec: ExecSettings,
+}
+
+/// デバイス exec の全体設定。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecSettings {
+    /// デバイス exec（get_state / 操作）1 回の上限ミリ秒。超過は timeout 扱い。
+    #[serde(default = "default_exec_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for ExecSettings {
+    fn default() -> Self {
+        ExecSettings {
+            timeout_ms: default_exec_timeout_ms(),
+        }
+    }
+}
+
+fn default_exec_timeout_ms() -> u64 {
+    15_000
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -187,11 +210,22 @@ pub struct Device {
     /// UI の「個別に操作」展開に使うだけ — mando が members を直列 exec することはない。
     #[serde(default)]
     pub members: Vec<String>,
+    /// exec 直列化レーン（任意）。同じ lane のデバイスと直列化される。
+    /// 未指定ならデバイス名 = デバイス単位の直列化のみ（他デバイスとは並列）。
+    /// echonet 系（enl / casa 経由）は 3610 を専有 bind するため、
+    /// 同一の lane（例 "echonet"）を明示すること。
+    #[serde(default)]
+    pub lane: Option<String>,
 }
 
 impl Device {
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// exec 直列化レーン名。未指定ならデバイス名。
+    pub fn exec_lane(&self) -> &str {
+        self.lane.as_deref().unwrap_or(&self.name)
     }
 
     pub fn open_cmd(&self) -> Option<&[String]> {
@@ -1077,9 +1111,42 @@ mod tests {
             presets: vec![],
             face: None,
             members: vec![],
+            lane: None,
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());
+    }
+
+    #[test]
+    fn device_lane_defaults_to_device_name() {
+        let c: Config = toml::from_str(
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+
+            [[device]]
+            name = "s2"
+            lane = "echonet"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.devices[0].exec_lane(), "s1");
+        assert_eq!(c.devices[1].exec_lane(), "echonet");
+    }
+
+    #[test]
+    fn exec_timeout_defaults_to_15000() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.exec.timeout_ms, 15_000);
+
+        let c: Config = toml::from_str("[exec]\ntimeout_ms = 3000\n").unwrap();
+        assert_eq!(c.exec.timeout_ms, 3_000);
     }
 
     #[test]

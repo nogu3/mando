@@ -35,6 +35,13 @@ struct App {
     graph_executor: Executor,
 }
 
+impl App {
+    /// デバイス exec の上限（config の [exec] timeout_ms）。
+    fn exec_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.config.exec.timeout_ms)
+    }
+}
+
 type Shared = Arc<App>;
 
 #[tokio::main]
@@ -188,7 +195,13 @@ struct StateView {
 
 /// get_state を実行し、正規化した状態を返す。
 async fn fetch_state(app: &App, device: &Device) -> StateView {
-    let result = app.executor.run(&device.get_state).await;
+    let result = run_bounded(
+        &app.executor,
+        device.exec_lane(),
+        &device.get_state,
+        app.exec_timeout(),
+    )
+    .await;
 
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
@@ -243,7 +256,7 @@ struct ActionView {
 }
 
 async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
-    let result = app.executor.run(cmd).await;
+    let result = run_bounded(&app.executor, device.exec_lane(), cmd, app.exec_timeout()).await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
             device = %device.name,
@@ -269,7 +282,7 @@ struct LightActionView {
 
 /// exec のみ実行して送信結果を返す（state 再取得なし）。light 用。
 async fn run_light_action(app: &App, device: &Device, cmd: &[String]) -> LightActionView {
-    let result = app.executor.run(cmd).await;
+    let result = run_bounded(&app.executor, device.exec_lane(), cmd, app.exec_timeout()).await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
             device = %device.name,
@@ -651,7 +664,7 @@ async fn get_graph(
         .iter()
         .map(|s| s.replace("{period}", period))
         .collect();
-    let result = run_graph_cmd(&app.graph_executor, &cmd, GRAPH_QUERY_TIMEOUT).await;
+    let result = run_bounded(&app.graph_executor, "graph", &cmd, GRAPH_QUERY_TIMEOUT).await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
             graph = %name,
@@ -684,19 +697,20 @@ async fn get_graph(
 /// ハングした CLI が graph_executor（Semaphore(1)）を永久に握るのを防ぐ。
 const GRAPH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// graph query を timeout 付きで exec する。超過は Timeout として返す
+/// exec を timeout 付きで走らせる。超過は Timeout として返す
 /// （future の drop で permit は解放され、子プロセスは kill_on_drop で回収される）。
-async fn run_graph_cmd(
+async fn run_bounded(
     executor: &Executor,
+    lane: &str,
     cmd: &[String],
     timeout: std::time::Duration,
 ) -> exec::ExecResult {
-    match tokio::time::timeout(timeout, executor.run(cmd)).await {
+    match tokio::time::timeout(timeout, executor.run(lane, cmd)).await {
         Ok(r) => r,
         Err(_) => exec::ExecResult {
             outcome: ExecOutcome::Timeout,
             stdout: String::new(),
-            stderr: "graph query timeout".into(),
+            stderr: "exec timeout".into(),
         },
     }
 }
@@ -735,7 +749,13 @@ async fn get_health(State(app): State<Shared>) -> Response {
         )
             .into_response();
     };
-    let result = run_graph_cmd(&app.graph_executor, &health.command, GRAPH_QUERY_TIMEOUT).await;
+    let result = run_bounded(
+        &app.graph_executor,
+        "graph",
+        &health.command,
+        GRAPH_QUERY_TIMEOUT,
+    )
+    .await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
             outcome = ?result.outcome,
@@ -1250,17 +1270,54 @@ mod tests {
     #[tokio::test]
     async fn graph_query_timeout_maps_to_timeout_outcome() {
         let ex = Executor::new();
-        let r = run_graph_cmd(
+        let r = run_bounded(
             &ex,
+            "graph",
             &["sh".into(), "-c".into(), "sleep 5".into()],
             std::time::Duration::from_millis(100),
         )
         .await;
         assert_eq!(r.outcome, ExecOutcome::Timeout);
         // permit が解放されていること（後続の run が即座に走れる）。
-        let r2 = ex.run(&["sh".into(), "-c".into(), "printf ok".into()]).await;
+        let r2 = ex
+            .run("graph", &["sh".into(), "-c".into(), "printf ok".into()])
+            .await;
         assert_eq!(r2.outcome, ExecOutcome::Success);
         assert_eq!(r2.stdout, "ok");
+    }
+
+    #[tokio::test]
+    async fn device_exec_times_out_and_maps_to_timeout_outcome() {
+        use std::time::Instant;
+        let config: Config = toml::from_str(
+            r#"
+            [exec]
+            timeout_ms = 200
+
+            [[device]]
+            name = "slow"
+            kind = "light"
+            get_state = ["sleep", "60"]
+            on = ["true"]
+            off = ["true"]
+            "#,
+        )
+        .unwrap();
+        let app = App {
+            config,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+        };
+        let device = app.config.find("slow").unwrap();
+        let start = Instant::now();
+        let view = fetch_state(&app, device).await;
+        assert_eq!(view.exec, ExecOutcome::Timeout);
+        assert_eq!(view.state, normalize::State::Unknown);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must bound the exec: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

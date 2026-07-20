@@ -1,11 +1,16 @@
-//! subprocess の直列実行。
+//! subprocess のレーン単位直列実行。
 //!
 //! enl は 0.0.0.0:3610 を専有 bind する。casa 経由でも casa が enl を呼ぶので
-//! 透過的に同じ衝突が起きる。よって exec 全体を Semaphore(1) で囲い、
-//! 並行に走らせない（axum は非同期だが、ここだけは意図的に直列）。
+//! 透過的に同じ衝突が起きる。echonet 系デバイスは config で lane = "echonet" に
+//! まとめられ、同一レーンで直列化される。レーン未指定のデバイスはデバイス名が
+//! レーンになり、自身の操作だけが直列（他デバイスとは並列）。mat は matd が
+//! 並行を捌くのでレーン不要。timeout はこのモジュールでなく呼び出し側（run_bounded）が課す。
+//! デバイス exec は config の [exec] timeout_ms（既定 15000）、graph/health は固定 30 秒。
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
@@ -49,27 +54,41 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
-/// exec 直列化器。全 subprocess 呼び出しを 1 本に絞る。
+/// exec 直列化器。レーン（文字列キー）ごとに Semaphore(1) を持ち、
+/// 同一レーンの subprocess を直列化する。異なるレーンは並列に走る。
+///
+/// レーンの決め方は呼び出し側（config）の責務 — echonet 系（enl / casa 経由）は
+/// 3610 を専有 bind するため同一レーンに集め、それ以外はデバイス単位でよい。
 pub struct Executor {
-    gate: Semaphore,
+    lanes: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Executor {
-            gate: Semaphore::new(1),
+            lanes: Mutex::new(HashMap::new()),
         }
     }
 
-    /// コマンド配列を exec する。Semaphore(1) で直列化される。
+    /// レーンの Semaphore を取得（無ければ作る）。
+    fn lane(&self, name: &str) -> Arc<Semaphore> {
+        let mut lanes = self.lanes.lock().expect("lanes poisoned");
+        lanes
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    }
+
+    /// コマンド配列を exec する。同一 lane 内で直列化される。
     ///
     /// `cmd[0]` を実行ファイル、残りを引数として扱う。空配列は呼び出し側で
     /// 弾く前提（config validate 済み）。
-    pub async fn run(&self, cmd: &[String]) -> ExecResult {
-        let _permit = self.gate.acquire().await.expect("semaphore closed");
+    pub async fn run(&self, lane: &str, cmd: &[String]) -> ExecResult {
+        let sem = self.lane(lane);
+        let _permit = sem.acquire_owned().await.expect("semaphore closed");
 
         let (program, args) = cmd.split_first().expect("empty command");
-        tracing::debug!(program, ?args, "exec");
+        tracing::debug!(lane, program, ?args, "exec");
 
         let output = Command::new(program)
             .args(args)
@@ -126,7 +145,7 @@ mod tests {
     async fn runs_and_captures_stdout() {
         let ex = Executor::new();
         let r = ex
-            .run(&["sh".into(), "-c".into(), "printf hello".into()])
+            .run("a", &["sh".into(), "-c".into(), "printf hello".into()])
             .await;
         assert_eq!(r.outcome, ExecOutcome::Success);
         assert_eq!(r.stdout, "hello");
@@ -135,14 +154,16 @@ mod tests {
     #[tokio::test]
     async fn maps_nonzero_exit() {
         let ex = Executor::new();
-        let r = ex.run(&["sh".into(), "-c".into(), "exit 3".into()]).await;
+        let r = ex
+            .run("a", &["sh".into(), "-c".into(), "exit 3".into()])
+            .await;
         assert_eq!(r.outcome, ExecOutcome::Timeout);
     }
 
     #[tokio::test]
     async fn reports_spawn_failure() {
         let ex = Executor::new();
-        let r = ex.run(&["__mando_no_such_binary__".into()]).await;
+        let r = ex.run("a", &["__mando_no_such_binary__".into()]).await;
         assert_eq!(r.outcome, ExecOutcome::SpawnFailed);
     }
 
@@ -162,11 +183,14 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 // 各タスクは「開始マーカ → sleep → 終了マーカ」を書く。
                 // 直列なら s,e ペアが交互に並ぶ。
-                ex.run(&[
-                    "sh".into(),
-                    "-c".into(),
-                    format!("printf 's{i} '>>{p}; sleep 0.05; printf 'e{i} '>>{p}"),
-                ])
+                ex.run(
+                    "a",
+                    &[
+                        "sh".into(),
+                        "-c".into(),
+                        format!("printf 's{i} '>>{p}; sleep 0.05; printf 'e{i} '>>{p}"),
+                    ],
+                )
                 .await;
             }));
         }
@@ -182,5 +206,57 @@ mod tests {
             assert_eq!(pair[1][..1].to_string(), "e");
             assert_eq!(&pair[0][1..], &pair[1][1..], "interleaved exec: {content}");
         }
+    }
+
+    #[tokio::test]
+    async fn different_lanes_run_in_parallel() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        // 0.3 秒 sleep を別レーンで同時に走らせ、直列（0.6 秒超）に
+        // ならないことを経過時間で確認する。
+        let ex = Arc::new(Executor::new());
+        let start = Instant::now();
+        let a = {
+            let ex = ex.clone();
+            tokio::spawn(
+                async move { ex.run("lane_a", &["sleep".into(), "0.3".into()]).await },
+            )
+        };
+        let b = {
+            let ex = ex.clone();
+            tokio::spawn(
+                async move { ex.run("lane_b", &["sleep".into(), "0.3".into()]).await },
+            )
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(550),
+            "different lanes should run in parallel: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_lane_is_serialized_by_elapsed_time() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let ex = Arc::new(Executor::new());
+        let start = Instant::now();
+        let a = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.run("lane", &["sleep".into(), "0.3".into()]).await })
+        };
+        let b = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.run("lane", &["sleep".into(), "0.3".into()]).await })
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(600),
+            "same lane must serialize: {:?}",
+            start.elapsed()
+        );
     }
 }
