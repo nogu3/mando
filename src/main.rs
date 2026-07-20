@@ -251,6 +251,16 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
 /// 成功読みだけ TTL キャッシュし、同時読みは 1 exec に合流する（原則6/7）。
 /// set 経路はこれを通さず、生の fetch_state + store を使う。
 async fn cached_state(app: &App, device: &Device) -> StateView {
+    // light は原則7 の例外: catch-up 読みは代表ノードへの fresh なプロキシ読みで
+    // あるべきで、共有 TTL キャッシュを経由すると古い状態を隠す窓を再導入してしまう。
+    // また light は 3610 で他レーンと衝突せず、UI からポーリングもされないため
+    // キャッシュの恩恵（直列待ち削減・重複 exec 抑制）もゼロ。よってキャッシュを
+    // 経由せず常に fresh fetch_state を返す（store もしないので read/write とも
+    // キャッシュに一切触れない）。
+    if device.kind == Kind::Light {
+        return fetch_state(app, device).await;
+    }
+
     let ttl = app.state_ttl();
     app.state_cache
         .get_or_fetch(&device.name, ttl, || async {
@@ -1413,6 +1423,52 @@ mod tests {
         cached_state(&app, device).await;
 
         assert_eq!(exec_count(&p), 2, "TTL 経過後は再 exec");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// get_state が exec のたびに temp ファイルへ 1 行追記する light を持つ App。
+    /// counting_app の shutter 版に対応する light 版（原則7 light 例外の検証用）。
+    fn counting_light_app(counter_path: &str, ttl_ms: u64) -> Shared {
+        let cfg: Config = toml::from_str(&format!(
+            r##"
+            [cache]
+            state_ttl_ms = {ttl_ms}
+            [[device]]
+            name = "light"
+            kind = "light"
+            get_state = ["sh", "-c", "printf x >> {counter_path}; printf '{{\"value\":true}}'"]
+            on  = ["sh", "-c", "printf '{{}}'"]
+            off = ["sh", "-c", "printf '{{}}'"]
+            "##
+        ))
+        .unwrap();
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn light_state_bypasses_cache() {
+        let path = std::env::temp_dir().join(format!("mando_cache_light_{}.txt", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        std::fs::write(&path, "").unwrap();
+
+        let app = counting_light_app(&p, 2000);
+        let device = app.config.find("light").unwrap();
+
+        let a = cached_state(&app, device).await;
+        let b = cached_state(&app, device).await;
+
+        assert_eq!(a.state, normalize::State::On);
+        assert_eq!(b.state, normalize::State::On);
+        assert_eq!(
+            exec_count(&p),
+            2,
+            "light は原則7 例外によりキャッシュされず毎回 exec する"
+        );
         std::fs::remove_file(&path).ok();
     }
 
