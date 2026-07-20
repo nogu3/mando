@@ -113,6 +113,11 @@
 
   /* ── light タイル（2 列グリッド）────────────────── */
   .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+  /* 照明グループカード: 先頭タイルは全幅、展開内は通常の 2 列グリッド */
+  .lgroup > .tiles { margin: 0; }
+  .lgroup > .tiles.head { grid-template-columns: 1fr; }
+  .lgroup > .tiles.members { margin-top: 4px; }
+  .lgroup > .tiles.members[hidden] { display: none; }
   .tile {
     border-radius: 16px; padding: 13px;
     background: var(--panel); border: 1px solid var(--line);
@@ -565,6 +570,36 @@ function buildLightTile(dev) {
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
   );
   cards.set(dev.name, c);
+  return el;
+}
+
+/* ── 照明グループカード(members を持つ light)──────────────
+   カード本体は既存の light タイルそのまま(一括操作 = wire group への multicast)。
+   「個別に操作 ▾」でメンバーのフル機能タイルを展開する(シャッターと同じ流儀)。 */
+function buildLightGroupCard(dev, byName) {
+  const el = document.createElement("div");
+  el.className = "group lgroup";
+  const head = document.createElement("div");
+  head.className = "tiles head";
+  head.appendChild(buildLightTile(dev));
+  el.appendChild(head);
+  const exp = document.createElement("button");
+  exp.className = "expander";
+  exp.type = "button";
+  exp.textContent = "個別に操作 ▾";
+  el.appendChild(exp);
+  const membersEl = document.createElement("div");
+  membersEl.className = "tiles members";
+  membersEl.hidden = true;
+  for (const m of dev.members) {
+    const md = byName.get(m);
+    if (md) membersEl.appendChild(buildLightTile(md));
+  }
+  el.appendChild(membersEl);
+  exp.addEventListener("click", () => {
+    membersEl.hidden = !membersEl.hidden;
+    exp.textContent = membersEl.hidden ? "個別に操作 ▾" : "個別に操作 ▴";
+  });
   return el;
 }
 
@@ -1289,14 +1324,23 @@ async function boot() {
   const plainSwitches = devices.filter((d) => d.kind === "switch" && d.face !== "light");
   const shutters = devices.filter((d) => d.kind === "shutter");
   const grouped = new Set(grps.flatMap((g) => g.members));
+  // members に挙がった light はトップの一覧から消え、グループカードの展開内に入る。
+  const lightMemberSet = new Set(lights.flatMap((d) => d.members || []));
+  const lightGroups = lights.filter((d) => (d.members || []).length);
+  const soloLights = lights.filter(
+    (d) => !(d.members || []).length && !lightMemberSet.has(d.name)
+  );
 
   if (lights.length || switchLights.length) {
     app.appendChild(sectionHeading("💡 照明"));
-    const tiles = document.createElement("div");
-    tiles.className = "tiles";
-    for (const dev of lights) tiles.appendChild(buildLightTile(dev));
-    for (const dev of switchLights) tiles.appendChild(buildSwitchTile(dev));
-    app.appendChild(tiles);
+    for (const g of lightGroups) app.appendChild(buildLightGroupCard(g, byName));
+    if (soloLights.length || switchLights.length) {
+      const tiles = document.createElement("div");
+      tiles.className = "tiles";
+      for (const dev of soloLights) tiles.appendChild(buildLightTile(dev));
+      for (const dev of switchLights) tiles.appendChild(buildSwitchTile(dev));
+      app.appendChild(tiles);
+    }
   }
   if (plainSwitches.length) {
     app.appendChild(sectionHeading("🔌 スイッチ"));
