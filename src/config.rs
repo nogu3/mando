@@ -65,6 +65,10 @@ pub struct Config {
     /// デバイス exec の全体設定（任意）。
     #[serde(default)]
     pub exec: ExecSettings,
+    /// state 読みキャッシュの設定（任意）。
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub cache: CacheSettings,
 }
 
 /// デバイス exec の全体設定。
@@ -85,6 +89,27 @@ impl Default for ExecSettings {
 
 fn default_exec_timeout_ms() -> u64 {
     15_000
+}
+
+/// state 読みキャッシュの設定。
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CacheSettings {
+    /// state 読みをキャッシュする TTL（ミリ秒）。0 は TTL 無効（single-flight のみ）。
+    #[serde(default = "default_state_ttl_ms")]
+    pub state_ttl_ms: u64,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        CacheSettings {
+            state_ttl_ms: default_state_ttl_ms(),
+        }
+    }
+}
+
+fn default_state_ttl_ms() -> u64 {
+    2_000
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -1825,5 +1850,17 @@ mod tests {
             Err(ConfigError::ForbiddenField { field: "members", .. })
         ));
         std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn cache_defaults_to_2000ms() {
+        let cfg: Config = toml::from_str(r#"bind = "0.0.0.0:8080""#).unwrap();
+        assert_eq!(cfg.cache.state_ttl_ms, 2000);
+    }
+
+    #[test]
+    fn cache_ttl_is_overridable() {
+        let cfg: Config = toml::from_str("[cache]\nstate_ttl_ms = 500\n").unwrap();
+        assert_eq!(cfg.cache.state_ttl_ms, 500);
     }
 }
