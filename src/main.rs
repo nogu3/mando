@@ -142,6 +142,9 @@ struct DeviceInfo {
     presets: Vec<PresetInfo>,
     /// switch の表示フェイス（表示専用。null なら素のスイッチ）。
     face: Option<Face>,
+    /// members を持つ light(グループカード)のメンバー device 名。空なら省略。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    members: Vec<String>,
 }
 
 async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
@@ -166,6 +169,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
                 })
                 .collect(),
             face: d.face,
+            members: d.members.clone(),
         })
         .collect();
     Json(devices)
@@ -1257,5 +1261,32 @@ mod tests {
         let r2 = ex.run(&["sh".into(), "-c".into(), "printf ok".into()]).await;
         assert_eq!(r2.outcome, ExecOutcome::Success);
         assert_eq!(r2.stdout, "ok");
+    }
+
+    #[tokio::test]
+    async fn devices_list_has_members_only_when_present() {
+        let cfg = r##"
+            [[device]]
+            name = "parent"
+            kind = "light"
+            members = ["kid"]
+            get_state = ["sh", "-c", "printf '{\"value\":true}'"]
+            on  = ["sh", "-c", "printf '{}'"]
+            off = ["sh", "-c", "printf '{}'"]
+            [[device]]
+            name = "kid"
+            kind = "light"
+            get_state = ["sh", "-c", "printf '{\"value\":true}'"]
+            on  = ["sh", "-c", "printf '{}'"]
+            off = ["sh", "-c", "printf '{}'"]
+        "##;
+        let (st, v) = call_on(cfg, "GET", "/api/devices").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let parent = arr.iter().find(|d| d["name"] == "parent").unwrap();
+        assert_eq!(parent["members"], serde_json::json!(["kid"]));
+        // 空の members はフィールドごと省略される。
+        let kid = arr.iter().find(|d| d["name"] == "kid").unwrap();
+        assert!(kid.get("members").is_none());
     }
 }
