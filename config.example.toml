@@ -128,6 +128,36 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 #
 # 注意: switch はグループ（[[group]] members）に入れられない（当面シャッター専用）。
 
+# ── light のグループカード（members）─────────────────────
+# light デバイスは members を持つことで「グループカード」として表示される。
+# 一括操作は上の group コマンド（wire group の場合は mat group invoke 等）のまま。
+# members は UI の「個別に操作」展開に使われ、mando が members を順に exec することはない。
+# メンバーは自分も [[device]] として定義されている必要がある。トップの照明一覧からは消え、
+# グループカードの展開内にのみ表示される。親・メンバーとも light 限定・入れ子禁止・複数親への所属禁止。
+# [[device]]
+# name  = "living_lights"
+# alias = "リビング照明"
+# kind  = "light"
+# get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
+# on    = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "on"]
+# off   = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "off"]
+# brightness = ["mat", "group", "level", "--group", "10", "--percent", "{brightness}"]
+# members = ["living_south_light", "tv_back_light"]
+#
+# [[device]]
+# name  = "living_south_light"
+# kind  = "light"
+# get_state = ["mat", "read", "--node", "6", "--cluster", "onoff", "--attribute", "on-off"]
+# on    = ["mat", "on",  "--node", "6"]
+# off   = ["mat", "off", "--node", "6"]
+#
+# [[device]]
+# name  = "tv_back_light"
+# kind  = "light"
+# get_state = ["mat", "read", "--node", "7", "--cluster", "onoff", "--attribute", "on-off"]
+# on    = ["mat", "on",  "--node", "7"]
+# off   = ["mat", "off", "--node", "7"]
+
 # ── グラフ（きろくセクション）──────────────────────────────
 # 下層の読み出しコマンドをテンプレで指定する。mando はこのコマンドを exec し
 # stdout の契約 JSON 配列を受け取るだけで、transport（HTTP か CLI か）は知らない。

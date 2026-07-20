@@ -182,6 +182,11 @@ pub struct Device {
     /// 未指定なら素のスイッチ表示。shutter / light では指定不可。
     #[serde(default)]
     pub face: Option<Face>,
+    /// このデバイスをグループカードとして描画するときのメンバー device 名(light 専用・任意)。
+    /// 一括操作はこのデバイス自身のコマンド(wire group 等)が担い、members は
+    /// UI の「個別に操作」展開に使うだけ — mando が members を直列 exec することはない。
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 impl Device {
@@ -246,6 +251,10 @@ pub enum ConfigError {
     DuplicateGraph(String),
     EmptyGraphQuery(String),
     PeriodPlaceholder { graph: String, count: usize },
+    UnknownLightMember { device: String, member: String },
+    NonLightMember { device: String, member: String },
+    NestedLightMembers { device: String, member: String },
+    DuplicateLightMember { member: String },
     EmptyHealthCommand,
 }
 
@@ -289,6 +298,18 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyGraphQuery(n) => write!(f, "graph {n}: query が空"),
             ConfigError::PeriodPlaceholder { graph, count } => {
                 write!(f, "graph {graph}: query は {{period}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
+            }
+            ConfigError::UnknownLightMember { device, member } => {
+                write!(f, "device {device}: members が未知の device を参照: {member}")
+            }
+            ConfigError::NonLightMember { device, member } => {
+                write!(f, "device {device}: members に light 以外は入れられない: {member}")
+            }
+            ConfigError::NestedLightMembers { device, member } => {
+                write!(f, "device {device}: member {member} は自身が members を持つため入れ子にできない")
+            }
+            ConfigError::DuplicateLightMember { member } => {
+                write!(f, "device {member}: 複数の light グループに所属できない")
             }
             ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
         }
@@ -441,6 +462,44 @@ impl Config {
                             field: "preset",
                         });
                     }
+                }
+            }
+        }
+
+        // light の members(グループカード)検証。親・メンバーとも light 限定、
+        // 入れ子と複数親への所属は禁止(UI がタイルをデバイスごとに 1 つしか持てないため)。
+        let mut seen_lm = std::collections::HashSet::new();
+        for d in &self.devices {
+            if d.members.is_empty() {
+                continue;
+            }
+            if d.kind != Kind::Light {
+                return Err(ConfigError::ForbiddenField {
+                    device: d.name.clone(),
+                    field: "members",
+                });
+            }
+            for m in &d.members {
+                let Some(md) = self.find(m) else {
+                    return Err(ConfigError::UnknownLightMember {
+                        device: d.name.clone(),
+                        member: m.clone(),
+                    });
+                };
+                if md.kind != Kind::Light {
+                    return Err(ConfigError::NonLightMember {
+                        device: d.name.clone(),
+                        member: m.clone(),
+                    });
+                }
+                if !md.members.is_empty() {
+                    return Err(ConfigError::NestedLightMembers {
+                        device: d.name.clone(),
+                        member: m.clone(),
+                    });
+                }
+                if !seen_lm.insert(m) {
+                    return Err(ConfigError::DuplicateLightMember { member: m.clone() });
                 }
             }
         }
@@ -1017,6 +1076,7 @@ mod tests {
             brightness: None,
             presets: vec![],
             face: None,
+            members: vec![],
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());
@@ -1550,6 +1610,126 @@ mod tests {
         assert!(matches!(
             Config::load(&p),
             Err(ConfigError::EmptyHealthCommand)
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    /// members テスト用の light デバイス定義を生成する。
+    fn light_toml(name: &str, extra: &str) -> String {
+        format!(
+            r##"
+            [[device]]
+            name = "{name}"
+            kind = "light"
+            get_state = ["mat","read"]
+            on  = ["mat","on"]
+            off = ["mat","off"]
+            {extra}
+            "##
+        )
+    }
+
+    #[test]
+    fn light_members_parse() {
+        let body = format!(
+            "{}{}{}",
+            light_toml("parent", r#"members = ["kid1", "kid2"]"#),
+            light_toml("kid1", ""),
+            light_toml("kid2", ""),
+        );
+        let p = write_tmp("members_ok", &body);
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("parent").unwrap().members, vec!["kid1", "kid2"]);
+        assert!(cfg.find("kid1").unwrap().members.is_empty());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_unknown() {
+        let body = light_toml("parent", r#"members = ["ghost"]"#);
+        let p = write_tmp("members_unknown", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::UnknownLightMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_non_light() {
+        let body = format!(
+            "{}{}",
+            light_toml("parent", r#"members = ["sw"]"#),
+            r##"
+            [[device]]
+            name = "sw"
+            kind = "switch"
+            get_state = ["casa","get"]
+            on  = ["casa","on"]
+            off = ["casa","off"]
+            "##
+        );
+        let p = write_tmp("members_nonlight", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::NonLightMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_nested() {
+        let body = format!(
+            "{}{}{}",
+            light_toml("grandparent", r#"members = ["parent"]"#),
+            light_toml("parent", r#"members = ["kid"]"#),
+            light_toml("kid", ""),
+        );
+        let p = write_tmp("members_nested", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::NestedLightMembers { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_duplicate_membership() {
+        let body = format!(
+            "{}{}{}",
+            light_toml("p1", r#"members = ["kid"]"#),
+            light_toml("p2", r#"members = ["kid"]"#),
+            light_toml("kid", ""),
+        );
+        let p = write_tmp("members_dup", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicateLightMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_forbidden_on_shutter() {
+        let p = write_tmp(
+            "members_shutter",
+            r##"
+            [[device]]
+            name = "s1"
+            members = ["s2"]
+            get_state = ["enl","get","x","026301","open_close_state"]
+            open = ["enl","set","x","026301","open_close_operation","open"]
+            close = ["enl","set","x","026301","open_close_operation","close"]
+            [[device]]
+            name = "s2"
+            get_state = ["enl","get","x","026302","open_close_state"]
+            open = ["enl","set","x","026302","open_close_operation","open"]
+            close = ["enl","set","x","026302","open_close_operation","close"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "members", .. })
         ));
         std::fs::remove_file(p).ok();
     }
