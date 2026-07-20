@@ -309,7 +309,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "device {device}: member {member} は自身が members を持つため入れ子にできない")
             }
             ConfigError::DuplicateLightMember { member } => {
-                write!(f, "device {member}: 複数の light グループに所属できない")
+                write!(f, "device {member}: members に複数回指定されている（同一グループ内の重複または複数グループへの所属）")
             }
             ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
         }
@@ -1705,6 +1705,32 @@ mod tests {
         assert!(matches!(
             Config::load(&p),
             Err(ConfigError::DuplicateLightMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_same_parent_duplicate() {
+        let body = format!(
+            "{}{}",
+            light_toml("parent", r#"members = ["kid", "kid"]"#),
+            light_toml("kid", ""),
+        );
+        let p = write_tmp("members_same_parent_dup", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::DuplicateLightMember { .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn light_members_reject_self_reference() {
+        let body = light_toml("parent", r#"members = ["parent"]"#);
+        let p = write_tmp("members_self_ref", &body);
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::NestedLightMembers { .. })
         ));
         std::fs::remove_file(p).ok();
     }

@@ -145,22 +145,22 @@ tasks:
       # pull 後にビルドする順序が肝。先にビルドすると古いソースを焼き込む。
       - git pull --ff-only
       - cargo build --release
-      - sudo install -Dm755 {{.BIN}} {{.BIN_DST}}
-      - sudo systemctl restart mando
-      - systemctl status mando --no-pager --lines=0
+      - install -Dm755 {{.BIN}} ~/.local/bin/mando
+      - systemctl --user restart mando
+      - systemctl --user status mando --no-pager --lines=0
 
   reload:
     desc: 常駐サービスを再起動して config を反映（config 変更後）
     cmds:
-      - sudo systemctl restart mando
-      - systemctl status mando --no-pager --lines=0
+      - systemctl --user restart mando
+      - systemctl --user status mando --no-pager --lines=0
 
   svc-status:
     desc: 常駐サービスの状態
     cmds:
-      - systemctl status mando --no-pager
+      - systemctl --user status mando --no-pager
 
   logs:
     desc: 常駐サービスのログを追尾（journalctl）
     cmds:
-      - journalctl -u mando -f --no-pager
+      - journalctl --user-unit mando -f --no-pager
