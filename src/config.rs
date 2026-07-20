@@ -67,7 +67,6 @@ pub struct Config {
     pub exec: ExecSettings,
     /// state 読みキャッシュの設定（任意）。
     #[serde(default)]
-    #[allow(dead_code)]
     pub cache: CacheSettings,
 }
 
@@ -93,7 +92,6 @@ fn default_exec_timeout_ms() -> u64 {
 
 /// state 読みキャッシュの設定。
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct CacheSettings {
     /// state 読みをキャッシュする TTL（ミリ秒）。0 は TTL 無効（single-flight のみ）。
     #[serde(default = "default_state_ttl_ms")]

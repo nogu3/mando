@@ -10,17 +10,12 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// main.rs での結線は Task 3（App.state_cache として使用）。それまで非 test
-// ビルドでは未構築/未使用のため dead_code が出る — 結線後にこの allow は外す。
-#[allow(dead_code)]
 struct Cached<T> {
     at: Instant,
     value: T,
 }
 
 /// 文字列キーごとに値 T を短時間共有する汎用キャッシュ。
-// main.rs での結線は Task 3。それまで非 test ビルドでは未構築（dead_code）。
-#[allow(dead_code)]
 pub struct Cache<T> {
     #[allow(clippy::type_complexity)]
     slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Cached<T>>>>>>,
@@ -34,7 +29,6 @@ impl<T> Default for Cache<T> {
     }
 }
 
-#[allow(dead_code)] // main.rs での結線は Task 3。それまで非 test ビルドでは未使用。
 impl<T: Clone + Send + 'static> Cache<T> {
     /// key の per-key ロックを取得（無ければ作る）。保持は一瞬。
     fn slot(&self, key: &str) -> Arc<tokio::sync::Mutex<Option<Cached<T>>>> {

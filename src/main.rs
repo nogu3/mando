@@ -34,12 +34,19 @@ struct App {
     /// 別枠 — 重い読み出し（duckdb 等）がシャッター操作をブロックしないため。
     /// グラフ同士は直列（ホストの CPU/メモリ保護）。
     graph_executor: Executor,
+    /// state 読みの short-TTL + single-flight キャッシュ（原則6/7）。
+    state_cache: cache::Cache<StateView>,
 }
 
 impl App {
     /// デバイス exec の上限（config の [exec] timeout_ms）。
     fn exec_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.config.exec.timeout_ms)
+    }
+
+    /// state 読みキャッシュの TTL（config の [cache] state_ttl_ms）。
+    fn state_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.config.cache.state_ttl_ms)
     }
 }
 
@@ -75,6 +82,7 @@ async fn main() {
         config,
         executor: Executor::new(),
         graph_executor: Executor::new(),
+        state_cache: cache::Cache::default(),
     });
 
     let router = router(app);
@@ -184,7 +192,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
 }
 
 /// state テンプレを exec → 正規化した結果。
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct StateView {
     /// 正規化された状態。shutter: open | closed | … / light: on | off。想定外は unknown。
     state: DeviceState,
@@ -239,9 +247,23 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
     }
 }
 
+/// get_state をキャッシュ経由で実行する（GET ハンドラ用）。
+/// 成功読みだけ TTL キャッシュし、同時読みは 1 exec に合流する（原則6/7）。
+/// set 経路はこれを通さず、生の fetch_state + store を使う。
+async fn cached_state(app: &App, device: &Device) -> StateView {
+    let ttl = app.state_ttl();
+    app.state_cache
+        .get_or_fetch(&device.name, ttl, || async {
+            let view = fetch_state(app, device).await;
+            let cacheable = view.exec == ExecOutcome::Success;
+            (view, cacheable)
+        })
+        .await
+}
+
 async fn get_state(State(app): State<Shared>, Path(name): Path<String>) -> Response {
     match app.config.find(&name) {
-        Some(device) => Json(fetch_state(&app, device).await).into_response(),
+        Some(device) => Json(cached_state(&app, device).await).into_response(),
         None => not_found(&name),
     }
 }
@@ -268,6 +290,12 @@ async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
     }
     // 設計原則 7: set 後は必ず state を取り直し、実際の開閉を確認してから返す。
     let state = fetch_state(app, device).await;
+    // 確定値でキャッシュを更新（成功時のみ）。直後のポーリングが古い値を見ない。
+    if state.exec == ExecOutcome::Success {
+        app.state_cache
+            .store(&device.name, state.clone())
+            .await;
+    }
     ActionView {
         action: result.outcome,
         state,
@@ -872,6 +900,7 @@ mod tests {
             config: cfg,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
         })
     }
 
@@ -915,6 +944,7 @@ mod tests {
             config: toml::from_str(cfg_toml).unwrap(),
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
         });
         let res = router(app)
             .oneshot(
@@ -1308,6 +1338,7 @@ mod tests {
             config,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
         };
         let device = app.config.find("slow").unwrap();
         let start = Instant::now();
@@ -1319,6 +1350,70 @@ mod tests {
             "timeout must bound the exec: {:?}",
             start.elapsed()
         );
+    }
+
+    /// get_state が exec のたびに temp ファイルへ 1 行追記する shutter を持つ App。
+    /// `ttl_ms` でキャッシュ TTL を差し替える。
+    fn counting_app(counter_path: &str, ttl_ms: u64) -> Shared {
+        let cfg: Config = toml::from_str(&format!(
+            r##"
+            [cache]
+            state_ttl_ms = {ttl_ms}
+            [[device]]
+            name = "shutter"
+            get_state = ["sh", "-c", "printf x >> {counter_path}; printf '{{\"properties\":[{{\"name\":\"open_close_state\",\"value\":\"open\"}}]}}'"]
+            open  = ["sh", "-c", "printf '{{}}'"]
+            close = ["sh", "-c", "printf '{{}}'"]
+            "##
+        ))
+        .unwrap();
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
+        })
+    }
+
+    fn exec_count(counter_path: &str) -> usize {
+        std::fs::read_to_string(counter_path)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn cached_state_hits_within_ttl() {
+        let path = std::env::temp_dir().join(format!("mando_cache_hit_{}.txt", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        std::fs::write(&path, "").unwrap();
+
+        let app = counting_app(&p, 2000);
+        let device = app.config.find("shutter").unwrap();
+
+        let a = cached_state(&app, device).await;
+        let b = cached_state(&app, device).await;
+
+        assert_eq!(a.state, normalize::State::Open);
+        assert_eq!(b.state, normalize::State::Open);
+        assert_eq!(exec_count(&p), 1, "TTL 内の 2 回目は exec しない");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn cached_state_refetches_after_ttl() {
+        let path = std::env::temp_dir().join(format!("mando_cache_exp_{}.txt", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        std::fs::write(&path, "").unwrap();
+
+        let app = counting_app(&p, 30);
+        let device = app.config.find("shutter").unwrap();
+
+        cached_state(&app, device).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        cached_state(&app, device).await;
+
+        assert_eq!(exec_count(&p), 2, "TTL 経過後は再 exec");
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
