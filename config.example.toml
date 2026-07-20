@@ -54,8 +54,8 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # 書くと UI が色玉スウォッチで出す。省略するとテキストチップになる。
 # node 番号は `mat discover` で確認。将来 casa に差し替えるときも配列の差し替えのみ。
 # [[device]]
-# name  = "living_lights"
-# alias = "リビング照明"
+# name  = "desk_light"
+# alias = "デスクライト"
 # kind  = "light"
 # get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "on",  "--node", "5"]
@@ -88,7 +88,8 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # color = "#ff69b4"
 # cmd   = ["mat", "color", "--node", "5", "--name", "pink"]
 #
-# 注意: light はグループ（[[group]] members）に入れられない（当面シャッター専用）。
+# 注意: light は [[group]]（シャッター用）には入れられない。light 同士をまとめるには
+# 下の「light のグループカード（members）」を使う。
 # 注意: light は定期ポーリングしない（mat 直叩きは 1 コール数秒 + exec 直列のため）。
 #       表示時 1 回 + 操作の ~2 秒後に 1 回の追いつき取得のみ（ベストエフォート表示）。
 #
