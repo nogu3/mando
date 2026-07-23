@@ -150,6 +150,9 @@ pub struct Graph {
     /// マップに無い series は素通し。検証はしない — 知らないキーは単に使われない。
     #[serde(default)]
     pub series_labels: Option<std::collections::HashMap<String, String>>,
+    /// チャート形（任意）。既知値 "stacked" のみ。省略時は従来 line/bar。
+    #[serde(default)]
+    pub chart: Option<String>,
 }
 
 impl Graph {
@@ -308,6 +311,7 @@ pub enum ConfigError {
     DuplicateGraph(String),
     EmptyGraphQuery(String),
     PeriodPlaceholder { graph: String, count: usize },
+    UnknownChart { graph: String, value: String },
     UnknownLightMember { device: String, member: String },
     NonLightMember { device: String, member: String },
     NestedLightMembers { device: String, member: String },
@@ -355,6 +359,9 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyGraphQuery(n) => write!(f, "graph {n}: query が空"),
             ConfigError::PeriodPlaceholder { graph, count } => {
                 write!(f, "graph {graph}: query は {{period}} プレースホルダをちょうど 1 個含む必要がある（現在 {count} 個）")
+            }
+            ConfigError::UnknownChart { graph, value } => {
+                write!(f, "graph {graph}: 未知の chart 値 {value}（対応: stacked）")
             }
             ConfigError::UnknownLightMember { device, member } => {
                 write!(f, "device {device}: members が未知の device を参照: {member}")
@@ -610,6 +617,14 @@ impl Config {
                     graph: g.name.clone(),
                     count,
                 });
+            }
+            if let Some(c) = &g.chart {
+                if c != "stacked" {
+                    return Err(ConfigError::UnknownChart {
+                        graph: g.name.clone(),
+                        value: c.clone(),
+                    });
+                }
             }
         }
 
@@ -1867,5 +1882,48 @@ mod tests {
     fn cache_ttl_is_overridable() {
         let cfg: Config = toml::from_str("[cache]\nstate_ttl_ms = 500\n").unwrap();
         assert_eq!(cfg.cache.state_ttl_ms, 500);
+    }
+
+    #[test]
+    fn graph_chart_stacked_accepted() {
+        let p = write_tmp(
+            "chart_ok",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl","get","x","026301","open_close_state"]
+            open = ["enl","set","x","026301","open_close_operation","open"]
+            close = ["enl","set","x","026301","open_close_operation","close"]
+            [[graph]]
+            name  = "power_balance"
+            unit  = "円"
+            chart = "stacked"
+            query = ["curl","{period}"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find_graph("power_balance").unwrap().chart.as_deref(), Some("stacked"));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn graph_chart_unknown_rejected() {
+        let p = write_tmp(
+            "chart_bad",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl","get","x","026301","open_close_state"]
+            open = ["enl","set","x","026301","open_close_operation","open"]
+            close = ["enl","set","x","026301","open_close_operation","close"]
+            [[graph]]
+            name  = "g"
+            unit  = "円"
+            chart = "pie"
+            query = ["curl","{period}"]
+            "##,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::UnknownChart { .. })));
+        std::fs::remove_file(p).ok();
     }
 }
