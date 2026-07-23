@@ -189,9 +189,16 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # [[graph]]
 # name       = "generation"
 # label      = "太陽光発電"
-# unit       = "W"      # 今日ビュー（時系列カーブ）の単位
-# unit_daily = "kWh"    # 週/月ビュー（日別集計）の単位。省略時 unit
+# unit       = "%"       # 今日ビュー: 定格比%（embalse が W/定格×100 で返す）
+# unit_daily = "kWh"     # 週/月ビュー & 今日の @summary（今日合計 kWh）の単位
 # query      = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/graphs/generation?period={period}"]
+#
+# [[graph]]
+# name  = "power_balance"
+# label = "電力収支"
+# unit  = "円"           # embalse が 買電(負)/売電(正)/自家消費節約(正) を円で返す
+# chart = "stacked"      # 基線 0 を挟んで積み上げ・見出しはネット合計（得/損）
+# query = ["curl", "-fsS", "--max-time", "30", "http://192.0.2.20:8526/api/graphs/power_balance?period={period}"]
 #
 # [[graph]]
 # name  = "co2"
