@@ -49,8 +49,13 @@ mando は **表示のみ**。
 
 ### 3. `main.rs`
 
-- `GraphView` に **`chart: Option<String>`**（config 由来）と **`summary: Option<f64>`** を追加。
-- `get_graph` は正規化結果の `series` と `summary`、config の `chart` を載せるだけ。
+- `GraphView` に以下を追加（いずれも `Option`・`None` は JSON 省略）:
+  - **`chart: Option<String>`**（config 由来）
+  - **`summary: Option<f64>`**（正規化結果）
+  - **`summary_unit: Option<String>`** — summary の表示単位。`GraphView.unit` は period
+    解決済み（generation today では `%`）なので、kWh の summary を出すには別枠が要る。
+    summary が `Some` のとき `graph.unit_daily`（無ければ `graph.unit`）を載せる。
+- `get_graph` は正規化結果の `series` / `summary`、config の `chart` / summary_unit を載せるだけ。
 
 ### 4. `index.html`
 
@@ -58,9 +63,12 @@ mando は **表示のみ**。
   （設計原則 4: generation 固有名をコードから排除。合計は embalse が `@summary` で返す）。
 - 見出しロジックを 2 モードに:
   - **通常**（`chart` 未指定）: 見出し = 先頭系列の最新値 + `unit`。`summary` があれば
-    sub に「今日 {summary} {unit_daily}」。→ 発電は「いま X% / 今日 Y kWh」がこれで出る。
+    sub に「今日 {summary} {summary_unit}」。→ 発電は「いま X% / 今日 Y kWh」がこれで出る。
   - **`chart === "stacked"`**: 見出し = **ネット合計 Σ**（全系列全点の合算。買電が負なので
     単純合算がネット）+ `unit`。得 = プラス色 / 損 = マイナス色。本体 = **スタックド棒**。
+- **セグメント配色は series ラベルでなく符号で決める**（設計原則 3/4: 買電/売電等の
+  下層ラベルを UI コードに焼かない）。系列合計が負 → 支出色（グレー）、正 → 得色パレット
+  （緑・青）を初出順に割当。ネット見出しの符号も全点 Σ の符号で決める。
 - **スタックド棒描画関数を新規追加**（既存 line/bar は据え置き。dataviz スキルに従う）:
   - today = 1 本、week/month = 日別 N 本。
   - **基線 0** を挟み、買電（負）を**下**、売電・自家消費節約（正）を**上**に積む。
