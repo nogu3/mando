@@ -1035,6 +1035,11 @@ async function fetchHealth() {
 // 系列へ初出順に固定割当する。循環させない — 5 系列以上は先頭 4 系列のみ描画
 // （必要なら config 側でグラフを分割する）。
 const GRAPH_COLORS = ["#3987e5", "#008300", "#d55181", "#c98500"];
+// スタックド棒（円収支）: 支出=ニュートラル、得=緑/青（案 E）。色は series の符号で割当。
+const STACK_NEG_COLOR = "#6b7488";              // 支出（合計が負の系列）
+const STACK_POS_COLORS = ["#18b88a", "#6ea8fe"]; // 得（合計が正の系列）を初出順に
+const NET_GAIN = "#18b88a";                      // ネット見出し 得(+)
+const NET_LOSS = "#f0635a";                      // ネット見出し 損(−)
 const GRAPH_SURFACE = "#10141d"; // マーカのサーフェスリング用（パネルの実効色）
 const PERIODS = [["today", "今日"], ["week", "週"], ["month", "月"]];
 let graphPeriod = "today";
@@ -1119,19 +1124,34 @@ function renderGraph(gc, view) {
     gc.bodyEl.innerHTML = `<div class="gmsg">まだデータがありません</div>`;
     return;
   }
-  // 見出しの要約数値 = 先頭系列の最新値（数字が主、カーブは従）。
-  const first = series[0];
-  const latest = first.points[first.points.length - 1][1];
-  gc.valEl.textContent = fmtNum(latest);
+  gc.valEl.style.color = ""; // 前回の得/損色をリセット
+  const stacked = view.chart === "stacked";
+
+  if (stacked) {
+    // 見出し = 全系列全点のネット合計 Σ（買電が負なので単純合算がネット）。
+    const net = series.reduce((a, s) => a + s.points.reduce((b, p) => b + p[1], 0), 0);
+    const sign = net >= 0 ? "+" : "−";
+    gc.valEl.textContent = sign + fmtNum(Math.abs(net));
+    gc.valEl.style.color = net >= 0 ? NET_GAIN : NET_LOSS;
+  } else {
+    // 通常: 見出し = 先頭系列の最新値。
+    const first = series[0];
+    const latest = first.points[first.points.length - 1][1];
+    gc.valEl.textContent = fmtNum(latest);
+  }
   const u = document.createElement("span");
   u.className = "u";
   u.textContent = view.unit;
   gc.valEl.appendChild(u);
-  // generation の今日ビューは合計 kWh を併記（5 分ビン W の積分近似 Σv×(5/60)÷1000）。
-  if (view.name === "generation" && view.period === "today") {
-    const kwh = (first.points.reduce((a, p) => a + p[1], 0) * (5 / 60)) / 1000;
-    gc.subEl.textContent = `今日の合計 約 ${kwh.toFixed(1)} kWh`;
+
+  // sub 要約値（@summary 由来）。単位は summary_unit。
+  if (view.summary != null) {
+    gc.subEl.textContent = `今日 ${fmtNum(view.summary)} ${view.summary_unit ?? ""}`.trim();
   }
+
+  // stacked は series の符号で色を割当、それ以外は GRAPH_COLORS。
+  const colorFor = stacked ? assignStackColors(series) : series.map((_, i) => GRAPH_COLORS[i]);
+
   // 凡例は 2 系列以上のときだけ（単系列はタイトルが系列名を兼ねる）。
   gc.legendEl.innerHTML = "";
   gc.legendEl.hidden = series.length < 2;
@@ -1141,20 +1161,37 @@ function renderGraph(gc, view) {
       k.className = "k";
       const d = document.createElement("span");
       d.className = "kd";
-      d.style.background = GRAPH_COLORS[i];
+      d.style.background = colorFor[i];
       k.append(d, s.label);
       gc.legendEl.appendChild(k);
     });
   }
+
   gc.bodyEl.innerHTML = "";
-  // 今日 = 時系列カーブ。週/月 = 日別集計（単系列は棒、複数系列は折れ線 —
-  // 30 日 × 複数系列のグループ棒はスマホで潰れる）。
-  const svg =
-    view.period !== "today" && series.length === 1
-      ? drawBarChart(series[0], view.period)
-      : drawLineChart(series, view.period);
+  let svg;
+  if (stacked) {
+    svg = drawStackedChart(series, view.period, colorFor);
+  } else {
+    // 今日 = 時系列カーブ。週/月 = 日別集計（単系列は棒、複数系列は折れ線）。
+    svg =
+      view.period !== "today" && series.length === 1
+        ? drawBarChart(series[0], view.period)
+        : drawLineChart(series, view.period);
+  }
   gc.bodyEl.appendChild(svg);
-  attachReadout(svg, gc, series, view);
+  if (!stacked) attachReadout(svg, gc, series, view);
+}
+
+// series 合計の符号で色を割当（買電/売電等のラベルを UI に焼かない・設計原則 3/4）。
+function assignStackColors(series) {
+  let posIdx = 0;
+  return series.map((s) => {
+    const total = s.points.reduce((a, p) => a + p[1], 0);
+    if (total < 0) return STACK_NEG_COLOR;
+    const c = STACK_POS_COLORS[posIdx % STACK_POS_COLORS.length];
+    posIdx += 1;
+    return c;
+  });
 }
 
 /* ── SVG チャート描画（手描き・外部ライブラリなし）───── */
@@ -1276,6 +1313,85 @@ function drawBarChart(s, period) {
     }));
   });
   return svg;
+}
+
+// スタックド棒: 基線 0 を挟み、正の系列を上、負の系列を下に積む。
+// today=1 本、週/月=ts 別 N 本。色は colors[seriesIndex]。
+function drawStackedChart(series, period, colors) {
+  const { w, h, l, r, t, b } = PLOT;
+  const svg = svgNode("svg", { viewBox: `0 0 ${w} ${h}`, role: "img" });
+  // ts の和集合を昇順に（同一クエリ由来の ISO8601 は辞書順=時刻順）。
+  const tsSet = new Set();
+  series.forEach((s) => s.points.forEach((p) => tsSet.add(p[0])));
+  const tss = [...tsSet].sort();
+  const at = (s, ts) => {
+    const p = s.points.find((q) => q[0] === ts);
+    return p ? p[1] : 0;
+  };
+  // 上下それぞれの最大積み高を求めて軸を切りよく丸める。
+  let maxUp = 0, maxDn = 0;
+  for (const ts of tss) {
+    let up = 0, dn = 0;
+    series.forEach((s) => { const v = at(s, ts); if (v >= 0) up += v; else dn += -v; });
+    maxUp = Math.max(maxUp, up); maxDn = Math.max(maxDn, dn);
+  }
+  const top = niceCeil(Math.max(maxUp, 1));
+  const bot = niceCeil(Math.max(maxDn, 1));
+  const y0 = t + (h - t - b) * (top / (top + bot)); // 基線 y
+  const upH = y0 - t, dnH = (h - b) - y0;
+  // 基線（やや強め）。
+  svg.appendChild(svgNode("line", {
+    x1: l, y1: y0, x2: w - r, y2: y0,
+    stroke: "rgba(150,170,210,0.28)", "stroke-width": 1,
+  }));
+  const slot = (w - l - r) / tss.length;
+  const bw = Math.max(6, Math.min(period === "today" ? 56 : 24, slot - 4));
+  // x 端ラベル（最初と最後の ts）。
+  const xEnd = [];
+  tss.forEach((ts, i) => {
+    const x = l + slot * i + (slot - bw) / 2;
+    if (i === 0) xEnd.push([x + bw / 2, "start", fmtTs(new Date(Date.parse(ts)), period)]);
+    if (i === tss.length - 1) xEnd.push([x + bw / 2, "end", fmtTs(new Date(Date.parse(ts)), period)]);
+    let yUp = y0, yDn = y0;
+    series.forEach((s, si) => {
+      const v = at(s, ts);
+      if (v > 0) {
+        const hh = (v / top) * upH;
+        const y = yUp - hh;
+        stackSeg(svg, x, y, bw, hh, colors[si], "up");
+        yUp = y - 2; // 2px 地間隔
+      } else if (v < 0) {
+        const hh = (-v / bot) * dnH;
+        const gap = yDn === y0 ? 0 : 2;
+        stackSeg(svg, x, yDn + gap, bw, hh, colors[si], "down");
+        yDn = yDn + gap + hh;
+      }
+    });
+  });
+  for (const [x, anchor, text] of xEnd) {
+    const tx = svgNode("text", {
+      x, y: h - b + 13, "text-anchor": anchor,
+      "font-size": 9, fill: "var(--muted)",
+    });
+    tx.textContent = text;
+    svg.appendChild(tx);
+  }
+  return svg;
+}
+
+// 積みセグメント 1 個。dir="up" は上端角、"down" は下端角のみ 4px 丸め。
+function stackSeg(svg, x, y, bw, hgt, fill, dir) {
+  const rr = Math.min(4, bw / 2, hgt);
+  let d;
+  if (dir === "up") {
+    d = `M${x},${y + hgt} L${x},${y + rr} Q${x},${y} ${x + rr},${y}` +
+        ` L${x + bw - rr},${y} Q${x + bw},${y} ${x + bw},${y + rr} L${x + bw},${y + hgt} Z`;
+  } else {
+    const yb = y + hgt;
+    d = `M${x},${y} L${x + bw},${y} L${x + bw},${yb - rr} Q${x + bw},${yb} ${x + bw - rr},${yb}` +
+        ` L${x + rr},${yb} Q${x},${yb} ${x},${yb - rr} Z`;
+  }
+  svg.appendChild(svgNode("path", { d, fill }));
 }
 
 /* ── ホバー/タッチ読み取り層: 最寄り時点の値を gsub に表示 ── */
