@@ -130,6 +130,13 @@ pub struct GraphSeries {
     pub points: Vec<(String, f64)>,
 }
 
+/// グラフ正規化の結果。通常系列と、見出し併記用の sub 要約値（@summary 行）。
+#[derive(Debug, PartialEq, Serialize)]
+pub struct GraphNormalized {
+    pub series: Vec<GraphSeries>,
+    pub summary: Option<f64>,
+}
+
 /// embalse 読み出し CLI の契約 JSON（フラット行配列）→ チャート系列。
 ///
 /// 契約: `[{"ts": "ISO8601", "series": "ラベル(任意)", "value": 数値}, ...]`
@@ -137,15 +144,18 @@ pub struct GraphSeries {
 /// 欠けた・型不正の行は drop（部分的に壊れたデータで全体を落とさない）。
 /// 系列は初出順、各系列内は ts 昇順（同一オフセットの ISO8601 は辞書順=時刻順）。
 /// series_labels は series 名 → UI 表示名の置換マップ（無いキーは素通し）。
+/// `@summary` 行は sub 要約値として抽出し series から除外（ts 最大を採用）。
 /// 下層（embalse）の出力形式に関する知識はこの関数に閉じる（設計原則 4）。
 pub fn normalize_graph_rows(
     rows: &[Value],
     default_label: &str,
     series_labels: Option<&std::collections::HashMap<String, String>>,
-) -> Vec<GraphSeries> {
+) -> GraphNormalized {
     let mut order: Vec<String> = Vec::new();
     let mut by_label: std::collections::HashMap<String, Vec<(String, f64)>> =
         std::collections::HashMap::new();
+    let mut summary: Option<f64> = None;
+    let mut summary_ts: Option<String> = None;
     for row in rows {
         let Some(ts) = row.get("ts").and_then(Value::as_str) else {
             continue;
@@ -153,10 +163,16 @@ pub fn normalize_graph_rows(
         let Some(value) = row.get("value").and_then(Value::as_f64) else {
             continue;
         };
-        let raw = row
-            .get("series")
-            .and_then(Value::as_str)
-            .unwrap_or(default_label);
+        let series_field = row.get("series").and_then(Value::as_str);
+        // 予約センチネル: 通常系列に混ぜず、ts 最大の value を sub 要約値に。
+        if series_field == Some("@summary") {
+            if summary_ts.as_deref().is_none_or(|t| ts > t) {
+                summary = Some(value);
+                summary_ts = Some(ts.to_string());
+            }
+            continue;
+        }
+        let raw = series_field.unwrap_or(default_label);
         let label = series_labels
             .and_then(|m| m.get(raw))
             .map(String::as_str)
@@ -169,14 +185,15 @@ pub fn normalize_graph_rows(
             .or_default()
             .push((ts.to_string(), value));
     }
-    order
+    let series = order
         .into_iter()
         .map(|label| {
             let mut points = by_label.remove(&label).unwrap_or_default();
             points.sort_by(|a, b| a.0.cmp(&b.0));
             GraphSeries { label, points }
         })
-        .collect()
+        .collect();
+    GraphNormalized { series, summary }
 }
 
 /// health 1 項目。契約行の metric を UI 表示名に写したもの。
@@ -493,7 +510,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 100.0}),
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 200.0}),
         ];
-        let s = normalize_graph_rows(&rows, "太陽光発電", None);
+        let s = normalize_graph_rows(&rows, "太陽光発電", None).series;
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].label, "太陽光発電");
         assert_eq!(s[0].points.len(), 2);
@@ -507,7 +524,7 @@ mod tests {
             json!({"ts": "t1", "series": "リビング", "value": 600.0}),
             json!({"ts": "t2", "series": "書斎", "value": 820.0}),
         ];
-        let s = normalize_graph_rows(&rows, "CO2", None);
+        let s = normalize_graph_rows(&rows, "CO2", None).series;
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].label, "書斎");
         assert_eq!(s[0].points.len(), 2);
@@ -521,7 +538,7 @@ mod tests {
             json!({"ts": "2026-07-15T10:05:00+09:00", "value": 2.0}),
             json!({"ts": "2026-07-15T10:00:00+09:00", "value": 1.0}),
         ];
-        let s = normalize_graph_rows(&rows, "x", None);
+        let s = normalize_graph_rows(&rows, "x", None).series;
         assert_eq!(s[0].points[0].1, 1.0);
         assert_eq!(s[0].points[1].1, 2.0);
     }
@@ -535,14 +552,14 @@ mod tests {
             json!("garbage"),                              // オブジェクトですらない
             json!({"ts": "t3", "value": 3.0}),             // 唯一の正常行
         ];
-        let s = normalize_graph_rows(&rows, "x", None);
+        let s = normalize_graph_rows(&rows, "x", None).series;
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].points, vec![("t3".to_string(), 3.0)]);
     }
 
     #[test]
     fn graph_rows_empty_is_empty() {
-        assert!(normalize_graph_rows(&[], "x", None).is_empty());
+        assert!(normalize_graph_rows(&[], "x", None).series.is_empty());
     }
 
     #[test]
@@ -553,10 +570,43 @@ mod tests {
             json!({"ts": "t1", "series": "cpu_used_pct", "value": 12.0}),
             json!({"ts": "t1", "series": "mem_used_pct", "value": 45.0}),
         ];
-        let s = normalize_graph_rows(&rows, "jarvis", Some(&m));
+        let s = normalize_graph_rows(&rows, "jarvis", Some(&m)).series;
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].label, "CPU (%)"); // マップにあれば置換
         assert_eq!(s[1].label, "mem_used_pct"); // 無ければ素通し
+    }
+
+    #[test]
+    fn graph_rows_summary_extracted_and_excluded() {
+        let rows = [
+            json!({"ts": "2026-07-15T10:00:00+09:00", "value": 100.0}),
+            json!({"ts": "2026-07-15T10:05:00+09:00", "value": 200.0}),
+            json!({"ts": "2026-07-15T23:59:00+09:00", "series": "@summary", "value": 5.6}),
+        ];
+        let n = normalize_graph_rows(&rows, "太陽光発電", None);
+        assert_eq!(n.summary, Some(5.6));
+        assert_eq!(n.series.len(), 1); // @summary は通常系列に混ざらない
+        assert_eq!(n.series[0].points.len(), 2);
+    }
+
+    #[test]
+    fn graph_rows_summary_takes_latest_ts() {
+        let rows = [
+            json!({"ts": "t1", "series": "@summary", "value": 1.0}),
+            json!({"ts": "t3", "series": "@summary", "value": 3.0}),
+            json!({"ts": "t2", "series": "@summary", "value": 2.0}),
+        ];
+        let n = normalize_graph_rows(&rows, "x", None);
+        assert_eq!(n.summary, Some(3.0)); // ts 最大
+        assert!(n.series.is_empty());
+    }
+
+    #[test]
+    fn graph_rows_no_summary_is_none() {
+        let rows = [json!({"ts": "t1", "value": 1.0})];
+        let n = normalize_graph_rows(&rows, "x", None);
+        assert_eq!(n.summary, None);
+        assert_eq!(n.series.len(), 1);
     }
 
     #[test]

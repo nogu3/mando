@@ -722,7 +722,7 @@ async fn get_graph(
         }
     };
     let series =
-        normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref());
+        normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref()).series;
     Json(GraphView {
         name: graph.name.clone(),
         period: period.to_string(),
