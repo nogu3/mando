@@ -1350,8 +1350,9 @@ function drawStackedChart(series, period, colors) {
   const xEnd = [];
   tss.forEach((ts, i) => {
     const x = l + slot * i + (slot - bw) / 2;
-    if (i === 0) xEnd.push([x + bw / 2, "start", fmtTs(new Date(Date.parse(ts)), period)]);
-    if (i === tss.length - 1) xEnd.push([x + bw / 2, "end", fmtTs(new Date(Date.parse(ts)), period)]);
+    // 単一バケット（今日=1本）は端ラベルが重なるので出さない（見出しとタブが期間を示す）。
+    if (tss.length > 1 && i === 0) xEnd.push([x + bw / 2, "start", fmtTs(new Date(Date.parse(ts)), period)]);
+    if (tss.length > 1 && i === tss.length - 1) xEnd.push([x + bw / 2, "end", fmtTs(new Date(Date.parse(ts)), period)]);
     let yUp = y0, yDn = y0;
     series.forEach((s, si) => {
       const v = at(s, ts);
