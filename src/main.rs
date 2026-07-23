@@ -664,6 +664,12 @@ struct GraphView {
     name: String,
     period: String,
     unit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chart: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_unit: Option<String>,
     series: Vec<GraphSeries>,
 }
 
@@ -721,13 +727,19 @@ async fn get_graph(
             return graph_unavailable(&name);
         }
     };
-    let series =
-        normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref()).series;
+    let normalized =
+        normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref());
+    let summary_unit = normalized
+        .summary
+        .map(|_| graph.unit_daily.as_deref().unwrap_or(&graph.unit).to_string());
     Json(GraphView {
         name: graph.name.clone(),
         period: period.to_string(),
         unit: graph.unit_for(period).to_string(),
-        series,
+        chart: graph.chart.clone(),
+        summary: normalized.summary,
+        summary_unit,
+        series: normalized.series,
     })
     .into_response()
 }
@@ -869,7 +881,7 @@ mod tests {
             label      = "太陽光発電"
             unit       = "W"
             unit_daily = "kWh"
-            query      = ["sh", "-c", "printf '[{\"ts\":\"2026-07-15T10:05:00+09:00\",\"value\":200},{\"ts\":\"2026-07-15T10:00:00+09:00\",\"value\":100}]'", "sh", "{period}"]
+            query      = ["sh", "-c", "printf '[{\"ts\":\"2026-07-15T10:05:00+09:00\",\"value\":200},{\"ts\":\"2026-07-15T10:00:00+09:00\",\"value\":100},{\"ts\":\"2026-07-15T23:59:00+09:00\",\"series\":\"@summary\",\"value\":5.6}]'", "sh", "{period}"]
             [[graph]]
             name  = "co2"
             label = "CO2"
@@ -897,6 +909,11 @@ mod tests {
             unit  = "%"
             query = ["sh", "-c", "printf '[{\"ts\":\"t1\",\"series\":\"cpu_used_pct\",\"value\":12.3},{\"ts\":\"t1\",\"series\":\"cpu_temp_c\",\"value\":52.0}]'", "sh", "{period}"]
             series_labels = { cpu_used_pct = "CPU (%)", cpu_temp_c = "温度 (℃)" }
+            [[graph]]
+            name  = "power_balance"
+            unit  = "円"
+            chart = "stacked"
+            query = ["sh", "-c", "printf '[{\"ts\":\"t1\",\"series\":\"買電\",\"value\":-80},{\"ts\":\"t1\",\"series\":\"売電\",\"value\":180},{\"ts\":\"t1\",\"series\":\"自家消費節約\",\"value\":130}]'", "sh", "{period}"]
             [health]
             label   = "jarvis"
             command = ["sh", "-c", "printf '[{\"metric\":\"cpu_used_pct\",\"value\":12.3,\"ts\":\"t1\",\"level\":\"ok\"},{\"metric\":\"disk_used_pct\",\"value\":83.2,\"ts\":\"t1\",\"level\":\"warn\"}]'"]
@@ -1233,6 +1250,27 @@ mod tests {
         // ts 昇順にソートされる（スタブは逆順で返す）。
         assert_eq!(s["points"][0][1], 100.0);
         assert_eq!(s["points"][1][1], 200.0);
+    }
+
+    #[tokio::test]
+    async fn graph_summary_from_sentinel() {
+        let (st, v) = call("GET", "/api/graphs/generation").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["summary"], 5.6); // @summary 行が sub 要約値に
+        assert_eq!(v["summary_unit"], "kWh"); // unit_daily
+        // @summary は series に混ざらない（先頭系列は generation のまま）。
+        assert_eq!(v["series"][0]["label"], "太陽光発電");
+        assert_eq!(v["series"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_stacked_carries_chart_and_series() {
+        let (st, v) = call("GET", "/api/graphs/power_balance").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["chart"], "stacked");
+        assert_eq!(v["unit"], "円");
+        assert_eq!(v["series"].as_array().unwrap().len(), 3);
+        assert!(v.get("summary").is_none() || v["summary"].is_null()); // @summary 無し
     }
 
     #[tokio::test]
