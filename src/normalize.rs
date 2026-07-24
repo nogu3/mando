@@ -289,11 +289,15 @@ pub struct MeshNode {
 }
 
 /// メッシュの 1 エッジ。lqi / rssi / fer は「悪いほうの視点」の値。
+/// mat 側でフィールドが省略されうるため、欠けた実測値をゼロ埋めせず
+/// Option のまま伝える（原則7: 未測定を測定値として偽らない）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MeshEdge {
     pub a: String,
     pub b: String,
     /// "good" | "fair" | "weak" | "bad" | "route_only"。
+    /// "route_only" は「隣接視点が無い」場合と「隣接視点はあるが品質値が
+    /// 何も読めない」場合の両方を指す（どちらも honest な描き分けは「薄い破線」）。
     pub grade: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lqi: Option<u8>,
@@ -316,20 +320,22 @@ pub struct MeshView {
     pub fetched_at: Option<String>,
 }
 
-/// 1 視点ぶんの neighbor 実測値。
+/// 1 視点ぶんの neighbor 実測値。mat 側の `LinkMetrics` は全フィールドが
+/// `Option`（`skip_serializing_if`）なので、ここも Option で受ける。
+/// `{"lqi": 3}`（rssi/fer 欠落）や `{}` すら実際の出力形。
 #[derive(Clone, Copy)]
 struct MeshLink {
-    lqi: u8,
-    rssi: i64,
-    fer: u8,
+    lqi: Option<u8>,
+    rssi: Option<i64>,
+    fer: Option<u8>,
 }
 
 fn read_link(v: &Value) -> Option<MeshLink> {
     let o = v.as_object()?;
     Some(MeshLink {
-        lqi: o.get("lqi").and_then(Value::as_u64).unwrap_or(0) as u8,
-        rssi: o.get("avg_rssi").and_then(Value::as_i64).unwrap_or(0),
-        fer: o.get("frame_error_rate").and_then(Value::as_u64).unwrap_or(0) as u8,
+        lqi: o.get("lqi").and_then(Value::as_u64).map(|n| n as u8),
+        rssi: o.get("avg_rssi").and_then(Value::as_i64),
+        fer: o.get("frame_error_rate").and_then(Value::as_u64).map(|n| n as u8),
     })
 }
 
@@ -344,22 +350,72 @@ fn severity(grade: &str) -> u8 {
     }
 }
 
-/// LQI で等級を出し、frame error rate が高ければ weak 以下へ落とす。
-/// FER は悪くする方向にしか働かない（lqi 0 の bad を weak に引き上げない）。
+/// 両視点のうち「悪いほう」を選ぶ。ゼロ埋めせず、実際に値がある視点だけを
+/// 比較材料にする:
+/// 1. lqi を持つ視点があれば、その中で lqi 最小（同値なら fer 最大。
+///    fer 欠落はタイで実値持ちに負ける）。
+/// 2. lqi を持つ視点が無ければ、fer を持つ視点の中で fer 最大。
+/// 3. どちらも無ければ品質測定なし（呼び出し側で route_only にする）。
+fn pick_worst(views: &[MeshLink]) -> Option<MeshLink> {
+    let mut worst: Option<MeshLink> = None;
+    for &v in views.iter().filter(|v| v.lqi.is_some()) {
+        worst = Some(match worst {
+            None => v,
+            Some(cur) if is_worse_by_lqi(v, cur) => v,
+            Some(cur) => cur,
+        });
+    }
+    if worst.is_some() {
+        return worst;
+    }
+    for &v in views.iter().filter(|v| v.fer.is_some()) {
+        worst = Some(match worst {
+            None => v,
+            Some(cur) if v.fer > cur.fer => v,
+            Some(cur) => cur,
+        });
+    }
+    worst
+}
+
+/// candidate が current より悪いか（lqi 昇順で悪い＝小さいほう。
+/// 同値なら fer 降順で悪い＝大きいほう。fer 欠落はタイで実値持ちに負ける）。
+fn is_worse_by_lqi(candidate: MeshLink, current: MeshLink) -> bool {
+    match candidate.lqi.cmp(&current.lqi) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => match (candidate.fer, current.fer) {
+            (Some(a), Some(b)) => a > b,
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+    }
+}
+
+/// LQI があれば LQI から等級を出し、frame error rate が高ければ weak 以下へ
+/// 落とす（FER は悪くする方向にしか働かない。lqi 0 の bad を weak に引き上げ
+/// ない）。LQI が無ければ FER のみで判定し、それも無ければ「品質を読めない」
+/// ことを正直に route_only として返す（原則7: 0 を捏造しない）。
 fn grade_link(l: MeshLink, t: &crate::config::MeshThresholds) -> &'static str {
-    let by_lqi = if l.lqi == 0 {
-        "bad"
-    } else if l.lqi <= t.lqi_weak {
-        "weak"
-    } else if l.lqi <= t.lqi_fair {
-        "fair"
-    } else {
-        "good"
-    };
-    if l.fer >= t.fer_weak && severity(by_lqi) < severity("weak") {
-        "weak"
-    } else {
-        by_lqi
+    let worsen_by_fer = l.fer.is_some_and(|f| f >= t.fer_weak);
+    match l.lqi {
+        Some(0) => "bad",
+        Some(lqi) => {
+            let by_lqi = if lqi <= t.lqi_weak {
+                "weak"
+            } else if lqi <= t.lqi_fair {
+                "fair"
+            } else {
+                "good"
+            };
+            if worsen_by_fer && severity(by_lqi) < severity("weak") {
+                "weak"
+            } else {
+                by_lqi
+            }
+        }
+        None if worsen_by_fer => "weak",
+        None => "route_only",
     }
 }
 
@@ -369,7 +425,12 @@ fn grade_link(l: MeshLink, t: &crate::config::MeshThresholds) -> &'static str {
 /// LQI が 0–3 スケールであること）はこの関数に閉じる（設計原則 4）。
 ///
 /// エッジ品質は両視点のうち**悪いほう**を採る（弱点探しが目的なので楽観側を
-/// 採らない）。悪さの比較は LQI 昇順、同値なら誤り率降順。
+/// 採らない）。悪さの比較は LQI 昇順、同値なら誤り率降順（`pick_worst` 参照）。
+/// mat 側のリンク実測値は各フィールドが省略されうるため、欠けた値を 0 として
+/// 埋めることはしない（原則7）。lqi・fer のいずれも読めない視点しか無い場合は
+/// "route_only" として扱う — これは「隣接視点そのものが無い」場合と区別しない
+/// （どちらも UI 上は「接続しているが品質不明」を表す薄い破線として描かれる、
+/// honest な描き分け）。
 pub fn normalize_mesh(
     raw: &Value,
     thresholds: &crate::config::MeshThresholds,
@@ -472,19 +533,16 @@ pub fn normalize_mesh(
             .filter_map(|k| e.get(*k))
             .filter_map(read_link)
             .collect();
-        // 悪いほう = LQI 昇順、同値なら誤り率降順。
-        let worst = views
-            .iter()
-            .copied()
-            .min_by(|x, y| x.lqi.cmp(&y.lqi).then(y.fer.cmp(&x.fer)));
+        // 悪いほう = LQI 昇順、同値なら誤り率降順（欠けた値はゼロ埋めしない）。
+        let worst = pick_worst(&views);
         let edge = match worst {
             Some(l) => MeshEdge {
                 a: a.to_string(),
                 b: b.to_string(),
                 grade: grade_link(l, thresholds).to_string(),
-                lqi: Some(l.lqi),
-                rssi: Some(l.rssi),
-                fer: Some(l.fer),
+                lqi: l.lqi,
+                rssi: l.rssi,
+                fer: l.fer,
             },
             None => MeshEdge {
                 a: a.to_string(),
@@ -1138,6 +1196,89 @@ mod tests {
           "edges": [{"a": "a", "b": "ghost", "a_sees_b": null, "b_sees_a": null}]
         });
         assert!(normalize_mesh(&raw, &th(), None).edges.is_empty());
+    }
+
+    /// 欠けている実測値をゼロ埋めしない（原則7）。lqi のみのビュー。
+    #[test]
+    fn mesh_link_lqi_only_no_zero_fill() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 1},
+                     "b_sees_a": null}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "weak"); // lqi 1 は既定 lqi_weak=1 で weak
+        assert_eq!(e.lqi, Some(1));
+        assert_eq!(e.rssi, None);
+        assert_eq!(e.fer, None);
+        // 欠けた値は JSON に "0" ではなく、キーごと出ない。
+        let s = serde_json::to_string(e).unwrap();
+        assert!(!s.contains("\"rssi\""));
+        assert!(!s.contains("\"fer\""));
+    }
+
+    /// fer だけ（lqi 欠落）がしきい値以上 → weak、lqi は出力に出ない。
+    #[test]
+    fn mesh_link_fer_only_above_threshold_is_weak() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"frame_error_rate": 90},
+                     "b_sees_a": null}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "weak");
+        assert_eq!(e.lqi, None);
+        assert_eq!(e.fer, Some(90));
+    }
+
+    /// fer だけ（lqi 欠落）がしきい値未満 → route_only（弱いと偽らない）。
+    #[test]
+    fn mesh_link_fer_only_below_threshold_is_route_only() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"frame_error_rate": 5},
+                     "b_sees_a": null}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "route_only");
+        assert_eq!(e.lqi, None);
+        assert_eq!(e.fer, Some(5));
+    }
+
+    /// 空のビューオブジェクト {} は品質測定なし＝route_only。0 を捏造しない。
+    #[test]
+    fn mesh_link_empty_object_is_route_only() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b", "a_sees_b": {}, "b_sees_a": null}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "route_only");
+        assert_eq!(e.lqi, None);
+        assert_eq!(e.rssi, None);
+        assert_eq!(e.fer, None);
+    }
+
+    /// lqi が同値のとき、fer を持つほうが持たないほうより悪い（タイに負けない）。
+    #[test]
+    fn mesh_tie_break_prefers_view_with_fer() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 2},
+                     "b_sees_a": {"lqi": 2, "frame_error_rate": 5}}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.lqi, Some(2));
+        assert_eq!(e.fer, Some(5)); // fer を持つ視点が採られる
     }
 
     #[test]

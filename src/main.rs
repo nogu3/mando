@@ -954,6 +954,9 @@ async fn refresh_mesh(State(app): State<Shared>) -> Response {
             return StatusCode::ACCEPTED.into_response();
         }
         job.running_since = Some(std::time::Instant::now());
+        // 前回失敗の error を持ち越さない。GET /api/mesh が
+        // {"status":"running","error":"..."} という矛盾を返さないため（原則7）。
+        job.error = None;
     }
     let spawned = app.clone();
     tokio::spawn(async move { run_mesh_job(spawned).await });
@@ -1240,6 +1243,43 @@ mod tests {
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "failed");
         assert!(v.get("snapshot").is_none());
+    }
+
+    /// 直前の失敗の error が、次の refresh 中に running のまま漏れないこと。
+    /// GET /api/mesh は {"status":"running","error":"failed"} のような
+    /// 矛盾した組を返してはいけない（設計原則7: 正直に出す）。
+    #[tokio::test]
+    async fn mesh_refresh_clears_stale_error_while_running() {
+        let marker = std::env::temp_dir().join(format!(
+            "mando-mesh-clear-error-{}",
+            std::process::id()
+        ));
+        std::fs::remove_file(&marker).ok();
+        let cmd = format!(
+            r#"["sh", "-c", "if [ -f {p} ]; then sleep 0.3; printf '{{\"network\":{{\"partition_ids\":[]}},\"nodes\":[],\"edges\":[]}}'; else touch {p}; exit 1; fi"]"#,
+            p = marker.display()
+        );
+        let app = app_from(&format!("{MESH_DEVICE}\n[mesh]\ncommand = {cmd}\n"));
+
+        // 1 回目: 失敗させて job.error を汚す。
+        call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        let v = settle(app.clone()).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "failed");
+
+        // 2 回目: 起動直後（まだ running）に error が残っていないこと。
+        let (s, _) = call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+        let (_, v) = call_on(app.clone(), "GET", "/api/mesh").await;
+        assert_eq!(v["status"], "running");
+        assert!(
+            v.get("error").is_none() || v["error"].is_null(),
+            "running 中に古い error が残っている: {v:?}"
+        );
+
+        let v = settle(app).await;
+        assert_eq!(v["status"], "idle");
+        std::fs::remove_file(&marker).ok();
     }
 
     #[tokio::test]
