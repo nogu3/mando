@@ -5,6 +5,7 @@ WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
 COPY index.html ./index.html
+COPY mesh.html ./mesh.html
 RUN cargo build --release
 
 FROM debian:stable-slim

@@ -43,6 +43,7 @@ tasks:
     sources:
       - src/**/*.rs
       - index.html
+      - mesh.html
       - Cargo.toml
     generates:
       - "{{.BIN}}"
