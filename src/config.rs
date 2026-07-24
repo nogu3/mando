@@ -192,7 +192,6 @@ pub struct Health {
 /// `mat diag mesh` は全ノードを逐次 probe するので実測 1 分 45 秒（13 ノード）
 /// かかる。graph / health の固定 30 秒とは別枠の timeout をここで持つ。
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // TODO: 消費側（正規化/API）は後続タスクで配線する
 pub struct Mesh {
     /// 画面見出しの対象名（任意。例 "自宅メッシュ"）。
     #[serde(default)]

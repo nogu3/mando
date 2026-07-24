@@ -71,6 +71,9 @@
 - `GET  /api/graphs` — config 上のグラフ一覧（きろくセクション）
 - `GET  /api/graphs/{name}?period=today|week|month` — graph query テンプレを exec → 正規化した系列 `{ "series": [...] }`
 - `GET  /api/health` — health テンプレを exec → 正規化 `{ "label"?, "worst": "ok|warn|crit|stale", "items": [...] }`（`[health]` 未設定なら 404）
+- `GET  /mesh` — 焼き込んだ `mesh.html` を返す（`[mesh]` 未設定なら 404）
+- `GET  /api/mesh` — 取得ジョブの状態とスナップショット（即答）。`{ "status": "empty|running|idle|failed", "stale": bool, "snapshot"?: {...} }`
+- `POST /api/mesh/refresh` — mesh 取得ジョブを起動（202・single-flight）
 
 ---
 

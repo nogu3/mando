@@ -370,7 +370,6 @@ fn grade_link(l: MeshLink, t: &crate::config::MeshThresholds) -> &'static str {
 ///
 /// エッジ品質は両視点のうち**悪いほう**を採る（弱点探しが目的なので楽観側を
 /// 採らない）。悪さの比較は LQI 昇順、同値なら誤り率降順。
-#[allow(dead_code)] // TODO: API 配線は後続タスク（#3 系列）で行う
 pub fn normalize_mesh(
     raw: &Value,
     thresholds: &crate::config::MeshThresholds,

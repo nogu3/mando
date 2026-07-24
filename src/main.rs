@@ -22,10 +22,20 @@ use serde_json::Value;
 
 use config::{Config, Device, Face, Kind};
 use exec::{ExecOutcome, Executor};
-use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, State as DeviceState};
+use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, MeshView, State as DeviceState};
 
 /// 焼き込んだ UI（設計原則 8）。config は外、UI はバイナリの一部。
 const INDEX_HTML: &str = include_str!("../index.html");
+
+/// mesh 取得ジョブの状態。running 中は running_since が Some。
+#[derive(Default)]
+struct MeshJob {
+    running_since: Option<std::time::Instant>,
+    /// 直近に成功した取得（取得完了時刻 + 正規化済みビュー）。
+    snapshot: Option<(std::time::Instant, MeshView)>,
+    /// 直近の取得が失敗したときの機械可読な理由。成功時にクリアする。
+    error: Option<String>,
+}
 
 struct App {
     config: Config,
@@ -34,8 +44,14 @@ struct App {
     /// 別枠 — 重い読み出し（duckdb 等）がシャッター操作をブロックしないため。
     /// グラフ同士は直列（ホストの CPU/メモリ保護）。
     graph_executor: Executor,
+    /// mesh 取得専用の直列化器。mat diag mesh は matd を経由しない直経路で
+    /// 重い（実測 1 分 45 秒）ため、devices / graph とは別枠にする。
+    mesh_executor: Executor,
     /// state 読みの short-TTL + single-flight キャッシュ（原則6/7）。
     state_cache: cache::Cache<StateView>,
+    /// mesh 取得ジョブの状態とスナップショット（1 スロット・メモリ内）。
+    /// 永続化しない — mando 再起動で empty に戻る。
+    mesh_job: std::sync::Mutex<MeshJob>,
 }
 
 impl App {
@@ -47,6 +63,13 @@ impl App {
     /// state 読みキャッシュの TTL（config の [cache] state_ttl_ms）。
     fn state_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.config.cache.state_ttl_ms)
+    }
+
+    /// mesh スナップショットの鮮度上限（config の [mesh] ttl_ms）。
+    fn mesh_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.config.mesh.as_ref().map(|m| m.ttl_ms).unwrap_or(0),
+        )
     }
 }
 
@@ -82,7 +105,9 @@ async fn main() {
         config,
         executor: Executor::new(),
         graph_executor: Executor::new(),
+        mesh_executor: Executor::new(),
         state_cache: cache::Cache::default(),
+        mesh_job: std::sync::Mutex::new(MeshJob::default()),
     });
 
     let router = router(app);
@@ -128,6 +153,9 @@ fn router(app: Shared) -> Router {
         .route("/api/graphs", get(list_graphs))
         .route("/api/graphs/:name", get(get_graph))
         .route("/api/health", get(get_health))
+        .route("/api/mesh", get(get_mesh))
+        .route("/api/mesh/refresh", post(refresh_mesh))
+        .route("/mesh", get(mesh_page))
         .with_state(app)
 }
 
@@ -839,6 +867,145 @@ fn health_unavailable() -> Response {
         .into_response()
 }
 
+/// [mesh] 未設定 → 404。
+fn mesh_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"mesh not configured"}"#.to_string(),
+    )
+        .into_response()
+}
+
+async fn mesh_page(State(app): State<Shared>) -> Response {
+    if app.config.mesh.is_none() {
+        return mesh_not_configured();
+    }
+    Html("").into_response()
+}
+
+/// GET /api/mesh の応答。running 中でも前回スナップショットは返す
+/// （UI が薄く表示したまま更新できるように）。
+#[derive(Serialize)]
+struct MeshStatusView {
+    /// "empty" | "running" | "idle" | "failed"
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// true なら UI は取得を仕掛けてよい（未取得 or ttl 超過）。
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<MeshView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn get_mesh(State(app): State<Shared>) -> Response {
+    let Some(mesh) = &app.config.mesh else {
+        return mesh_not_configured();
+    };
+    let job = app.mesh_job.lock().expect("mesh_job poisoned");
+    let age_ms = job
+        .snapshot
+        .as_ref()
+        .map(|(at, _)| at.elapsed().as_millis() as u64);
+    let status = if job.running_since.is_some() {
+        "running"
+    } else if job.error.is_some() {
+        "failed"
+    } else if job.snapshot.is_some() {
+        "idle"
+    } else {
+        "empty"
+    };
+    // 取得中は「さらに仕掛けろ」と言わない。
+    let stale = job.running_since.is_none()
+        && match job.snapshot.as_ref() {
+            None => true,
+            Some((at, _)) => at.elapsed() >= app.mesh_ttl(),
+        };
+    Json(MeshStatusView {
+        status,
+        label: mesh.label.clone(),
+        stale,
+        age_ms,
+        elapsed_ms: job.running_since.map(|t| t.elapsed().as_millis() as u64),
+        snapshot: job.snapshot.as_ref().map(|(_, v)| v.clone()),
+        error: job.error.clone(),
+    })
+    .into_response()
+}
+
+/// 取得ジョブを起動する。既に走っていれば何もせず 202（single-flight）。
+async fn refresh_mesh(State(app): State<Shared>) -> Response {
+    if app.config.mesh.is_none() {
+        return mesh_not_configured();
+    }
+    {
+        let mut job = app.mesh_job.lock().expect("mesh_job poisoned");
+        if job.running_since.is_some() {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        job.running_since = Some(std::time::Instant::now());
+    }
+    let spawned = app.clone();
+    tokio::spawn(async move { run_mesh_job(spawned).await });
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// exec → パース → 正規化 → ジョブスロットへ格納。失敗理由は機械可読な
+/// 文字列で残し、日本語化は UI の責務にする。
+async fn run_mesh_job(app: Shared) {
+    let mesh = app
+        .config
+        .mesh
+        .as_ref()
+        .expect("run_mesh_job は [mesh] 有りでのみ起動する");
+    let timeout = std::time::Duration::from_millis(mesh.timeout_ms);
+    let result = run_bounded(&app.mesh_executor, "mesh", &mesh.command, timeout).await;
+
+    let outcome = if result.outcome != ExecOutcome::Success {
+        tracing::warn!(
+            outcome = ?result.outcome,
+            stderr = %result.stderr.trim(),
+            "mesh 取得が非成功"
+        );
+        Err(match result.outcome {
+            ExecOutcome::Timeout => "timeout",
+            ExecOutcome::Rejected => "rejected",
+            ExecOutcome::NetworkError => "network_error",
+            ExecOutcome::SpawnFailed => "spawn_failed",
+            _ => "failed",
+        })
+    } else {
+        match serde_json::from_str::<Value>(&result.stdout) {
+            Ok(raw) => Ok(normalize::normalize_mesh(
+                &raw,
+                &mesh.thresholds,
+                mesh.labels.as_ref(),
+            )),
+            Err(_) => {
+                tracing::warn!("mesh の stdout が JSON でない");
+                Err("bad_json")
+            }
+        }
+    };
+
+    let mut job = app.mesh_job.lock().expect("mesh_job poisoned");
+    job.running_since = None;
+    match outcome {
+        Ok(view) => {
+            job.error = None;
+            job.snapshot = Some((std::time::Instant::now(), view));
+        }
+        Err(kind) => job.error = Some(kind.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,8 +1094,160 @@ mod tests {
             config: cfg,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
         })
+    }
+
+    /// 任意の config から App を組む（mesh のテストは config を差し替えたいので個別に作る）。
+    fn app_from(toml_src: &str) -> Shared {
+        let cfg: Config = toml::from_str(toml_src).unwrap();
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
+        })
+    }
+
+    /// 同じ App インスタンスに対して繰り返し叩く（ジョブ状態を跨いで見るため）。
+    async fn call_on(app: Shared, method: &str, path: &str) -> (axum::http::StatusCode, Value) {
+        let res = router(app)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// status が running でなくなるまで待つ（最大 5 秒）。
+    async fn settle(app: Shared) -> Value {
+        for _ in 0..100 {
+            let (_, v) = call_on(app.clone(), "GET", "/api/mesh").await;
+            if v["status"] != "running" {
+                return v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("mesh job が 5 秒で終わらなかった");
+    }
+
+    const MESH_DEVICE: &str = r#"
+        [[device]]
+        name = "s1"
+        get_state = ["sh", "-c", "printf '{}'"]
+        open  = ["sh", "-c", "printf '{}'"]
+        close = ["sh", "-c", "printf '{}'"]
+    "#;
+
+    /// 2 頂点 1 エッジの最小メッシュを返す偽コマンド(ext はダミー)。
+    const MESH_OK_CMD: &str = r#"["sh", "-c", "printf '{\"timestamp\":\"t1\",\"network\":{\"name\":\"test-thread\",\"channel\":15,\"partition_ids\":[1],\"leader_router_id\":38},\"nodes\":[{\"id\":\"node:5\",\"node_id\":5,\"alias\":\"desk_light\",\"role\":\"router\",\"probed\":true},{\"id\":\"ext:0011223344556677\",\"ext_address\":\"0011223344556677\",\"role\":\"leader\"}],\"edges\":[{\"a\":\"node:5\",\"b\":\"ext:0011223344556677\",\"a_sees_b\":{\"lqi\":1,\"avg_rssi\":-94,\"frame_error_rate\":88},\"b_sees_a\":null}]}'"]"#;
+
+    #[tokio::test]
+    async fn mesh_api_404_without_config() {
+        let app = app_from(MESH_DEVICE);
+        let (s, _) = call_on(app.clone(), "GET", "/api/mesh").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call_on(app, "GET", "/mesh").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mesh_starts_empty_and_stale() {
+        let app = app_from(&format!(
+            "{MESH_DEVICE}\n[mesh]\nlabel = \"自宅メッシュ\"\ncommand = {MESH_OK_CMD}\n"
+        ));
+        let (s, v) = call_on(app, "GET", "/api/mesh").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["status"], "empty");
+        assert_eq!(v["label"], "自宅メッシュ");
+        // 一度も取っていない = 取りに行くべき
+        assert_eq!(v["stale"], true);
+        assert!(v.get("snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn mesh_refresh_produces_snapshot() {
+        let app = app_from(&format!(
+            "{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"
+        ));
+        let (s, _) = call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+
+        let v = settle(app).await;
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["stale"], false);
+        assert!(v["age_ms"].as_u64().is_some());
+        let snap = &v["snapshot"];
+        assert_eq!(snap["network"]["name"], "test-thread");
+        assert_eq!(snap["network"]["split"], false);
+        assert_eq!(snap["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(snap["unidentified_count"], 1);
+        // lqi 1 かつ誤り率 88% → weak
+        assert_eq!(snap["edges"][0]["grade"], "weak");
+        assert_eq!(snap["fetched_at"], "t1");
+    }
+
+    #[tokio::test]
+    async fn mesh_refresh_is_single_flight() {
+        // 走った回数をファイル行数で数える。
+        let counter = std::env::temp_dir().join(format!(
+            "mando-mesh-singleflight-{}",
+            std::process::id()
+        ));
+        std::fs::remove_file(&counter).ok();
+        let cmd = format!(
+            r#"["sh", "-c", "echo x >> {}; sleep 0.4; printf '{{\"network\":{{\"partition_ids\":[1]}},\"nodes\":[],\"edges\":[]}}'"]"#,
+            counter.display()
+        );
+        let app = app_from(&format!("{MESH_DEVICE}\n[mesh]\ncommand = {cmd}\n"));
+
+        for _ in 0..3 {
+            let (s, _) = call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+            assert_eq!(s, StatusCode::ACCEPTED);
+        }
+        let v = settle(app).await;
+        assert_eq!(v["status"], "idle");
+
+        let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs, 1, "同時 refresh でコマンドが複数回走った");
+        std::fs::remove_file(&counter).ok();
+    }
+
+    #[tokio::test]
+    async fn mesh_reports_command_failure() {
+        let app = app_from(&format!(
+            "{MESH_DEVICE}\n[mesh]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n"
+        ));
+        call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        let v = settle(app).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "failed");
+        assert!(v.get("snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn mesh_reports_bad_json() {
+        let app = app_from(&format!(
+            "{MESH_DEVICE}\n[mesh]\ncommand = [\"sh\", \"-c\", \"printf 'not-json'\"]\n"
+        ));
+        call_on(app.clone(), "POST", "/api/mesh/refresh").await;
+        let v = settle(app).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "bad_json");
     }
 
     async fn call(method: &str, path: &str) -> (axum::http::StatusCode, Value) {
@@ -966,12 +1285,14 @@ mod tests {
         (status, json)
     }
 
-    async fn call_on(cfg_toml: &str, method: &str, path: &str) -> (axum::http::StatusCode, Value) {
+    async fn call_with_cfg(cfg_toml: &str, method: &str, path: &str) -> (axum::http::StatusCode, Value) {
         let app = Arc::new(App {
             config: toml::from_str(cfg_toml).unwrap(),
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
         });
         let res = router(app)
             .oneshot(
@@ -1013,7 +1334,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_not_configured_is_404() {
-        let (st, _) = call_on(MINIMAL_DEVICE, "GET", "/api/health").await;
+        let (st, _) = call_with_cfg(MINIMAL_DEVICE, "GET", "/api/health").await;
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
@@ -1022,7 +1343,7 @@ mod tests {
         let cfg = format!(
             "{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n"
         );
-        let (st, v) = call_on(&cfg, "GET", "/api/health").await;
+        let (st, v) = call_with_cfg(&cfg, "GET", "/api/health").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
         assert_eq!(v["error"], "health query failed");
     }
@@ -1032,7 +1353,7 @@ mod tests {
         let cfg = format!(
             "{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"printf 'not-json'\"]\n"
         );
-        let (st, _) = call_on(&cfg, "GET", "/api/health").await;
+        let (st, _) = call_with_cfg(&cfg, "GET", "/api/health").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
     }
 
@@ -1386,7 +1707,9 @@ mod tests {
             config,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
         };
         let device = app.config.find("slow").unwrap();
         let start = Instant::now();
@@ -1419,7 +1742,9 @@ mod tests {
             config: cfg,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
         })
     }
 
@@ -1484,7 +1809,9 @@ mod tests {
             config: cfg,
             executor: Executor::new(),
             graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
         })
     }
 
@@ -1527,7 +1854,7 @@ mod tests {
             on  = ["sh", "-c", "printf '{}'"]
             off = ["sh", "-c", "printf '{}'"]
         "##;
-        let (st, v) = call_on(cfg, "GET", "/api/devices").await;
+        let (st, v) = call_with_cfg(cfg, "GET", "/api/devices").await;
         assert_eq!(st, StatusCode::OK);
         let arr = v.as_array().unwrap();
         let parent = arr.iter().find(|d| d["name"] == "parent").unwrap();
