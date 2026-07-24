@@ -27,10 +27,17 @@ MANDO_CONFIG=./config.toml ./target/release/mando
 - `POST /api/devices/{name}/on` — light を点灯 → **直後に state 再取得**（`state: "on|off|unknown"`）
 - `POST /api/devices/{name}/off` — 同上（消灯）
 - `POST /api/devices/{name}/presets/{preset}` — config の名前付きプリセット（色・色温度）を実行 → state 再取得
+- `GET  /mesh` — Thread メッシュの表示画面（`[mesh]` 未設定なら 404）。トップからはリンクしない
+- `GET  /api/mesh` — 取得ジョブの状態とスナップショット（即答）
+- `POST /api/mesh/refresh` — 取得ジョブを起動（202・single-flight）
 
 `state` は set 後に必ず取り直した確定値（楽観表示しない）。`action` / `exec` は
 subprocess の終了コードを写したもの: `success` / `timeout` / `rejected` /
 `network_error` / `failed` / `spawn_failed`。
+
+> `mat diag mesh` は全ノードを逐次 probe するので重い（13 ノードで実測 1 分 45 秒）。
+> 取得は非同期ジョブで走り、`/mesh` を開いている間だけ動く。誰も見ていなければ
+> 何も走らない（mando はスケジューラを持たない）。
 
 ## 設定
 
