@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>メッシュ — mando</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #151b32; --line: #263154; --fg: #e8ecf8; --dim: #8b96b8;
+    --good: #45c17a; --fair: #e0a53a; --weak: #e4604f; --bad: #a02a1f; --route: #3b4770;
+    --accent: #6aa9ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; }
+  header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 17px; margin: 0 0 8px; font-weight: 700; }
+  .netinfo { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--dim); }
+  .netinfo b { color: var(--fg); font-weight: 600; }
+  .warn { color: var(--fair); }
+  main { padding: 12px 16px 60px; max-width: 760px; margin: 0 auto; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0; }
+  button.act { background: var(--accent); color: #0b1020; border: 0; border-radius: 999px;
+               padding: 9px 18px; font: inherit; font-weight: 700; cursor: pointer; }
+  button.act[disabled] { background: #2a3150; opacity: .5; cursor: default; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dim); }
+  .stamp { margin-left: auto; font-size: 12px; color: var(--dim); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+          padding: 10px; margin: 12px 0; position: relative; }
+  .card.stale svg { opacity: .35; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center;
+             justify-content: center; text-align: center; font-size: 13px; padding: 16px; }
+  svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 12px; color: var(--dim);
+            padding: 8px 4px 2px; }
+  .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle;
+              margin-right: 5px; border-radius: 2px; }
+  h2 { font-size: 14px; margin: 22px 0 8px; color: var(--dim); font-weight: 700;
+       letter-spacing: .04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { padding: 7px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .note { font-size: 12px; color: var(--dim); background: #1a2140; border-left: 3px solid var(--fair);
+          padding: 9px 11px; border-radius: 0 8px 8px 0; margin: 10px 0; }
+  .fail { color: var(--weak); }
+  .more { background: none; border: 0; color: var(--accent); font: inherit; font-size: 13px;
+          padding: 8px 2px; cursor: pointer; }
+  .boot { padding: 40px 16px; text-align: center; color: var(--dim); }
+  .spin { display: inline-block; width: 12px; height: 12px; margin-right: 7px;
+          border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%;
+          animation: sp .8s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">📡 メッシュ</h1>
+  <div class="netinfo" id="netinfo"></div>
+</header>
+<main id="main" hidden>
+  <div class="bar">
+    <button class="act" id="refresh">更新</button>
+    <label class="chk"><input type="checkbox" id="hideother"> 名無しを隠す</label>
+    <span class="stamp" id="stamp"></span>
+  </div>
+
+  <div class="card" id="card">
+    <svg id="graph" viewBox="0 0 720 720" aria-label="メッシュ図"></svg>
+    <div class="overlay" id="overlay" hidden></div>
+    <div class="legend">
+      <span><i style="background:var(--good)"></i>強い</span>
+      <span><i style="background:var(--fair)"></i>ふつう</span>
+      <span><i style="background:var(--weak)"></i>弱い</span>
+      <span><i style="background:var(--bad)"></i>ほぼ不通</span>
+      <span>● うちの機器 ・ 名無しの参加者 ★ leader ◆ 名前付きの他人</span>
+    </div>
+  </div>
+
+  <div class="note" id="dupnote" hidden></div>
+
+  <h2>弱いリンク</h2>
+  <table id="weak"><thead><tr><th>リンク</th><th class="num">LQI</th><th class="num">RSSI</th><th class="num">誤り率</th></tr></thead><tbody></tbody></table>
+  <button class="more" id="weakmore" hidden></button>
+
+  <h2>問い合わせに失敗した機器</h2>
+  <table id="failed"><thead><tr><th>機器</th><th>理由</th></tr></thead><tbody></tbody></table>
+</main>
+<div class="boot" id="boot"><span class="spin"></span>読み込み中…</div>
+<script>
+const SVGNS = "http://www.w3.org/2000/svg";
+const CX = 360, CY = 360, R_IN = 175, R_OUT = 300;
+const GCOLOR = { good: "#45c17a", fair: "#e0a53a", weak: "#e4604f", bad: "#a02a1f", route_only: "#3b4770" };
+const GWIDTH = { good: 2.4, fair: 1.7, weak: 1.2, bad: 1.0, route_only: 0.8 };
+const GORDER = { good: 0, fair: 1, route_only: 1, weak: 2, bad: 3 };
+const ERROR_JA = {
+  timeout: "時間内に終わりませんでした",
+  rejected: "機器が拒否しました",
+  network_error: "ネットワーク異常",
+  spawn_failed: "コマンドを実行できませんでした",
+  failed: "コマンドが失敗しました",
+  bad_json: "応答を解釈できませんでした",
+};
+const PROBE_JA = {
+  timeout: "応答なし",
+  unreachable: "届かない",
+  device_rejected: "機器が拒否",
+  store_missing: "認証情報が見つからない",
+};
+
+let hideOther = false;
+let view = null;      // 直近の GET /api/mesh の応答
+let pollTimer = null;
+
+async function api(method, path) {
+  const res = await fetch(path, { method });
+  if (!res.ok) throw new Error(String(res.status));
+  return res.status === 202 ? null : res.json();
+}
+
+/* ── レイアウト ───────────────────────────────────────── */
+/* リング上の並び順を隣接ノードの平均角へ寄せて交差を減らす（barycenter）。 */
+function orderRing(ids, adj, fixedAngle) {
+  if (!ids.length) return new Map();
+  let cur = ids.slice();
+  let ang = new Map(cur.map((id, i) => [id, (i / cur.length) * Math.PI * 2]));
+  for (let it = 0; it < 30; it++) {
+    const next = new Map();
+    for (const id of cur) {
+      let x = 0, y = 0, n = 0;
+      for (const nb of adj.get(id) || []) {
+        const a = ang.has(nb) ? ang.get(nb) : fixedAngle(nb);
+        if (a == null) continue;
+        x += Math.cos(a); y += Math.sin(a); n++;
+      }
+      next.set(id, n ? Math.atan2(y, x) : ang.get(id));
+    }
+    cur = cur.slice().sort((p, q) => next.get(p) - next.get(q));
+    ang = new Map(cur.map((id, i) => [id, (i / cur.length) * Math.PI * 2]));
+  }
+  return ang;
+}
+
+function layout(snap) {
+  const shown = snap.nodes.filter((n) => !(hideOther && n.kind === "anonymous"));
+  const ids = new Set(shown.map((n) => n.id));
+  const adj = new Map(shown.map((n) => [n.id, []]));
+  for (const e of snap.edges) {
+    if (!ids.has(e.a) || !ids.has(e.b)) continue;
+    adj.get(e.a).push(e.b);
+    adj.get(e.b).push(e.a);
+  }
+  const pos = new Map();
+  const leader = shown.find((n) => n.is_leader);
+  if (leader) pos.set(leader.id, { x: CX, y: CY, a: null });
+
+  const inner = shown
+    .filter((n) => n !== leader && (n.role === "router" || n.role === "reed"))
+    .map((n) => n.id);
+  const outer = shown
+    .filter((n) => n !== leader && !(n.role === "router" || n.role === "reed"))
+    .map((n) => n.id);
+
+  const aIn = orderRing(inner, adj, () => null);
+  for (const [id, a] of aIn) pos.set(id, { x: CX + R_IN * Math.cos(a), y: CY + R_IN * Math.sin(a), a });
+  const aOut = orderRing(outer, adj, (id) => (aIn.has(id) ? aIn.get(id) : null));
+  for (const [id, a] of aOut) pos.set(id, { x: CX + R_OUT * Math.cos(a), y: CY + R_OUT * Math.sin(a), a });
+  return pos;
+}
+
+/* ── 描画 ─────────────────────────────────────────────── */
+function el(name, attrs, text) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function drawGraph(snap) {
+  const svg = document.getElementById("graph");
+  svg.innerHTML = "";
+  const pos = layout(snap);
+  const byId = new Map(snap.nodes.map((n) => [n.id, n]));
+
+  for (const r of [R_IN, R_OUT]) {
+    svg.appendChild(el("circle", { cx: CX, cy: CY, r, fill: "none",
+      stroke: "#1f2745", "stroke-dasharray": "3 6" }));
+  }
+
+  // 弱い線を後（＝上）に描き、良い線に埋もれさせない。
+  const drawn = snap.edges
+    .filter((e) => pos.has(e.a) && pos.has(e.b))
+    .sort((p, q) => GORDER[p.grade] - GORDER[q.grade]);
+  for (const e of drawn) {
+    const A = pos.get(e.a), B = pos.get(e.b);
+    const dim = byId.get(e.a).kind === "anonymous" || byId.get(e.b).kind === "anonymous";
+    svg.appendChild(el("line", {
+      x1: A.x, y1: A.y, x2: B.x, y2: B.y,
+      stroke: GCOLOR[e.grade], "stroke-width": GWIDTH[e.grade],
+      "stroke-opacity": dim ? 0.22 : 0.85,
+      "stroke-dasharray": e.grade === "bad" || e.grade === "route_only" ? "3 4" : "",
+    }));
+  }
+
+  for (const n of snap.nodes) {
+    const p = pos.get(n.id);
+    if (!p) continue;
+    const failed = n.probed === false;
+    const r = n.kind === "ours" ? 15 : n.kind === "named" ? 12 : 5;
+    const fill = failed ? "#3a3f55" : n.kind === "ours" ? "#2b3a66" : n.kind === "named" ? "#3a2f52" : "#2a3150";
+    const stroke = failed ? "#7d8296" : n.kind === "ours" ? "#6aa9ff" : n.kind === "named" ? "#b48bdd" : "#4a5479";
+    const g = el("g", {});
+    g.appendChild(el("circle", { cx: p.x, cy: p.y, r, fill, stroke,
+      "stroke-width": n.kind === "ours" ? 2 : 1.2,
+      "stroke-dasharray": failed ? "3 3" : "" }));
+    if (n.is_leader) {
+      g.appendChild(el("text", { x: p.x, y: p.y + 4.5, "text-anchor": "middle",
+        "font-size": 12, fill: "#ffd76a" }, "★"));
+    } else if (n.kind === "named") {
+      g.appendChild(el("text", { x: p.x, y: p.y + 4, "text-anchor": "middle",
+        "font-size": 11, fill: "#e8ecf8" }, "◆"));
+    }
+    if (n.kind !== "anonymous" || n.is_leader) {
+      const anchor = p.a == null ? "middle"
+        : Math.cos(p.a) < -0.15 ? "end" : Math.cos(p.a) > 0.15 ? "start" : "middle";
+      const dx = p.a == null ? 0 : Math.cos(p.a) * (r + 6);
+      const dy = p.a == null ? -(r + 10) : Math.sin(p.a) * (r + 6) + 4;
+      g.appendChild(el("text", { x: p.x + dx, y: p.y + dy, "text-anchor": anchor,
+        "font-size": 11, fill: failed ? "#7d8296" : "#cdd6f0" }, n.name));
+      if (n.role === "sed" || n.role === "reed") {
+        g.appendChild(el("text", { x: p.x + dx, y: p.y + dy + 12, "text-anchor": anchor,
+          "font-size": 9.5, fill: "#8b96b8" }, n.role === "sed" ? "電池・間欠" : "中継しない"));
+      }
+    }
+    svg.appendChild(g);
+  }
+}
+
+/* ── 表・ヘッダ ───────────────────────────────────────── */
+let weakExpanded = false;
+
+function drawWeak(snap) {
+  const byId = new Map(snap.nodes.map((n) => [n.id, n]));
+  const rows = snap.edges
+    .filter((e) => e.grade === "weak" || e.grade === "bad")
+    .sort((p, q) => GORDER[q.grade] - GORDER[p.grade] || p.lqi - q.lqi || p.rssi - q.rssi);
+  const tb = document.querySelector("#weak tbody");
+  tb.innerHTML = "";
+  const shown = weakExpanded ? rows : rows.slice(0, 10);
+  for (const e of shown) {
+    const tr = document.createElement("tr");
+    const td = (h) => { const c = document.createElement("td"); c.innerHTML = h; return c; };
+    const name = document.createElement("td");
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.style.background = GCOLOR[e.grade];
+    name.appendChild(dot);
+    name.appendChild(document.createTextNode(
+      `${byId.get(e.a).name} ↔ ${byId.get(e.b).name}`));
+    tr.appendChild(name);
+    for (const v of [e.lqi, `${e.rssi} dBm`, `${e.fer}%`]) {
+      const c = td("");
+      c.className = "num";
+      c.textContent = v;
+      tr.appendChild(c);
+    }
+    tb.appendChild(tr);
+  }
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const c = document.createElement("td");
+    c.colSpan = 4;
+    c.style.color = "var(--dim)";
+    c.textContent = "弱いリンクはありません";
+    tr.appendChild(c);
+    tb.appendChild(tr);
+  }
+  const more = document.getElementById("weakmore");
+  more.hidden = rows.length <= 10;
+  more.textContent = weakExpanded ? "折りたたむ" : `他 ${rows.length - 10} 件を表示`;
+}
+
+function drawFailed(snap) {
+  const tb = document.querySelector("#failed tbody");
+  tb.innerHTML = "";
+  const failed = snap.nodes.filter((n) => n.probed === false);
+  if (!failed.length) {
+    const tr = document.createElement("tr");
+    const c = document.createElement("td");
+    c.colSpan = 2;
+    c.style.color = "var(--dim)";
+    c.textContent = "なし";
+    tr.appendChild(c);
+    tb.appendChild(tr);
+    return;
+  }
+  for (const n of failed) {
+    const tr = document.createElement("tr");
+    const a = document.createElement("td");
+    a.className = "fail";
+    a.textContent = n.name;
+    const b = document.createElement("td");
+    b.textContent = PROBE_JA[n.error_kind] || n.error_kind || "不明";
+    tr.appendChild(a);
+    tr.appendChild(b);
+    tb.appendChild(tr);
+  }
+}
+
+function drawHeader(v) {
+  const snap = v.snapshot;
+  document.getElementById("title").textContent = v.label ? `📡 ${v.label}` : "📡 メッシュ";
+  const info = document.getElementById("netinfo");
+  if (!snap) { info.textContent = ""; return; }
+  const ours = snap.nodes.filter((n) => n.kind === "ours").length;
+  const parts = [
+    `ネットワーク <b>${snap.network.name ?? "?"}</b>`,
+    `チャンネル <b>${snap.network.channel ?? "?"}</b>`,
+    `機器 <b>${ours}</b> / 参加者 <b>${snap.nodes.length}</b>`,
+    snap.network.split
+      ? `<span class="warn">⚠ メッシュが分裂しています</span>`
+      : `分裂 <b>なし</b>`,
+  ];
+  info.innerHTML = parts.join("");
+}
+
+function drawStamp(v) {
+  const stamp = document.getElementById("stamp");
+  if (v.status === "running") {
+    const sec = Math.round((v.elapsed_ms ?? 0) / 1000);
+    const n = v.snapshot ? v.snapshot.nodes.filter((x) => x.kind === "ours").length : null;
+    const who = n ? `${n} 台` : "各機器";
+    stamp.innerHTML = `<span class="spin"></span>${who}に順に問い合わせています… 経過 ${sec} 秒（ふつう 2 分ほど）`;
+  } else if (v.age_ms != null) {
+    const m = Math.floor(v.age_ms / 60000);
+    stamp.textContent = m < 1 ? "たった今取得" : `${m} 分前に取得`;
+  } else {
+    stamp.textContent = "";
+  }
+}
+
+function render(v) {
+  view = v;
+  document.getElementById("boot").hidden = true;
+  document.getElementById("main").hidden = false;
+  document.getElementById("refresh").disabled = v.status === "running";
+  drawHeader(v);
+  drawStamp(v);
+
+  const card = document.getElementById("card");
+  const overlay = document.getElementById("overlay");
+  card.classList.toggle("stale", v.status === "running" && !!v.snapshot);
+
+  if (v.snapshot) {
+    drawGraph(v.snapshot);
+    drawWeak(v.snapshot);
+    drawFailed(v.snapshot);
+    const note = document.getElementById("dupnote");
+    note.hidden = !v.snapshot.unidentified_count;
+    note.textContent =
+      `うちの機器 ${v.snapshot.unidentified_count} 台は自分の識別子を名乗れませんでした` +
+      `（同一 ID を返すファームウェアの既知問題）。そのぶん、同じ機器が「名無しの参加者」` +
+      `としても図に出ている可能性があります。推測で統合はしません。`;
+  } else {
+    document.getElementById("graph").innerHTML = "";
+  }
+
+  overlay.hidden = true;
+  if (v.status === "running" && !v.snapshot) {
+    overlay.hidden = false;
+    overlay.innerHTML = `<div><span class="spin"></span>各機器に順に問い合わせています…<br>ふつう 2 分ほどかかります</div>`;
+  } else if (v.status === "failed" && !v.snapshot) {
+    overlay.hidden = false;
+    overlay.innerHTML = `<div>メッシュを調べられませんでした<br><span style="color:var(--dim)">${ERROR_JA[v.error] || v.error || ""}</span></div>`;
+  } else if (v.status === "failed") {
+    overlay.hidden = false;
+    overlay.innerHTML = `<div>更新できませんでした<br><span style="color:var(--dim)">${ERROR_JA[v.error] || v.error || ""}（表示は前回の結果）</span></div>`;
+  } else if (v.status === "empty") {
+    overlay.hidden = false;
+    overlay.innerHTML = `<div>まだ調べていません<br><span style="color:var(--dim)">「更新」を押すと調べます</span></div>`;
+  }
+}
+
+/* ── 取得ループ ───────────────────────────────────────── */
+async function poll() {
+  let v;
+  try {
+    v = await api("GET", "/api/mesh");
+  } catch (e) {
+    document.getElementById("boot").hidden = false;
+    document.getElementById("boot").textContent = "⚠ サーバに接続できません";
+    return;
+  }
+  render(v);
+  clearTimeout(pollTimer);
+  if (v.status === "running") {
+    pollTimer = setTimeout(poll, 5000);
+  } else if (v.stale && v.status !== "failed") {
+    // 未取得 or ttl 超過 → 自動で仕掛ける（見ている間だけ pull）
+    // ただし failed のときは仕掛けない。stale は失敗後も true のままなので、
+    // 自動再試行だと ~2 分かかる失敗コマンドを無限に再起動してしまう。
+    await api("POST", "/api/mesh/refresh").catch(() => {});
+    pollTimer = setTimeout(poll, 1000);
+  }
+}
+
+document.getElementById("refresh").addEventListener("click", async () => {
+  document.getElementById("refresh").disabled = true;
+  await api("POST", "/api/mesh/refresh").catch(() => {});
+  setTimeout(poll, 300);
+});
+document.getElementById("hideother").addEventListener("change", (ev) => {
+  hideOther = ev.target.checked;
+  if (view && view.snapshot) drawGraph(view.snapshot);
+});
+document.getElementById("weakmore").addEventListener("click", () => {
+  weakExpanded = !weakExpanded;
+  if (view && view.snapshot) drawWeak(view.snapshot);
+});
+poll();
+</script>
+</body>
+</html>

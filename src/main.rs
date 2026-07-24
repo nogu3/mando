@@ -27,6 +27,9 @@ use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, MeshView,
 /// 焼き込んだ UI（設計原則 8）。config は外、UI はバイナリの一部。
 const INDEX_HTML: &str = include_str!("../index.html");
 
+/// メッシュ表示の UI（[mesh] 未設定なら配らない）。index.html とは独立した画面。
+const MESH_HTML: &str = include_str!("../mesh.html");
+
 /// mesh 取得ジョブの状態。running 中は running_since が Some。
 #[derive(Default)]
 struct MeshJob {
@@ -881,7 +884,7 @@ async fn mesh_page(State(app): State<Shared>) -> Response {
     if app.config.mesh.is_none() {
         return mesh_not_configured();
     }
-    Html("").into_response()
+    Html(MESH_HTML).into_response()
 }
 
 /// GET /api/mesh の応答。running 中でも前回スナップショットは返す
@@ -1248,6 +1251,28 @@ mod tests {
         let v = settle(app).await;
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "bad_json");
+    }
+
+    #[tokio::test]
+    async fn mesh_page_is_served_when_configured() {
+        let app = app_from(&format!(
+            "{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"
+        ));
+        let res = router(app)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mesh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<title>メッシュ — mando</title>"));
+        assert!(body.contains("/api/mesh/refresh"));
     }
 
     async fn call(method: &str, path: &str) -> (axum::http::StatusCode, Value) {
