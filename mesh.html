@@ -30,6 +30,7 @@
   .card.stale svg { opacity: .35; }
   .overlay { position: absolute; inset: 0; display: flex; align-items: center;
              justify-content: center; text-align: center; font-size: 13px; padding: 16px; }
+  .overlay[hidden] { display: none; }
   svg { width: 100%; height: auto; display: block; }
   .legend { display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 12px; color: var(--dim);
             padding: 8px 4px 2px; }
@@ -67,7 +68,7 @@
   </div>
 
   <div class="card" id="card">
-    <svg id="graph" viewBox="0 0 720 720" aria-label="メッシュ図"></svg>
+    <svg id="graph" viewBox="-90 0 900 720" aria-label="メッシュ図"></svg>
     <div class="overlay" id="overlay" hidden></div>
     <div class="legend">
       <span><i style="background:var(--good)"></i>強い</span>
@@ -250,7 +251,6 @@ function drawWeak(snap) {
   const shown = weakExpanded ? rows : rows.slice(0, 10);
   for (const e of shown) {
     const tr = document.createElement("tr");
-    const td = (h) => { const c = document.createElement("td"); c.innerHTML = h; return c; };
     const name = document.createElement("td");
     const dot = document.createElement("span");
     dot.className = "dot";
@@ -260,7 +260,7 @@ function drawWeak(snap) {
       `${byId.get(e.a).name} ↔ ${byId.get(e.b).name}`));
     tr.appendChild(name);
     for (const v of [e.lqi, `${e.rssi} dBm`, `${e.fer}%`]) {
-      const c = td("");
+      const c = document.createElement("td");
       c.className = "num";
       c.textContent = v;
       tr.appendChild(c);
@@ -314,15 +314,30 @@ function drawHeader(v) {
   const info = document.getElementById("netinfo");
   if (!snap) { info.textContent = ""; return; }
   const ours = snap.nodes.filter((n) => n.kind === "ours").length;
-  const parts = [
-    `ネットワーク <b>${snap.network.name ?? "?"}</b>`,
-    `チャンネル <b>${snap.network.channel ?? "?"}</b>`,
-    `機器 <b>${ours}</b> / 参加者 <b>${snap.nodes.length}</b>`,
-    snap.network.split
-      ? `<span class="warn">⚠ メッシュが分裂しています</span>`
-      : `分裂 <b>なし</b>`,
-  ];
-  info.innerHTML = parts.join("");
+  info.innerHTML = "";
+  const addText = (text) => info.appendChild(document.createTextNode(text));
+  const addBold = (text) => {
+    const b = document.createElement("b");
+    b.textContent = text;
+    info.appendChild(b);
+  };
+  addText("ネットワーク ");
+  addBold(String(snap.network.name ?? "?"));
+  addText("チャンネル ");
+  addBold(String(snap.network.channel ?? "?"));
+  addText("機器 ");
+  addBold(String(ours));
+  addText(" / 参加者 ");
+  addBold(String(snap.nodes.length));
+  if (snap.network.split) {
+    const warn = document.createElement("span");
+    warn.className = "warn";
+    warn.textContent = "⚠ メッシュが分裂しています";
+    info.appendChild(warn);
+  } else {
+    addText("分裂 ");
+    addBold("なし");
+  }
 }
 
 function drawStamp(v) {
