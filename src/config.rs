@@ -62,6 +62,8 @@ pub struct Config {
     pub graphs: Vec<Graph>,
     #[serde(default)]
     pub health: Option<Health>,
+    #[serde(default)]
+    pub mesh: Option<Mesh>,
     /// デバイス exec の全体設定（任意）。
     #[serde(default)]
     pub exec: ExecSettings,
@@ -183,6 +185,79 @@ pub struct Health {
     /// metric 名 → UI 表示名の置換マップ（任意）。無いキーは metric 名を素通し。
     #[serde(default)]
     pub labels: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Thread メッシュ表示のコマンド定義（任意）。未設定なら /mesh ごと無効。
+///
+/// `mat diag mesh` は全ノードを逐次 probe するので実測 1 分 45 秒（13 ノード）
+/// かかる。graph / health の固定 30 秒とは別枠の timeout をここで持つ。
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // TODO: 消費側（正規化/API）は後続タスクで配線する
+pub struct Mesh {
+    /// 画面見出しの対象名（任意。例 "自宅メッシュ"）。
+    #[serde(default)]
+    pub label: Option<String>,
+    /// exec するコマンド配列。
+    pub command: Vec<String>,
+    /// スナップショットの鮮度。これより古い状態で /mesh を開くと自動で再取得する。
+    #[serde(default = "default_mesh_ttl_ms")]
+    pub ttl_ms: u64,
+    /// exec 1 回の上限ミリ秒。超過は timeout 扱い。
+    #[serde(default = "default_mesh_timeout_ms")]
+    pub timeout_ms: u64,
+    /// リンク品質の等級しきい値。
+    #[serde(default)]
+    pub thresholds: MeshThresholds,
+    /// alias → UI 表示名の置換マップ（任意）。無いキーは alias を素通し。
+    #[serde(default)]
+    pub labels: Option<std::collections::HashMap<String, String>>,
+}
+
+/// リンク品質の等級しきい値。LQI と frame error rate の 2 軸で持つ —
+/// 実測で LQI 1・誤り率 0% のリンクと LQI 1・誤り率 88% のリンクが併存し、
+/// LQI だけでは弱いリンクを取りこぼすため。
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // TODO: 消費側（正規化/API）は後続タスクで配線する
+pub struct MeshThresholds {
+    /// これ以下は fair。
+    #[serde(default = "default_lqi_fair")]
+    pub lqi_fair: u8,
+    /// これ以下は weak（0 は bad）。
+    #[serde(default = "default_lqi_weak")]
+    pub lqi_weak: u8,
+    /// frame error rate(%) がこれ以上なら LQI に関わらず weak 以下に落とす。
+    #[serde(default = "default_fer_weak")]
+    pub fer_weak: u8,
+}
+
+impl Default for MeshThresholds {
+    fn default() -> Self {
+        MeshThresholds {
+            lqi_fair: default_lqi_fair(),
+            lqi_weak: default_lqi_weak(),
+            fer_weak: default_fer_weak(),
+        }
+    }
+}
+
+fn default_mesh_ttl_ms() -> u64 {
+    600_000
+}
+
+fn default_mesh_timeout_ms() -> u64 {
+    240_000
+}
+
+fn default_lqi_fair() -> u8 {
+    2
+}
+
+fn default_lqi_weak() -> u8 {
+    1
+}
+
+fn default_fer_weak() -> u8 {
+    30
 }
 
 fn default_bind() -> String {
@@ -317,6 +392,7 @@ pub enum ConfigError {
     NestedLightMembers { device: String, member: String },
     DuplicateLightMember { member: String },
     EmptyHealthCommand,
+    EmptyMeshCommand,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -376,6 +452,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "device {member}: members に複数回指定されている（同一グループ内の重複または複数グループへの所属）")
             }
             ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
+            ConfigError::EmptyMeshCommand => write!(f, "mesh: command が空"),
         }
     }
 }
@@ -631,6 +708,12 @@ impl Config {
         if let Some(h) = &self.health {
             if h.command.is_empty() {
                 return Err(ConfigError::EmptyHealthCommand);
+            }
+        }
+
+        if let Some(m) = &self.mesh {
+            if m.command.is_empty() {
+                return Err(ConfigError::EmptyMeshCommand);
             }
         }
 
@@ -1722,6 +1805,106 @@ mod tests {
         assert!(matches!(
             Config::load(&p),
             Err(ConfigError::EmptyHealthCommand)
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn mesh_parses() {
+        let p = write_tmp(
+            "meshok",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [mesh]
+            label      = "自宅メッシュ"
+            command    = ["mat", "diag", "mesh"]
+            ttl_ms     = 300000
+            timeout_ms = 120000
+            [mesh.thresholds]
+            lqi_fair = 3
+            lqi_weak = 2
+            fer_weak = 10
+            [mesh.labels]
+            desk_light = "デスクライト"
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let m = cfg.mesh.as_ref().unwrap();
+        assert_eq!(m.label.as_deref(), Some("自宅メッシュ"));
+        assert_eq!(m.command, vec!["mat", "diag", "mesh"]);
+        assert_eq!(m.ttl_ms, 300_000);
+        assert_eq!(m.timeout_ms, 120_000);
+        assert_eq!(m.thresholds.lqi_fair, 3);
+        assert_eq!(m.thresholds.lqi_weak, 2);
+        assert_eq!(m.thresholds.fer_weak, 10);
+        assert_eq!(m.labels.as_ref().unwrap().get("desk_light").unwrap(), "デスクライト");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn mesh_defaults() {
+        let p = write_tmp(
+            "meshdefault",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [mesh]
+            command = ["mat", "diag", "mesh"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let m = cfg.mesh.as_ref().unwrap();
+        assert_eq!(m.label, None);
+        assert_eq!(m.ttl_ms, 600_000);
+        assert_eq!(m.timeout_ms, 240_000);
+        assert_eq!(m.thresholds.lqi_fair, 2);
+        assert_eq!(m.thresholds.lqi_weak, 1);
+        assert_eq!(m.thresholds.fer_weak, 30);
+        assert!(m.labels.is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn mesh_absent_is_none() {
+        let p = write_tmp(
+            "meshnone",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.mesh.is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn mesh_empty_command_rejected() {
+        let p = write_tmp(
+            "meshempty",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [mesh]
+            command = []
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyMeshCommand)
         ));
         std::fs::remove_file(p).ok();
     }

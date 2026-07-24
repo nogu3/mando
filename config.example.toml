@@ -230,3 +230,29 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # mem_used_pct  = "メモリ"
 # disk_used_pct = "ディスク"
 # cpu_temp_c    = "CPU温度"
+
+# ── メッシュ表示（[mesh]、任意）────────────────────────────
+# Thread メッシュのトポロジーを /mesh で可視化する。未設定なら /mesh ごと 404。
+#
+# mat diag mesh は commission 済みノードを逐次 probe するので重い。
+# 13 ノードで実測 1 分 45 秒（1 台の mDNS timeout を含む）。取得は非同期ジョブで
+# 走り、GET /api/mesh は即答で状態とスナップショットを返す。
+# 誰も /mesh を開いていなければ何も走らない（mando はスケジューラを持たない）。
+#
+# [mesh]
+# label      = "自宅メッシュ"
+# command    = ["mat", "diag", "mesh"]
+# ttl_ms     = 600000        # 既定 600000（10 分）。これより古ければ開いた時に自動再取得
+# timeout_ms = 240000        # 既定 240000（4 分）。graph/health の 30 秒とは別枠
+#
+# リンク品質の等級しきい値。LQI と frame error rate の 2 軸で持つ —
+# LQI 1 でも誤り率 0% のリンクと 88% のリンクが併存するため、LQI だけでは
+# 弱いリンクを取りこぼす。
+# [mesh.thresholds]
+# lqi_fair = 2               # 既定 2。これ以下は fair
+# lqi_weak = 1               # 既定 1。これ以下は weak（0 は bad）
+# fer_weak = 30              # 既定 30。誤り率(%) がこれ以上なら weak 以下へ落とす
+#
+# alias → 表示名の置換（[health.labels] と同型）。無いキーは alias を素通し。
+# [mesh.labels]
+# desk_light = "デスクライト"
