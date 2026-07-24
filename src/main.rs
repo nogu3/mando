@@ -1256,7 +1256,7 @@ mod tests {
         ));
         std::fs::remove_file(&marker).ok();
         let cmd = format!(
-            r#"["sh", "-c", "if [ -f {p} ]; then sleep 0.3; printf '{{\"network\":{{\"partition_ids\":[]}},\"nodes\":[],\"edges\":[]}}'; else touch {p}; exit 1; fi"]"#,
+            r#"["sh", "-c", "if [ -f {p} ]; then sleep 2; printf '{{\"network\":{{\"partition_ids\":[]}},\"nodes\":[],\"edges\":[]}}'; else touch {p}; exit 1; fi"]"#,
             p = marker.display()
         );
         let app = app_from(&format!("{MESH_DEVICE}\n[mesh]\ncommand = {cmd}\n"));

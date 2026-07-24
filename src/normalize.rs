@@ -296,8 +296,11 @@ pub struct MeshEdge {
     pub a: String,
     pub b: String,
     /// "good" | "fair" | "weak" | "bad" | "route_only"。
-    /// "route_only" は「隣接視点が無い」場合と「隣接視点はあるが品質値が
-    /// 何も読めない」場合の両方を指す（どちらも honest な描き分けは「薄い破線」）。
+    /// "route_only" は「選ばれた視点に lqi が無く、かつ fer も無いか
+    /// fer_weak 未満」の場合（`grade_link`）。fer が閾値未満で読めている
+    /// ケースでは fer 自体はこの edge の出力に残る — route_only だからと
+    /// いって品質値が一切読めないとは限らない（honest な描き分けは
+    /// UI 上「薄い破線」）。
     pub grade: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lqi: Option<u8>,
@@ -427,10 +430,12 @@ fn grade_link(l: MeshLink, t: &crate::config::MeshThresholds) -> &'static str {
 /// エッジ品質は両視点のうち**悪いほう**を採る（弱点探しが目的なので楽観側を
 /// 採らない）。悪さの比較は LQI 昇順、同値なら誤り率降順（`pick_worst` 参照）。
 /// mat 側のリンク実測値は各フィールドが省略されうるため、欠けた値を 0 として
-/// 埋めることはしない（原則7）。lqi・fer のいずれも読めない視点しか無い場合は
-/// "route_only" として扱う — これは「隣接視点そのものが無い」場合と区別しない
-/// （どちらも UI 上は「接続しているが品質不明」を表す薄い破線として描かれる、
-/// honest な描き分け）。
+/// 埋めることはしない（原則7）。lqi が読めず、かつ fer も読めないか fer_weak
+/// 未満の視点しか無い場合は "route_only" として扱う（`grade_link`）。後者では
+/// fer 自体はこの edge の出力に残る — route_only だからといって品質値が一切
+/// 読めないとは限らない。隣接視点そのものが無い場合も同じ扱いになり、
+/// どちらも UI 上は「接続しているが品質不明」を表す薄い破線として描かれる、
+/// honest な描き分け。
 pub fn normalize_mesh(
     raw: &Value,
     thresholds: &crate::config::MeshThresholds,
@@ -1279,6 +1284,44 @@ mod tests {
         let e = &normalize_mesh(&raw, &th(), None).edges[0];
         assert_eq!(e.lqi, Some(2));
         assert_eq!(e.fer, Some(5)); // fer を持つ視点が採られる
+    }
+
+    /// 上記の鏡像: fer を持つ視点を a_sees_b 側に置いても結果は変わらない。
+    /// `is_worse_by_lqi` の (None, _) => false 分岐（= 既に選ばれている
+    /// fer 持ちの視点を、後続の fer 欠落視点で上書きしない）を通す。
+    #[test]
+    fn mesh_tie_break_prefers_view_with_fer_mirrored_order() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 2, "frame_error_rate": 5},
+                     "b_sees_a": {"lqi": 2}}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.lqi, Some(2));
+        assert_eq!(e.fer, Some(5)); // 順序を入れ替えても fer を持つ視点が採られる
+    }
+
+    /// 片方は lqi のみ、もう片方は fer のみという部分的なビュー同士の組み合わせ。
+    /// lqi を持つ視点がある時点でそちらが無条件に採られる（`pick_worst` は
+    /// lqi 持ちの視点があれば fer のみの視点を見にいかない）ため、他方の
+    /// fer はこの edge に一切混ざらない。これは「視点ごと」に選ぶ設計の
+    /// 意図した帰結であり見落としではない — 将来この挙動を見直す余地は
+    /// 残る（例えば異なる視点の fer を lqi 持ち視点に補完する等）。
+    #[test]
+    fn mesh_partial_views_lqi_view_wins_without_merging_other_views_fer() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 3},
+                     "b_sees_a": {"frame_error_rate": 90}}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "good");
+        assert_eq!(e.lqi, Some(3));
+        assert_eq!(e.fer, None); // b_sees_a の fer=90 は混ざらない
     }
 
     #[test]
