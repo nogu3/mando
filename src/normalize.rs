@@ -260,6 +260,257 @@ pub fn normalize_health_rows(
     HealthReport { worst, items }
 }
 
+/// メッシュの network セクション。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeshNetwork {
+    pub name: Option<String>,
+    pub channel: Option<u64>,
+    pub leader_router_id: Option<u64>,
+    /// partition_ids が 2 つ以上 = メッシュが分裂している。
+    pub split: bool,
+}
+
+/// メッシュの 1 頂点。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeshNode {
+    /// mat の安定キー（ext:… / node:… / rloc:…）をそのまま。
+    pub id: String,
+    /// UI 表示名。
+    pub name: String,
+    /// "ours"（自 fabric）| "named"（他人だが名前あり）| "anonymous"。
+    pub kind: String,
+    pub role: String,
+    pub is_leader: bool,
+    /// 自 fabric ノードのみが持つ。他人の参加者は probe していないので None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+}
+
+/// メッシュの 1 エッジ。lqi / rssi / fer は「悪いほうの視点」の値。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeshEdge {
+    pub a: String,
+    pub b: String,
+    /// "good" | "fair" | "weak" | "bad" | "route_only"。
+    pub grade: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lqi: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rssi: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fer: Option<u8>,
+}
+
+/// フロントが見る安定形。mat の生 JSON はここから先に出さない。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeshView {
+    pub network: MeshNetwork,
+    pub nodes: Vec<MeshNode>,
+    pub edges: Vec<MeshEdge>,
+    /// 自 fabric なのに自分の ext を名乗れなかったノード数。
+    /// 二重出現の注記を出すかの判断に使う（mat#13）。
+    pub unidentified_count: usize,
+    /// mat が付けた収集時刻。
+    pub fetched_at: Option<String>,
+}
+
+/// 1 視点ぶんの neighbor 実測値。
+#[derive(Clone, Copy)]
+struct MeshLink {
+    lqi: u8,
+    rssi: i64,
+    fer: u8,
+}
+
+fn read_link(v: &Value) -> Option<MeshLink> {
+    let o = v.as_object()?;
+    Some(MeshLink {
+        lqi: o.get("lqi").and_then(Value::as_u64).unwrap_or(0) as u8,
+        rssi: o.get("avg_rssi").and_then(Value::as_i64).unwrap_or(0),
+        fer: o.get("frame_error_rate").and_then(Value::as_u64).unwrap_or(0) as u8,
+    })
+}
+
+/// 等級の深刻度（大きいほど悪い）。
+fn severity(grade: &str) -> u8 {
+    match grade {
+        "good" => 0,
+        "fair" => 1,
+        "weak" => 2,
+        "bad" => 3,
+        _ => 0,
+    }
+}
+
+/// LQI で等級を出し、frame error rate が高ければ weak 以下へ落とす。
+/// FER は悪くする方向にしか働かない（lqi 0 の bad を weak に引き上げない）。
+fn grade_link(l: MeshLink, t: &crate::config::MeshThresholds) -> &'static str {
+    let by_lqi = if l.lqi == 0 {
+        "bad"
+    } else if l.lqi <= t.lqi_weak {
+        "weak"
+    } else if l.lqi <= t.lqi_fair {
+        "fair"
+    } else {
+        "good"
+    };
+    if l.fer >= t.fer_weak && severity(by_lqi) < severity("weak") {
+        "weak"
+    } else {
+        by_lqi
+    }
+}
+
+/// `mat diag mesh` の出力 JSON → フロント向けの安定形。
+///
+/// mat 固有の知識（`a_sees_b` / `b_sees_a` の構造、`ext:` / `node:` の ID 規約、
+/// LQI が 0–3 スケールであること）はこの関数に閉じる（設計原則 4）。
+///
+/// エッジ品質は両視点のうち**悪いほう**を採る（弱点探しが目的なので楽観側を
+/// 採らない）。悪さの比較は LQI 昇順、同値なら誤り率降順。
+#[allow(dead_code)] // TODO: API 配線は後続タスク（#3 系列）で行う
+pub fn normalize_mesh(
+    raw: &Value,
+    thresholds: &crate::config::MeshThresholds,
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> MeshView {
+    let net = raw.get("network");
+    let partitions = net
+        .and_then(|n| n.get("partition_ids"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let network = MeshNetwork {
+        name: net
+            .and_then(|n| n.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        channel: net.and_then(|n| n.get("channel")).and_then(Value::as_u64),
+        leader_router_id: net
+            .and_then(|n| n.get("leader_router_id"))
+            .and_then(Value::as_u64),
+        split: partitions > 1,
+    };
+
+    let raw_nodes = raw
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut nodes = Vec::new();
+    let mut unidentified_count = 0;
+    for n in &raw_nodes {
+        let Some(id) = n.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let alias = n.get("alias").and_then(Value::as_str);
+        let label = n.get("label").and_then(Value::as_str);
+        let (kind, name) = match (alias, label) {
+            (Some(a), _) => {
+                let shown = labels
+                    .and_then(|m| m.get(a))
+                    .map(String::as_str)
+                    .unwrap_or(a);
+                ("ours", shown.to_string())
+            }
+            (None, Some(l)) => ("named", l.to_string()),
+            (None, None) => {
+                let ext = n.get("ext_address").and_then(Value::as_str);
+                let shown = match ext {
+                    Some(e) if e.len() >= 4 => e[..4].to_string(),
+                    Some(e) => e.to_string(),
+                    None => id.to_string(),
+                };
+                ("anonymous", shown)
+            }
+        };
+        // 自 fabric なのに ext を名乗れていない = mat#13 の二重出現候補。
+        if alias.is_some() && id.starts_with("node:") {
+            unidentified_count += 1;
+        }
+        let role = n
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        nodes.push(MeshNode {
+            id: id.to_string(),
+            name,
+            kind: kind.to_string(),
+            is_leader: role == "leader",
+            role,
+            probed: n.get("probed").and_then(Value::as_bool),
+            error_kind: n
+                .get("probe_error")
+                .and_then(|e| e.get("kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+
+    let known: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut edges = Vec::new();
+    for e in raw
+        .get("edges")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let (Some(a), Some(b)) = (
+            e.get("a").and_then(Value::as_str),
+            e.get("b").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !known.contains(a) || !known.contains(b) {
+            continue;
+        }
+        let views: Vec<MeshLink> = ["a_sees_b", "b_sees_a"]
+            .iter()
+            .filter_map(|k| e.get(*k))
+            .filter_map(read_link)
+            .collect();
+        // 悪いほう = LQI 昇順、同値なら誤り率降順。
+        let worst = views
+            .iter()
+            .copied()
+            .min_by(|x, y| x.lqi.cmp(&y.lqi).then(y.fer.cmp(&x.fer)));
+        let edge = match worst {
+            Some(l) => MeshEdge {
+                a: a.to_string(),
+                b: b.to_string(),
+                grade: grade_link(l, thresholds).to_string(),
+                lqi: Some(l.lqi),
+                rssi: Some(l.rssi),
+                fer: Some(l.fer),
+            },
+            None => MeshEdge {
+                a: a.to_string(),
+                b: b.to_string(),
+                grade: "route_only".to_string(),
+                lqi: None,
+                rssi: None,
+                fer: None,
+            },
+        };
+        edges.push(edge);
+    }
+
+    MeshView {
+        network,
+        nodes,
+        edges,
+        unidentified_count,
+        fetched_at: raw
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +945,211 @@ mod tests {
             serde_json::to_string(&r.items[0]).unwrap(),
             r#"{"label":"a","level":"stale"}"#
         );
+    }
+
+    fn th() -> crate::config::MeshThresholds {
+        crate::config::MeshThresholds::default()
+    }
+
+    /// ext アドレスはすべてダミー（設置環境の実値は公開リポジトリに置かない）。
+    fn sample() -> Value {
+        json!({
+          "timestamp": "2026-07-23T21:14:02+09:00",
+          "network": {
+            "name": "test-thread", "channel": 15,
+            "partition_ids": [1581832881], "leader_router_id": 38
+          },
+          "nodes": [
+            {"id": "ext:0011223344556677", "ext_address": "0011223344556677",
+             "rloc16": "0x9800", "router_id": 38, "role": "leader"},
+            {"id": "node:5", "node_id": 5, "alias": "desk_light",
+             "role": "router", "probed": true},
+            {"id": "ext:8899AABBCCDDEEFF", "ext_address": "8899AABBCCDDEEFF",
+             "node_id": 7, "alias": "hall_light", "rloc16": "0x6c00",
+             "router_id": 27, "role": "router", "probed": true},
+            {"id": "ext:AABBCCDDEEFF0011", "ext_address": "AABBCCDDEEFF0011",
+             "rloc16": "0x7c00", "router_id": 31, "role": "router",
+             "label": "otbr-br"},
+            {"id": "node:15", "node_id": 15, "role": "unknown", "probed": false,
+             "probe_error": {"kind": "timeout", "detail": "no SRV+AAAA answer"}}
+          ],
+          "edges": [
+            {"a": "node:5", "b": "ext:8899AABBCCDDEEFF",
+             "a_sees_b": {"lqi": 3, "avg_rssi": -60, "last_rssi": -58,
+                          "frame_error_rate": 0, "age": 12},
+             "b_sees_a": {"lqi": 3, "avg_rssi": -62, "last_rssi": -61,
+                          "frame_error_rate": 1, "age": 8}},
+            {"a": "node:5", "b": "ext:AABBCCDDEEFF0011",
+             "a_sees_b": null, "b_sees_a": null,
+             "route": {"lqi_in": 3, "lqi_out": 3, "path_cost": 1}}
+          ]
+        })
+    }
+
+    #[test]
+    fn mesh_network_and_counts() {
+        let v = normalize_mesh(&sample(), &th(), None);
+        assert_eq!(v.network.name.as_deref(), Some("test-thread"));
+        assert_eq!(v.network.channel, Some(15));
+        assert_eq!(v.network.leader_router_id, Some(38));
+        assert!(!v.network.split);
+        assert_eq!(v.fetched_at.as_deref(), Some("2026-07-23T21:14:02+09:00"));
+        assert_eq!(v.nodes.len(), 5);
+        assert_eq!(v.edges.len(), 2);
+        // alias を持つのに ext を名乗れていないノード（node:5）だけを数える
+        assert_eq!(v.unidentified_count, 1);
+    }
+
+    #[test]
+    fn mesh_split_when_multiple_partitions() {
+        let mut raw = sample();
+        raw["network"]["partition_ids"] = json!([1, 2]);
+        assert!(normalize_mesh(&raw, &th(), None).network.split);
+    }
+
+    #[test]
+    fn mesh_node_kinds_and_names() {
+        let v = normalize_mesh(&sample(), &th(), None);
+        let by = |id: &str| v.nodes.iter().find(|n| n.id == id).unwrap();
+
+        let leader = by("ext:0011223344556677");
+        assert_eq!(leader.kind, "anonymous");
+        assert_eq!(leader.name, "0011"); // ext の先頭 4 桁
+        assert!(leader.is_leader);
+        assert_eq!(leader.probed, None);
+
+        let ours = by("node:5");
+        assert_eq!(ours.kind, "ours");
+        assert_eq!(ours.name, "desk_light"); // labels 未指定なので alias 素通し
+        assert_eq!(ours.role, "router");
+        assert_eq!(ours.probed, Some(true));
+        assert!(!ours.is_leader);
+
+        let named = by("ext:AABBCCDDEEFF0011");
+        assert_eq!(named.kind, "named");
+        assert_eq!(named.name, "otbr-br");
+
+        let failed = by("node:15");
+        assert_eq!(failed.kind, "anonymous"); // alias も label も無い
+        assert_eq!(failed.probed, Some(false));
+        assert_eq!(failed.error_kind.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn mesh_labels_replace_alias() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("desk_light".to_string(), "デスクライト".to_string());
+        let v = normalize_mesh(&sample(), &th(), Some(&labels));
+        let n = v.nodes.iter().find(|n| n.id == "node:5").unwrap();
+        assert_eq!(n.name, "デスクライト");
+    }
+
+    #[test]
+    fn mesh_route_only_edge() {
+        let v = normalize_mesh(&sample(), &th(), None);
+        let e = v.edges.iter().find(|e| e.b == "ext:AABBCCDDEEFF0011").unwrap();
+        assert_eq!(e.grade, "route_only");
+        assert_eq!(e.lqi, None);
+        assert_eq!(e.rssi, None);
+        assert_eq!(e.fer, None);
+    }
+
+    /// lqi だけで等級が決まるケース。
+    #[test]
+    fn mesh_grade_by_lqi() {
+        for (lqi, want) in [(3u8, "good"), (2, "fair"), (1, "weak"), (0, "bad")] {
+            let raw = json!({
+              "network": {"partition_ids": []},
+              "nodes": [{"id": "a"}, {"id": "b"}],
+              "edges": [{"a": "a", "b": "b",
+                         "a_sees_b": {"lqi": lqi, "avg_rssi": -70, "frame_error_rate": 0},
+                         "b_sees_a": null}]
+            });
+            let v = normalize_mesh(&raw, &th(), None);
+            assert_eq!(v.edges[0].grade, want, "lqi {lqi}");
+        }
+    }
+
+    /// FER は等級を悪くする方向にしか働かない。good でも weak に落ち、bad は bad のまま。
+    #[test]
+    fn mesh_grade_fer_only_worsens() {
+        let mk = |lqi: u8, fer: u8| {
+            json!({
+              "network": {"partition_ids": []},
+              "nodes": [{"id": "a"}, {"id": "b"}],
+              "edges": [{"a": "a", "b": "b",
+                         "a_sees_b": {"lqi": lqi, "avg_rssi": -70, "frame_error_rate": fer},
+                         "b_sees_a": null}]
+            })
+        };
+        assert_eq!(normalize_mesh(&mk(3, 88), &th(), None).edges[0].grade, "weak");
+        assert_eq!(normalize_mesh(&mk(2, 30), &th(), None).edges[0].grade, "weak");
+        assert_eq!(normalize_mesh(&mk(0, 88), &th(), None).edges[0].grade, "bad");
+        // しきい値未満の誤り率は等級を変えない
+        assert_eq!(normalize_mesh(&mk(3, 29), &th(), None).edges[0].grade, "good");
+    }
+
+    /// 両視点のうち悪いほうを採る。LQI が同値なら誤り率が大きいほう。
+    #[test]
+    fn mesh_takes_worse_view() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 3, "avg_rssi": -55, "frame_error_rate": 0},
+                     "b_sees_a": {"lqi": 1, "avg_rssi": -94, "frame_error_rate": 5}}]
+        });
+        let e = &normalize_mesh(&raw, &th(), None).edges[0];
+        assert_eq!(e.grade, "weak");
+        assert_eq!(e.lqi, Some(1));
+        assert_eq!(e.rssi, Some(-94));
+        assert_eq!(e.fer, Some(5));
+
+        let tie = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 2, "avg_rssi": -70, "frame_error_rate": 4},
+                     "b_sees_a": {"lqi": 2, "avg_rssi": -72, "frame_error_rate": 40}}]
+        });
+        let e = &normalize_mesh(&tie, &th(), None).edges[0];
+        assert_eq!(e.fer, Some(40));
+        assert_eq!(e.grade, "weak"); // 誤り率 40 >= 30 で fair から落ちる
+    }
+
+    #[test]
+    fn mesh_thresholds_move_the_boundary() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}, {"id": "b"}],
+          "edges": [{"a": "a", "b": "b",
+                     "a_sees_b": {"lqi": 2, "avg_rssi": -70, "frame_error_rate": 0},
+                     "b_sees_a": null}]
+        });
+        assert_eq!(normalize_mesh(&raw, &th(), None).edges[0].grade, "fair");
+        let strict = crate::config::MeshThresholds { lqi_fair: 3, lqi_weak: 2, fer_weak: 30 };
+        assert_eq!(normalize_mesh(&raw, &strict, None).edges[0].grade, "weak");
+    }
+
+    #[test]
+    fn mesh_drops_edges_with_unknown_endpoint() {
+        let raw = json!({
+          "network": {"partition_ids": []},
+          "nodes": [{"id": "a"}],
+          "edges": [{"a": "a", "b": "ghost", "a_sees_b": null, "b_sees_a": null}]
+        });
+        assert!(normalize_mesh(&raw, &th(), None).edges.is_empty());
+    }
+
+    #[test]
+    fn mesh_empty_graph() {
+        let raw = json!({"network": {"partition_ids": []}, "nodes": [], "edges": []});
+        let v = normalize_mesh(&raw, &th(), None);
+        assert!(v.nodes.is_empty());
+        assert!(v.edges.is_empty());
+        assert!(!v.network.split);
+        assert_eq!(v.network.name, None);
+        assert_eq!(v.unidentified_count, 0);
+        assert_eq!(v.fetched_at, None);
     }
 }

@@ -217,7 +217,6 @@ pub struct Mesh {
 /// 実測で LQI 1・誤り率 0% のリンクと LQI 1・誤り率 88% のリンクが併存し、
 /// LQI だけでは弱いリンクを取りこぼすため。
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // TODO: 消費側（正規化/API）は後続タスクで配線する
 pub struct MeshThresholds {
     /// これ以下は fair。
     #[serde(default = "default_lqi_fair")]
