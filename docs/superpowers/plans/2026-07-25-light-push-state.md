@@ -2100,6 +2100,9 @@ async function lightAct(name, verb, path, body) {
     const am = ACTION_MSG[view.action] || "";
     if (am) {
       clearLightTimers(c);
+      // 直前の操作が残した「反映中…」を戻す。タイマーを止めた以上、
+      // 他に戻す担い手がいない（light は定期ポーリングされない）。
+      rerenderKnown(name);
       c.msgEl.textContent = "⚠ " + am;
       c.statusEl.classList.add("error");
     } else {
@@ -2119,6 +2122,7 @@ async function lightAct(name, verb, path, body) {
   } catch (e) {
     if (c) {
       clearLightTimers(c);
+      rerenderKnown(name);
       c.msgEl.textContent = "⚠ 通信エラー"; c.statusEl.classList.add("error");
     }
   } finally {
@@ -2134,6 +2138,15 @@ function clearLightTimers(c) {
   if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
 }
 
+/* 既知状態へ描き戻す（通信しない）。「反映中…」の後始末はここに集約する。
+   exec / stale は付けない — 新たに確認したわけではないので、前回の判定を
+   そのまま名乗り直さない（原則 7）。呼び出し側が warning を出す場合は
+   これを呼んだ**あと**に付ける（renderState が status クラスを張り替える）。 */
+function rerenderKnown(name) {
+  const c = cards.get(name);
+  if (c) renderState(name, { state: c.state });
+}
+
 /* SSE 接続中の「反映中…」の後始末。既に同じ状態だと変化が起きず push が
    来ないので、既知状態へ描き戻して表示を固まらせない。通信はしない。 */
 function scheduleLightSettle(name) {
@@ -2142,10 +2155,17 @@ function scheduleLightSettle(name) {
   if (c.settleTimer) clearTimeout(c.settleTimer);
   c.settleTimer = setTimeout(() => {
     c.settleTimer = null;
-    renderState(name, { state: c.state, source: "push", stale: false });
+    rerenderKnown(name);
   }, LIGHT_SETTLE_MS);
 }
 ```
+
+> **エラー分岐で `rerenderKnown` を呼ぶ順序が肝。** `renderState` は
+> `statusEl.className` を張り替えるので、警告クラスは**そのあと**に付ける。
+> これが無いと、A を押して「反映中…」が出ている間に B を押して B が失敗した
+> 場合、`clearLightTimers` が A のタイマーを止めた結果ラベルを戻す担い手が
+> 誰もいなくなり、**タイルが「反映中…」で永久に固まる**（light は定期
+> ポーリングされないので他に直す経路が無い）。Task 6 のレビューで発覚した。
 
 - [ ] **Step 4: `renderState` に `stale` を写し、`startEvents` を足す**
 
