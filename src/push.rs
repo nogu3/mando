@@ -14,9 +14,10 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::{Config, Kind};
 use crate::normalize::{self, PushEvent, State};
@@ -24,6 +25,19 @@ use crate::normalize::{self, PushEvent, State};
 /// 値の出どころ。UI が「いま何を根拠に表示しているか」を隠さないため（原則 7）。
 pub const SOURCE_PUSH: &str = "push";
 pub const SOURCE_READ: &str = "read";
+
+/// SSE で配る 1 件。接続直後のスナップショットも変化イベントも同じ形。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StateEvent {
+    pub device: String,
+    pub state: State,
+    pub source: &'static str,
+    pub stale: bool,
+}
+
+/// broadcast バッファ。溢れた遅いクライアントは Lagged になり、次の変化
+/// イベント（or 再接続時のスナップショット）で追いつく。
+const BROADCAST_CAPACITY: usize = 64;
 
 /// listener 再起動の待ち（指数 backoff）。
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -38,11 +52,21 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// デバイス 1 台の push 状態。
-#[derive(Default)]
 struct Slot {
     /// `"cluster/attribute"` → 最新値の汎用マップ。今 state に写すのは
     /// `onoff/on-off` だけ。明るさ・色は読み出す属性を足すだけで済む。
     attrs: HashMap<String, Value>,
+    /// 直近にこの slot を更新した出どころ。
+    source: &'static str,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Slot {
+            attrs: HashMap::new(),
+            source: SOURCE_PUSH,
+        }
+    }
 }
 
 impl Slot {
@@ -78,9 +102,10 @@ pub struct PushStore {
     /// 突合表。1 つの node_id が複数の論理デバイス（グループカードと
     /// そのメンバー等）の代表ノードになりうるので Vec で持つ。
     by_node: HashMap<u64, Vec<String>>,
-    /// push 管理下のデバイス名（config 記載順）。
+    /// push 管理下のデバイス名（config 記載順。スナップショットの順序）。
     tracked: Vec<String>,
     inner: Mutex<Inner>,
+    tx: broadcast::Sender<StateEvent>,
 }
 
 impl PushStore {
@@ -97,6 +122,7 @@ impl PushStore {
             by_node.entry(node_id).or_default().push(d.name.clone());
             tracked.push(d.name.clone());
         }
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         PushStore {
             by_node,
             tracked,
@@ -105,6 +131,7 @@ impl PushStore {
                 generation: 0,
                 slots: HashMap::new(),
             }),
+            tx,
         }
     }
 
@@ -136,6 +163,11 @@ impl PushStore {
     /// 捨てる。断で捨てるのは必須（切れていた間に状態が変化した可能性があり、
     /// `mat listen` は新規クライアント接続へ priming を replay しないため、
     /// 再 read が唯一の正しい復旧手段）。復帰でも捨てるのは構造的な保証。
+    ///
+    /// 断そのものは broadcast しない — 静止したライトの値は断の間もほぼ
+    /// 正しく、再接続直後の再ベースライン read が差分を必ず broadcast する。
+    /// 断中に GET state を叩けば read フォールバック（失敗なら `stale: true`）
+    /// で正直に出る。
     pub fn set_connected(&self, connected: bool) {
         let mut inner = self.lock();
         inner.connected = connected;
@@ -168,7 +200,13 @@ impl PushStore {
         if !inner.connected || inner.generation != generation {
             return;
         }
-        Self::update(&mut inner, device, normalize::ONOFF_KEY.to_string(), value);
+        self.update(
+            &mut inner,
+            device,
+            normalize::ONOFF_KEY.to_string(),
+            value,
+            SOURCE_READ,
+        );
     }
 
     /// listener からの 1 イベントを取り込む。突合できる論理デバイスが
@@ -181,19 +219,64 @@ impl PushStore {
         let key = normalize::attr_key(&ev.cluster, &ev.attribute);
         let mut inner = self.lock();
         for device in &devices {
-            Self::update(&mut inner, device, key.clone(), ev.value.clone());
+            self.update(&mut inner, device, key.clone(), ev.value.clone(), SOURCE_PUSH);
         }
         true
     }
 
-    /// 属性を 1 つ書く。
-    fn update(inner: &mut Inner, device: &str, key: String, value: Value) {
-        inner
-            .slots
-            .entry(device.to_string())
-            .or_default()
-            .attrs
-            .insert(key, value);
+    /// 属性を 1 つ書き、導出 state が変わったときだけ broadcast する
+    /// （onoff を動かさない属性の更新でクライアントを起こさない）。
+    fn update(
+        &self,
+        inner: &mut Inner,
+        device: &str,
+        key: String,
+        value: Value,
+        source: &'static str,
+    ) {
+        let slot = inner.slots.entry(device.to_string()).or_default();
+        let before = slot.state();
+        slot.attrs.insert(key, value);
+        slot.source = source;
+        let after = slot.state();
+        if after == before {
+            return;
+        }
+        if let Some(state) = after {
+            // 購読者ゼロなら Err。捨ててよい。
+            let _ = self.tx.send(StateEvent {
+                device: device.to_string(),
+                state,
+                source,
+                stale: false,
+            });
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
+        self.tx.subscribe()
+    }
+
+    /// SSE 接続直後に送る現在スナップショット。基準値が確立していない
+    /// デバイスは含めない — 「不明」で上書きして、クライアントが read で
+    /// 得た正しい表示を壊さないため。
+    pub fn snapshot(&self) -> Vec<StateEvent> {
+        let inner = self.lock();
+        if !inner.connected {
+            return Vec::new();
+        }
+        self.tracked
+            .iter()
+            .filter_map(|name| {
+                let slot = inner.slots.get(name)?;
+                Some(StateEvent {
+                    device: name.clone(),
+                    state: slot.state()?,
+                    source: slot.source,
+                    stale: false,
+                })
+            })
+            .collect()
     }
 }
 
@@ -470,6 +553,65 @@ mod tests {
         assert_eq!(s.primed_state("desk_light"), None);
         s.apply(&onoff_event(6, false));
         assert_eq!(s.primed_state("desk_light"), Some(State::Off));
+    }
+
+    #[test]
+    fn broadcasts_only_on_state_change() {
+        let s = connected_store();
+        let mut rx = s.subscribe();
+        s.apply(&onoff_event(6, true));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            StateEvent {
+                device: "desk_light".into(),
+                state: State::On,
+                source: SOURCE_PUSH,
+                stale: false,
+            }
+        );
+        // 同じ値の再送では起こさない。
+        s.apply(&onoff_event(6, true));
+        assert!(rx.try_recv().is_err());
+        // onoff を動かさない属性でも起こさない（明るさ・色が流れてきても静か）。
+        s.apply(&PushEvent {
+            node_id: 6,
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into(),
+            value: json!(120),
+        });
+        assert!(rx.try_recv().is_err());
+        // 変化したら起こす。
+        s.apply(&onoff_event(6, false));
+        assert_eq!(rx.try_recv().unwrap().state, State::Off);
+    }
+
+    #[test]
+    fn baseline_broadcasts_with_read_source() {
+        let s = connected_store();
+        let mut rx = s.subscribe();
+        s.baseline("desk_light", State::Off, s.generation());
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.source, SOURCE_READ);
+        assert_eq!(ev.state, State::Off);
+    }
+
+    #[test]
+    fn snapshot_omits_devices_without_a_baseline() {
+        let s = connected_store();
+        s.apply(&onoff_event(6, false));
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 1, "基準値のあるデバイスだけ: {snap:?}");
+        assert_eq!(snap[0].device, "desk_light");
+        assert_eq!(snap[0].state, State::Off);
+        assert!(!snap[0].stale);
+    }
+
+    #[test]
+    fn snapshot_is_empty_while_disconnected() {
+        let s = connected_store();
+        s.apply(&onoff_event(6, false));
+        s.set_connected(false);
+        assert!(s.snapshot().is_empty());
     }
 
     #[tokio::test]

@@ -14,10 +14,14 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -230,6 +234,7 @@ fn router(app: Shared) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/:name/state", get(get_state))
+        .route("/api/events", get(events))
         .route("/api/devices/:name/open", post(open_device))
         .route("/api/devices/:name/close", post(close_device))
         .route("/api/devices/:name/stop", post(stop_device))
@@ -1167,6 +1172,45 @@ async fn run_mesh_job(app: Shared) {
     }
 }
 
+/// [push] 未設定 → 404（機能ごと無効）。
+fn push_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"push not configured"}"#.to_string(),
+    )
+        .into_response()
+}
+
+/// light の状態を SSE で push する。接続直後に現在スナップショットを送り、
+/// 以後は変化のたび 1 イベント。cross-tab / 別端末の操作も全画面に反映される。
+async fn events(State(app): State<Shared>) -> Response {
+    let Some(store) = app.push.clone() else {
+        return push_not_configured();
+    };
+    // 購読を先に取ってからスナップショットを撮る。この順なら取りこぼさない
+    // （逆順だと間のイベントが落ちる）。重複は同じ値の再描画で無害。
+    let rx = store.subscribe();
+    let snapshot = store.snapshot();
+    let live = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => return Some((ev, rx)),
+                // 遅いクライアントは取りこぼす。次の変化 or 再接続時の
+                // スナップショットで追いつく。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(missed = n, "SSE クライアントがイベントを取りこぼした");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    let stream = futures_util::stream::iter(snapshot)
+        .chain(live)
+        .map(|ev| Event::default().json_data(&ev));
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2073,6 +2117,76 @@ mod tests {
         assert_eq!(v["exec"], "success");
         assert!(v.get("source").is_none());
         assert!(v.get("stale").is_none());
+    }
+
+    #[tokio::test]
+    async fn events_is_404_without_push_config() {
+        let (st, v) = call_with_cfg(MINIMAL_DEVICE, "GET", "/api/events").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "push not configured");
+    }
+
+    /// SSE ボディから次の `data:` 行の JSON を 1 件取り出す（keep-alive 行は飛ばす）。
+    async fn next_sse_data(body: &mut Body) -> Value {
+        for _ in 0..50 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame())
+                .await
+                .expect("SSE frame が来ない")
+                .expect("SSE ストリームが終わった")
+                .unwrap();
+            let Ok(bytes) = frame.into_data() else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    return serde_json::from_str(rest.trim()).expect("data 行が JSON でない");
+                }
+            }
+        }
+        panic!("data 行が来なかった");
+    }
+
+    #[tokio::test]
+    async fn sse_sends_snapshot_then_change_events() {
+        let p = tmp_counter("sse");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.baseline("light", normalize::State::On, store.generation());
+
+        let res = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut body = res.into_body();
+
+        // 接続直後スナップショット（新しく開いたタブが即座に正しくなる）。
+        let snap = next_sse_data(&mut body).await;
+        assert_eq!(snap["device"], "light");
+        assert_eq!(snap["state"], "on");
+        assert_eq!(snap["source"], "read");
+        assert_eq!(snap["stale"], false);
+
+        // 以後は変化のたびイベント。
+        store.apply(&normalize::PushEvent {
+            node_id: 5,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+            value: serde_json::json!(false),
+        });
+        let change = next_sse_data(&mut body).await;
+        assert_eq!(change["device"], "light");
+        assert_eq!(change["state"], "off");
+        assert_eq!(change["source"], "push");
+        std::fs::remove_file(&p).ok();
     }
 
     /// get_state が exec のたびに 1 文字追記する push 管理下 light を持つ App。
