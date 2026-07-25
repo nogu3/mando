@@ -246,8 +246,10 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
 struct StateView {
     /// 正規化された状態。shutter: open | closed | … / light: on | off。想定外は unknown。
     state: DeviceState,
-    /// get_state の exec 結果（成否を正直に出す）。
-    exec: ExecOutcome,
+    /// get_state の exec 結果（成否を正直に出す）。push 由来の即答では
+    /// exec が走っていないので省略する — 走らなかった exec の成功を騙らない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exec: Option<ExecOutcome>,
     /// 下層の生 JSON（パースできた場合のみ。デバッグ用）。
     raw: Option<Value>,
 }
@@ -271,7 +273,7 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
         );
         return StateView {
             state: DeviceState::Unknown,
-            exec: result.outcome,
+            exec: Some(result.outcome),
             raw: None,
         };
     }
@@ -285,7 +287,7 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
                     Kind::Light => normalize_mat_onoff(&raw),
                     Kind::Switch => normalize_enl_state(&raw),
                 },
-                exec: result.outcome,
+                exec: Some(result.outcome),
                 raw: Some(raw),
             }
         }
@@ -293,7 +295,7 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
             tracing::warn!(device = %device.name, error = %e, "get_state JSON パース失敗");
             StateView {
                 state: DeviceState::Unknown,
-                exec: result.outcome,
+                exec: Some(result.outcome),
                 raw: None,
             }
         }
@@ -335,7 +337,7 @@ async fn cached_state(app: &App, device: &Device) -> StateView {
     app.state_cache
         .get_or_fetch(&device.name, ttl, || async {
             let view = fetch_state(app, device).await;
-            let cacheable = view.exec == ExecOutcome::Success;
+            let cacheable = view.exec == Some(ExecOutcome::Success);
             (view, cacheable)
         })
         .await
@@ -371,7 +373,7 @@ async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
     // 設計原則 7: set 後は必ず state を取り直し、実際の開閉を確認してから返す。
     let state = fetch_state(app, device).await;
     // 確定値でキャッシュを更新（成功時のみ）。直後のポーリングが古い値を見ない。
-    if state.exec == ExecOutcome::Success {
+    if state.exec == Some(ExecOutcome::Success) {
         app.state_cache
             .store(&device.name, state.clone())
             .await;
@@ -1818,7 +1820,7 @@ mod tests {
         let device = app.config.find("slow").unwrap();
         let start = Instant::now();
         let view = fetch_state(&app, device).await;
-        assert_eq!(view.exec, ExecOutcome::Timeout);
+        assert_eq!(view.exec, Some(ExecOutcome::Timeout));
         assert_eq!(view.state, normalize::State::Unknown);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
@@ -1939,6 +1941,16 @@ mod tests {
             "light は原則7 例外によりキャッシュされず毎回 exec する"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// shutter は本設計の対象外 — 応答の形が変わらないことの釘打ち。
+    /// （Task 4 で source / stale の不在アサートを足す）
+    #[tokio::test]
+    async fn shutter_state_response_shape_unchanged() {
+        let (st, v) = call("GET", "/api/devices/shutter/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["exec"], "success");
     }
 
     #[tokio::test]
