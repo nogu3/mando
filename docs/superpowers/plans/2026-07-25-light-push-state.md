@@ -2107,6 +2107,10 @@ async function lightAct(name, verb, path, body) {
       c.statusEl.classList.add("error");
     } else {
       // 成功 = 送信できただけ。中間表示にして反映を待つ。
+      // 張り直す前に両方止める。sseOpen が前回操作との間で反転していると、
+      // 各 schedule 関数は自分の型のタイマーしか止めないので前回のもう一方が
+      // 生き残り、余計な state 読みが走る（exec ゼロの旨みを削る）。
+      clearLightTimers(c);
       c.statusEl.classList.remove("error");
       c.msgEl.textContent = "";
       c.labelEl.textContent = "反映中…";
