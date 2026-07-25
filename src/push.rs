@@ -499,10 +499,12 @@ mod tests {
         let s = Arc::new(store());
         let (tx, _rx) = mpsc::unbounded_channel();
         // 不正なバイトを 1 行出したあと、自分では終わらない子。
+        // exec で sh を置き換えるので子は sleep 自身になり、kill が孫を
+        // 取り残さない（テストがプロセスを残して終わらないため）。
         let cmd = vec![
             "sh".to_string(),
             "-c".to_string(),
-            r#"printf '\377\n'; sleep 60"#.to_string(),
+            r#"printf '\377\n'; exec sleep 60"#.to_string(),
         ];
         let started = Instant::now();
         let done = tokio::time::timeout(Duration::from_secs(20), run_once(&cmd, &s, &tx)).await;
