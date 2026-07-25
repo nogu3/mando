@@ -379,7 +379,7 @@ const POLL_EXTEND_MS = 30 * 1000;          // 動作中（opening/closing）が�
 const POLL_EXTEND_CAP_MS = 10 * 60 * 1000; // 直近トリガーからの延長上限（固着時の無限ポーリング防止）。
 const MOVING_STATES = new Set(["opening", "closing"]);
 const LIGHT_CATCHUP_MS = 2000; // light: SSE が切れているときの追いつき取得までの待ち（fallback）。
-const LIGHT_SETTLE_MS = 2000;  // light: SSE 接続中に「反映中…」を畳むまでの待ち（通信しない）。
+const LIGHT_SETTLE_MS = 2000;  // light: 押下後に push を待つ見張りの猶予（空振りなら読む）。
 
 const app = document.getElementById("app");
 const cards = new Map();  // device name -> {statusEl, labelEl, msgEl, buttons, state}
@@ -567,8 +567,9 @@ function buildLightTile(dev) {
     lastSat: 100,
     lastBright: 100, // シート再訪時の明るさスライダー初期位置（現在値は state に出ない）
     catchupTimer: null, // 追いつき取得タイマー（SSE 断時のみ。device ごとに 1 本、連打時は張り直し）
-    settleTimer: null,  // SSE 接続中の「反映中…」後始末タイマー（通信しない）
+    settleTimer: null,  // push 待ちの見張りタイマー（空振りしたら追いつき取得へ落ちる）
     pendingPush: false, // 押下後、push が降りてくるのを待っているか（見張り用）
+    pushSeq: 0,         // このタイル宛に push を受けた回数（POST 中の到着検出用）
   };
   el.querySelector(".bulb").addEventListener("click", () =>
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
@@ -804,6 +805,9 @@ async function lightAct(name, verb, path, body) {
   busyCount++;
   setDeviceBusy(name, true);
   if (c) c.msgEl.textContent = verb;
+  // POST 中に push が届いたかを見るための基準。届いていればもう確定済みなので
+  // 「反映中…」へ戻さない（このデバイスの変化そのものが降ってきている）。
+  const seenPushes = c ? (c.pushSeq | 0) : 0;
   try {
     const view = await api("POST", path, body);
     const am = ACTION_MSG[view.action] || "";
@@ -814,6 +818,12 @@ async function lightAct(name, verb, path, body) {
       rerenderKnown(name);
       c.msgEl.textContent = "⚠ " + am;
       c.statusEl.classList.add("error");
+    } else if (sseOpen && (c.pushSeq | 0) !== seenPushes) {
+      // POST 中に push が届いた = すでに確定済み。中間表示にも見張りにも
+      // 戻さず、降ってきた state をそのまま残す。
+      clearLightTimers(c);
+      c.statusEl.classList.remove("error");
+      c.msgEl.textContent = "";
     } else {
       // 成功 = 送信できただけ。中間表示にして反映を待つ。
       // 張り直す前に両方止める。sseOpen が前回操作との間で反転していると、
@@ -876,29 +886,38 @@ function scheduleLightWatchdog(name) {
     c.settleTimer = null;
     if (!c.pendingPush) return; // push が来て解除済み
     c.pendingPush = false;
-    // 押しても状態が変わらなかった場合もここに来る（変化がなければ
-    // サーバは broadcast しない）。読み直せば「反映中…」も畳める。
-    scheduleLightCatchup(name);
+    // 見張りの待ちが settle 相当なので、ここからは待たずに読む。
+    catchupLightNow(name);
   }, LIGHT_SETTLE_MS);
 }
 
+/* 状態を 1 回取得して描く。追いつき取得の実体。busy（連打中・一括操作中）なら
+   延期して再アームし、ボタンが空き次第 1 回だけ取得する。 */
+function catchupLightNow(name) {
+  const c = cards.get(name);
+  if (!c) return;
+  if (c.buttons.some((b) => b.disabled)) {
+    if (c.catchupTimer) clearTimeout(c.catchupTimer);
+    c.catchupTimer = setTimeout(() => {
+      c.catchupTimer = null;
+      catchupLightNow(name);
+    }, LIGHT_CATCHUP_MS);
+    return;
+  }
+  api("GET", `/api/devices/${encodeURIComponent(name)}/state`)
+    .then((view) => renderState(name, view))
+    // 外れていても次の操作 or ページ再表示で直る。
+    .catch(() => {});
+}
+
+/* SSE が切れているときの経路: 操作の LIGHT_CATCHUP_MS 後に 1 回だけ取得する。 */
 function scheduleLightCatchup(name) {
   const c = cards.get(name);
   if (!c) return;
-  if (c.catchupTimer) clearTimeout(c.catchupTimer); // 連打時は張り直し
-  c.catchupTimer = setTimeout(async () => {
+  if (c.catchupTimer) clearTimeout(c.catchupTimer);
+  c.catchupTimer = setTimeout(() => {
     c.catchupTimer = null;
-    // busy（連打中・一括操作中）なら延期して再アーム。ボタンが空き次第 1 回だけ取得する。
-    if (c.buttons.some((b) => b.disabled)) {
-      scheduleLightCatchup(name);
-      return;
-    }
-    try {
-      const view = await api("GET", `/api/devices/${encodeURIComponent(name)}/state`);
-      renderState(name, view);
-    } catch (e) {
-      // 外れていても次の操作 or ページ再表示で直る。
-    }
+    catchupLightNow(name);
   }, LIGHT_CATCHUP_MS);
 }
 
@@ -936,7 +955,10 @@ function startEvents() {
     try { ev = JSON.parse(e.data); } catch (_) { return; }
     if (!ev || !ev.device) return;
     const c = cards.get(ev.device);
-    if (c) c.pendingPush = false; // push が来た = 見張り解除
+    if (c) {
+      c.pendingPush = false; // push が来た = 見張り解除
+      c.pushSeq = (c.pushSeq | 0) + 1;
+    }
     renderState(ev.device, ev);
   });
 }

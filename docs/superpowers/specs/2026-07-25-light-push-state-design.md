@@ -205,6 +205,13 @@ API バージョニングはしない（利用者は同梱 UI のみ）。
 
 ## クライアント（index.html）
 
+> **実装時の訂正:** 「SSE 接続中は `scheduleLightCatchup` を張らない」は、
+> `sseOpen`（ブラウザとの socket の生死）を「push が届く」の代わりに使って
+> いる点が誤り。node_id 未設定・`mat` が古い・`matd` 停止・node_id ドリフトでは
+> イベントが永久に来ないので、押下後の確認をやめると押下前の状態を確定値
+> として出してしまう。実装は「押下後 `LIGHT_SETTLE_MS` の間 push を待つ
+> 見張りを置き、空振りなら追いつき取得へ落ちる」形になっている。
+
 - `EventSource("/api/events")` を張り、light の状態イベントで **既存の `renderState` を呼ぶ**
   （描画ロジックは再利用。`source` / `stale` の扱いも `renderState` 側に寄せる）。
 - SSE 接続中は `scheduleLightCatchup` を**張らない**。接続が切れていれば従来どおり張る
@@ -229,6 +236,13 @@ API バージョニングはしない（利用者は同梱 UI のみ）。
 - 別端末（or curl）で on → **開いている UI がポーリングなしで反映**されること。
 - matd を再起動 → listener が再接続し、再ベースライン後に再び `source: "push"` へ戻ること。
 - 検証は夜間を避け、終了時は必ず元の on/off 状態へ戻す。
+
+> **実装時の訂正:** e2e の `source: "push"` という判定条件は、再ベースライン
+> read で基準値が確立した直後には成立しない — その値の出どころは read なので
+> `source: "read"` を返す（これが正しい。`/state` と `/api/events` が同じ値で
+> 食い違わないよう、出どころは state を導く値と同じ粒度で持っている）。
+> `source: "push"` になるのは実際に listen イベントを受けたあと。判定は
+> 「`exec` が付かない・即答である」で行うこと。
 
 `cargo clippy -- -D warnings` がクリーンであること。
 

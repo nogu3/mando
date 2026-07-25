@@ -218,12 +218,24 @@ impl PushStore {
     }
 
     /// 操作を送ったので基準値を落とす。次の GET は read で実機を見に行く
-    /// （push イベントが先に来ればそれが基準値になり、read は起きない）。
+    /// （push イベントが来ればそれが基準値になり、read は起きない）。
     /// 送信できたことは状態の確認ではないので、押下前の値を primed の
     /// まま出し続けてはいけない（原則 7）。
+    ///
+    /// 同じ代表ノードを共有する論理デバイス（グループカードとそのメンバー）は
+    /// まとめて落とす — `apply` がイベントを全員に配るのと同じ範囲。1 台への
+    /// 操作が他方の実状態も動かすので、片方だけ primed に残してはいけない。
     pub fn invalidate(&self, device: &str) {
+        let siblings: Vec<String> = self
+            .by_node
+            .values()
+            .find(|devices| devices.iter().any(|d| d == device))
+            .cloned()
+            .unwrap_or_else(|| vec![device.to_string()]);
         let mut inner = self.lock();
-        inner.slots.remove(device);
+        for d in &siblings {
+            inner.slots.remove(d);
+        }
     }
 
     /// listener からの 1 イベントを取り込む。突合できる論理デバイスが
@@ -629,6 +641,22 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_covers_devices_sharing_a_node() {
+        let s = connected_store();
+        s.apply(&onoff_event(5, true));
+        assert_eq!(primed(&s, "living_lights"), Some(State::On));
+        assert_eq!(primed(&s, "living_south_light"), Some(State::On));
+        // グループカードへの操作は同じ代表ノードのメンバーも動かす。
+        s.invalidate("living_lights");
+        assert_eq!(primed(&s, "living_lights"), None);
+        assert_eq!(
+            primed(&s, "living_south_light"),
+            None,
+            "同じ代表ノードを共有するデバイスも基準値を落とす"
+        );
+    }
+
+    #[test]
     fn broadcasts_only_on_state_change() {
         let s = connected_store();
         let mut rx = s.subscribe();
@@ -695,7 +723,7 @@ mod tests {
             r#"printf '{"node_id":6,"cluster":"onoff","attribute":"on-off","value":true}\n'; "#,
             r#"printf 'garbage\n'; "#,
             r#"printf '{"node_id":6,"cluster":"onoff","attribute":"on-off","value":false}\n'; "#,
-            r#"exec sleep 30"#,
+            r#"exec sleep 8"#,
         );
         let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
         // 子は自分で終わらないので、依頼が届くまで待ってから見る。

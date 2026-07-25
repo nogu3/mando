@@ -512,6 +512,14 @@ struct LightActionView {
 
 /// exec のみ実行して送信結果を返す（state 再取得なし）。light 用。
 async fn run_light_action(app: &App, device: &Device, cmd: &[String]) -> LightActionView {
+    // 送る前に基準値を落とす。送信できたことは状態の確認ではないので、
+    // 押下前の値を primed のまま出し続けてはいけない（原則 7）。exec の間
+    // （warm でも ~100ms、ハング時は timeout まで）押下前の値を stale:false で
+    // 出さないため、また exec 中に届いた push を後から消してしまわないため、
+    // 順序が肝（先に落とせば、その push がそのまま新しい基準値になる）。
+    if let Some(store) = &app.push {
+        store.invalidate(&device.name);
+    }
     let result = run_bounded(&app.executor, device.exec_lane(), cmd, app.exec_timeout()).await;
     if result.outcome != ExecOutcome::Success {
         tracing::warn!(
@@ -520,11 +528,6 @@ async fn run_light_action(app: &App, device: &Device, cmd: &[String]) -> LightAc
             stderr = %result.stderr.trim(),
             "set 非成功"
         );
-    }
-    // 送信した = 状態が変わったかもしれない。基準値を落として、次の read が
-    // 実機を見に行くようにする（push が先に来ればそれが基準値になる）。
-    if let Some(store) = &app.push {
-        store.invalidate(&device.name);
     }
     LightActionView {
         action: result.outcome,
@@ -2276,6 +2279,28 @@ mod tests {
         // 走らなかった exec の成功を騙らない。
         assert!(v.get("exec").is_none(), "push 即答に exec は付けない: {v:?}");
         assert_eq!(exec_count(&p), 0, "primed のとき exec は 1 回も走らない");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// push 由来の基準値は push と名乗る（read 由来と取り違えない）。
+    /// /state と /api/events の source が食い違わないための釘。
+    #[tokio::test]
+    async fn push_derived_state_reports_push_source() {
+        let p = tmp_counter("pushsrc");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.apply(&normalize::PushEvent {
+            node_id: 5,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+            value: serde_json::json!(true),
+        });
+
+        let (_, v) = call_on(app, "GET", "/api/devices/light/state").await;
+        assert_eq!(v["state"], "on");
+        assert_eq!(v["source"], "push");
+        assert_eq!(exec_count(&p), 0, "push 由来なので exec は走らない");
         std::fs::remove_file(&p).ok();
     }
 
