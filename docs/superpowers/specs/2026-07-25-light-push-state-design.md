@@ -138,9 +138,22 @@ B（明るさ・色）のときは **`levelcontrol/current-level` や `colorcont
 
 ## config
 
+> **実装時の訂正（2026-07-25）:** 下の `listen` 例は `--count` が抜けていて誤り。
+> `mat listen --count` は既定 **1** で「この件数を受けたら exit 0」という意味
+> （`range(1..)` なので 0 = 無限は無い）。この例ではイベント 1 件でプロセスが
+> 終了し、毎イベントごとに listener が再起動して再ベースライン read が走る —
+> 本設計が消したかった read がそのまま戻ってくる。正しくは実質無限（u32 上限）を
+> 渡す:
+>
+> ```toml
+> listen = ["mat", "listen", "--count", "4294967295", "--timeout-ms", "0"]
+> ```
+>
+> 実装済みの例は `config.example.toml` を参照。
+
 ```toml
 [push]                                   # セクションごと任意。無ければ現状動作のまま
-listen = ["mat", "listen", "--timeout-ms", "0"]   # 0 = 無期限
+listen = ["mat", "listen", "--timeout-ms", "0"]   # ← 誤り。上の訂正を参照
 
 [[device]]
 name  = "living_lights"
