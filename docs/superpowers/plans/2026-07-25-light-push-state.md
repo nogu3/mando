@@ -1780,13 +1780,15 @@ pub struct PushStore {
 > この Task はその**シグネチャを変えない** — 中の `Self::update` 呼び出しを
 > `self.update(..., source)` にするだけ。
 
-`set_connected` の doc に「断そのものは broadcast しない」理由を追記:
+`set_connected` の doc に「断そのものは broadcast しない」理由を追記する。
+**本文（`generation` の bump と無条件 `slots.clear()`）は Task 4 のレビュー修正で
+入ったものなので触らない** — doc コメントだけ、既にある 4 行の下に段落を足す:
 
 ```rust
-    /// listener の接続状態を切り替える。false にすると全デバイスの基準値を
-    /// 捨てる（切れていた間に状態が変化した可能性があり、`mat listen` は
-    /// 新規クライアント接続へ priming を replay しないため、再 read が唯一の
-    /// 正しい復旧手段）。
+    /// listener の接続状態を切り替える。切り替えのたびに全デバイスの基準値を
+    /// 捨てる。断で捨てるのは必須（切れていた間に状態が変化した可能性があり、
+    /// `mat listen` は新規クライアント接続へ priming を replay しないため、
+    /// 再 read が唯一の正しい復旧手段）。復帰でも捨てるのは構造的な保証。
     ///
     /// 断そのものは broadcast しない — 静止したライトの値は断の間もほぼ
     /// 正しく、再接続直後の再ベースライン read が差分を必ず broadcast する。

@@ -135,11 +135,11 @@ async fn main() {
         }
     };
 
-    // bind に成功してから listener を起こす。bind 失敗の exit(1) では
+    // bind に成功してから push listener を起こす。bind 失敗の exit(1) では
     // デストラクタが走らず kill_on_drop が効かないため、先に起こすと
     // mat listen の子プロセスが取り残される。
     if let Some(store) = store {
-        start_push(app.clone(), store);
+        start_push(app, store);
     }
 
     axum::serve(listener, router)

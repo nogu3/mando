@@ -132,10 +132,10 @@ impl PushStore {
         self.lock().generation
     }
 
-    /// listener の接続状態を切り替える。false にすると全デバイスの基準値を
-    /// 捨てる（切れていた間に状態が変化した可能性があり、`mat listen` は
-    /// 新規クライアント接続へ priming を replay しないため、再 read が唯一の
-    /// 正しい復旧手段）。
+    /// listener の接続状態を切り替える。切り替えのたびに全デバイスの基準値を
+    /// 捨てる。断で捨てるのは必須（切れていた間に状態が変化した可能性があり、
+    /// `mat listen` は新規クライアント接続へ priming を replay しないため、
+    /// 再 read が唯一の正しい復旧手段）。復帰でも捨てるのは構造的な保証。
     pub fn set_connected(&self, connected: bool) {
         let mut inner = self.lock();
         inner.connected = connected;
@@ -209,6 +209,7 @@ pub async fn run_listener(
     loop {
         let started = Instant::now();
         match run_once(&cmd, &store, &rebaseline).await {
+            // code=None は猶予超過で mando が kill した場合（直前に warn 済み）。
             Ok(status) => tracing::warn!(code = ?status.code(), "push listener が終了した"),
             Err(e) => tracing::warn!(error = %e, "push listener を起動できない"),
         }
