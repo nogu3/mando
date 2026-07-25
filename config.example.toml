@@ -22,6 +22,24 @@ timeout_ms = 15000
 [cache]
 state_ttl_ms = 2000   # 既定 2000。0 = TTL 無効（同時読みの合流のみ）
 
+# ── light 状態の push 取り込み（[push]、任意）──────────────────
+# 未設定ならこの機能ごと無効で、既存挙動と 1 バイトも変わらない。
+#
+# light の on/off は groupcast（無応答マルチキャスト）なので物理は即反応するが、
+# 確認 read は代表ノードへの unicast で、matd がまだ購読していないノードの
+# 初回は CASE cold-start を踏んで極端に遅い（実測 3.6〜80 秒。2 発目以降は
+# ~100ms）。read をやめて matd の常駐 Subscribe から push で state を得れば
+# cold-start は原理的に消える。これはその pull → push 移行の設定。
+#
+# listen は無期限ストリームなので、[exec] timeout_ms もレーン直列化も通らない
+# （通すと即座に打ち切られる）。--count は「この件数を受けたら exit 0」なので
+# 実質無限（u32 上限）を渡す。--timeout-ms 0 は無期限待ち。
+# 落ちたら mando が指数 backoff（1s→30s）で再起動し、そのたび全 light の
+# 基準値を捨てて read で再ベースラインする（この read が購読を誘発する）。
+#
+# [push]
+# listen = ["mat", "listen", "--count", "4294967295", "--timeout-ms", "0"]
+
 [[device]]
 name      = "shutter"        # URL とフロントが使う安定識別子（変えると URL が変わる）
 alias     = "シャッター"     # UI 表示名（任意。未指定なら name。`label` でも可）
@@ -71,6 +89,13 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # name  = "desk_light"
 # alias = "デスクライト"
 # kind  = "light"
+# push イベントの突合キー（light 専用・任意。[push] を使うときだけ意味がある）。
+# listen イベントは {"node_id": 5, ...} と数値で来るので、config 側も数値で持つ。
+# 機器を commission した結果決まるデプロイデータなので、実 IP・EPC と同じクラス
+# のものとして config に置く（read の戻り値からは学習しない — 学習には read 成功が
+# 要り、その read こそが cold で遅い／失敗するもの）。node 番号は `mat discover` で確認。
+# 未指定の light はそのデバイスだけ従来の read 経路のままになり、起動時に warn が出る。
+# node_id = 5
 # get_state = ["mat", "read", "--node", "5", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "on",  "--node", "5"]
 # off   = ["mat", "off", "--node", "5"]
@@ -105,7 +130,9 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # 注意: light は [[group]]（シャッター用）には入れられない。light 同士をまとめるには
 # 下の「light のグループカード（members）」を使う。
 # 注意: light は定期ポーリングしない（mat 直叩きは 1 コール数秒 + exec 直列のため）。
-#       表示時 1 回 + 操作の ~2 秒後に 1 回の追いつき取得のみ（ベストエフォート表示）。
+#       [push] 未設定なら「表示時 1 回 + 操作の ~2 秒後に 1 回の追いつき取得」のみ。
+#       [push] + node_id があれば状態は listen から push で降ってきて、GET state は
+#       exec ゼロで即答する（UI へは /api/events の SSE で流れ、別端末の操作も反映される）。
 #
 # ── mat の wire group（groupcast）でまとめて操作する場合 ──────────────
 # group は無応答マルチキャストで state を読めないため、get_state は代表ノード
@@ -154,6 +181,9 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # name  = "living_lights"
 # alias = "リビング照明"
 # kind  = "light"
+# 代表ノードは複数の論理デバイスで共有してよい（グループカードとそのメンバーが
+# 同じノードを代表にする構成）。1 件の push イベントが両方に反映される。
+# node_id = 6
 # get_state = ["mat", "read", "--node", "6", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "on"]
 # off   = ["mat", "group", "invoke", "--group", "10", "--cluster", "onoff", "--command", "off"]
@@ -163,6 +193,7 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # [[device]]
 # name  = "living_south_light"
 # kind  = "light"
+# node_id = 6
 # get_state = ["mat", "read", "--node", "6", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "on",  "--node", "6"]
 # off   = ["mat", "off", "--node", "6"]
@@ -170,6 +201,7 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # [[device]]
 # name  = "tv_back_light"
 # kind  = "light"
+# node_id = 7
 # get_state = ["mat", "read", "--node", "7", "--cluster", "onoff", "--attribute", "on-off"]
 # on    = ["mat", "on",  "--node", "7"]
 # off   = ["mat", "off", "--node", "7"]

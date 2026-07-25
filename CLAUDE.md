@@ -41,6 +41,15 @@
 
 6. **状態は pull、ただしアクティブ窓の間だけ。** 下層は one-shot で状態を持たないので push する主体がいない。UI は表示時に 1 回取得し、操作後 2 分間（`opening`/`closing` が見えている間は延長、直近トリガーから上限 10 分）だけ 3〜5 秒ポーリングする。窓の外ではポーリングしない（静止したシャッターの状態は勝手に変わらない）。INF 通知を拾うための常駐化は下層の思想に反するのでやらない。
 
+   > **light の例外（Matter）:** matd は常駐 Subscribe を持つので、light には push する
+   > 主体がいる。`[push]` を設定すると mando は `mat listen` を長寿命サブプロセスとして
+   > 張り、状態を in-memory に持って `/api/events`（SSE）でブラウザまで push する。
+   > 値の古さは TTL で腐らせず、信頼できるかどうかは **listener が生きているか**だけで
+   > 決まる（primed なら exec ゼロで即答、unprimed／断なら read、それも失敗なら
+   > `stale: true`）。「INF 通知のための常駐化はしない」は **echonet 限定**の話で、
+   > Matter は matd が常駐購読を持つのが mat ファミリの設計なので、この非対称は意図的
+   > （`docs/superpowers/specs/2026-07-25-light-push-state-design.md`）。
+
 7. **成否を正直に出す。** set は普通に失敗する（timeout / SNA / network）。**set 後は必ず state を取り直し、実際の開閉を確認してから表示**する。「閉じました」を楽観表示しない。`enl` の終了コードを明確な UI 状態へ写す:
 
    | code | 意味 | UI |
@@ -55,6 +64,9 @@
    > 送信結果（`{"action": ...}`）のみ正直に返し、state は UI が押下 ~2 秒後に 1 回だけ
    > 非同期で追いつき取得するベストエフォート表示とする
    > （`docs/superpowers/specs/2026-07-10-light-async-state-design.md`）。
+   > `[push]` を設定している場合、この追いつき取得は不要で状態は SSE で降ってくる
+   > （追いつき取得は SSE 断時の fallback として残る。
+   > `docs/superpowers/specs/2026-07-25-light-push-state-design.md`）。
    > shutter は本原則どおり set 後の同期確認を維持する。
 
 8. **`index.html` はバイナリに焼く（`include_str!`）、config は外に置く。** UI はプログラムの一部なので焼き込み、単一バイナリで配る。実 IP / EPC は設置環境ごとのデプロイデータで、再コンパイルなしに書き換えられるべき＝外出し。`casa` の「設定は外」原則とも揃う。成果物は **バイナリ 1 個 + `config.toml`**。
@@ -71,6 +83,7 @@
 - `GET  /api/graphs` — config 上のグラフ一覧（きろくセクション）
 - `GET  /api/graphs/{name}?period=today|week|month` — graph query テンプレを exec → 正規化した系列 `{ "series": [...] }`
 - `GET  /api/health` — health テンプレを exec → 正規化 `{ "label"?, "worst": "ok|warn|crit|stale", "items": [...] }`（`[health]` 未設定なら 404）
+- `GET  /api/events` — light の状態変化を SSE で push（接続直後に全 light の現在スナップショット。`[push]` 未設定なら 404）
 - `GET  /mesh` — 焼き込んだ `mesh.html` を返す（`[mesh]` 未設定なら 404）
 - `GET  /api/mesh` — 取得ジョブの状態とスナップショット（即答）。`{ "status": "empty|running|idle|failed", "stale": bool, "snapshot"?: {...} }`
 - `POST /api/mesh/refresh` — mesh 取得ジョブを起動（202・single-flight）

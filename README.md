@@ -21,7 +21,7 @@ MANDO_CONFIG=./config.toml ./target/release/mando
 
 - `GET  /` — 焼き込んだ UI
 - `GET  /api/devices` — 論理デバイス一覧
-- `GET  /api/devices/{name}/state` — `{ state, exec, raw }`（`state` は shutter: `open|closed|…`、light: `on|off`、想定外は `unknown`）
+- `GET  /api/devices/{name}/state` — `{ state, exec, raw }`（`state` は shutter: `open|closed|…`、light: `on|off`、想定外は `unknown`）。`[push]` 管理下の light は `source`（`push`｜`read`）と `stale` が付き、push 即答では `exec` を省く（走らなかった exec の成功を騙らない）
 - `POST /api/devices/{name}/open` — open → **直後に state 再取得** → `{ action, state, exec, raw }`
 - `POST /api/devices/{name}/close` — 同上（close）
 - `POST /api/devices/{name}/on` — light を点灯 → **直後に state 再取得**（`state: "on|off|unknown"`）
@@ -31,6 +31,17 @@ MANDO_CONFIG=./config.toml ./target/release/mando
 `state` は set 後に必ず取り直した確定値（楽観表示しない）。`action` / `exec` は
 subprocess の終了コードを写したもの: `success` / `timeout` / `rejected` /
 `network_error` / `failed` / `spawn_failed`。
+
+- `GET  /api/events` — light の状態変化を SSE で push（`[push]` 未設定なら 404）。接続直後に全 light の現在スナップショットを 1 発送り、以後は変化のたび `{"device","state","source","stale"}` を 1 件
+
+> light の on/off は groupcast なので物理は即反応するが、確認 read は代表ノードへの
+> unicast で、matd がまだ購読していないノードの初回は CASE cold-start で極端に遅い
+> （実測 3.6〜80 秒）。`[push]` を設定すると mando は `mat listen` を長寿命
+> サブプロセスとして張り、状態を in-memory に持って即答する（primed なら exec ゼロ）。
+> 値の古さは TTL で腐らせない — 信頼できるかどうかは listener が生きているかだけで
+> 決まる。unprimed／listener 断なら read で確定し、それも失敗なら `stale: true` で
+> 正直に出す。shutter は ECHONET で push の主体がいないので従来どおり
+> （set 後の同期確認 + アクティブ窓ポーリング）。
 
 - `GET  /mesh` — Thread メッシュの表示画面（`[mesh]` 未設定なら 404）。トップからはリンクしない
 - `GET  /api/mesh` — 取得ジョブの状態とスナップショット（即答）
