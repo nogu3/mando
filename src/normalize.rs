@@ -134,6 +134,64 @@ pub fn read_node_id(raw: &Value) -> Option<u64> {
     raw.get("node_id").and_then(Value::as_u64)
 }
 
+/// PushStore の汎用マップのキー（`"onoff/on-off"` 形）。
+/// 明るさ・色を足すときはここに別の属性が増えるだけ。
+pub fn attr_key(cluster: &str, attribute: &str) -> String {
+    format!("{cluster}/{attribute}")
+}
+
+/// state に写す属性（Matter 固有の知識）。
+pub const ONOFF_KEY: &str = "onoff/on-off";
+
+/// 論理 state → `onoff/on-off` の値表現。read で確定した基準値を push の
+/// 汎用マップに載せるための逆写像（On / Off 以外は載せない）。
+pub fn state_to_onoff_value(state: State) -> Option<Value> {
+    match state {
+        State::On => Some(Value::Bool(true)),
+        State::Off => Some(Value::Bool(false)),
+        _ => None,
+    }
+}
+
+/// `mat listen` の 1 イベント。下層固有の形をここで吸収し、push.rs は
+/// この構造体しか見ない（設計原則 4）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PushEvent {
+    pub node_id: u64,
+    pub cluster: String,
+    pub attribute: String,
+    pub value: Value,
+}
+
+/// listen の 1 行 → PushEvent。
+///
+/// mat listen の実出力例:
+/// `{"timestamp":"...","node_id":5,"endpoint":1,"cluster":"onoff",
+///   "attribute":"on-off","value":true,"priming":false,"recovered":false}`
+///
+/// cluster / attribute は既知 ID なら chip-tool 記法名、未知なら数値で来るので
+/// どちらも受けて文字列キーへ正規化する。node_id / cluster / attribute / value
+/// のいずれかが欠けた行・ack 行（`{"listening":true}`）・壊れた JSON は None。
+/// `priming` / `recovered` は区別しない — どちらもその時点の実値を運ぶ。
+pub fn parse_mat_listen_event(line: &str) -> Option<PushEvent> {
+    let raw: Value = serde_json::from_str(line).ok()?;
+    Some(PushEvent {
+        node_id: raw.get("node_id")?.as_u64()?,
+        cluster: name_or_number(raw.get("cluster")?)?,
+        attribute: name_or_number(raw.get("attribute")?)?,
+        value: raw.get("value")?.clone(),
+    })
+}
+
+/// cluster / attribute の値（chip-tool 記法名 or 数値 ID）を文字列キーへ。
+fn name_or_number(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// グラフ 1 系列。契約 JSON の行を series 別に束ねたもの。
 #[derive(Debug, PartialEq, Serialize)]
 pub struct GraphSeries {
@@ -589,6 +647,78 @@ pub fn normalize_mesh(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_listen_event() {
+        let ev = parse_mat_listen_event(
+            r#"{"timestamp":"2026-07-20T21:00:00+09:00","node_id":5,"endpoint":1,"cluster":"onoff","attribute":"on-off","value":true,"priming":false,"recovered":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            PushEvent {
+                node_id: 5,
+                cluster: "onoff".into(),
+                attribute: "on-off".into(),
+                value: json!(true),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_listen_event_with_numeric_ids() {
+        // 未知 cluster / attribute は数値のまま来る（mat の read と同じ規律）。
+        let ev = parse_mat_listen_event(
+            r#"{"node_id":9,"cluster":1234,"attribute":7,"value":42}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.cluster, "1234");
+        assert_eq!(ev.attribute, "7");
+        assert_eq!(ev.value, json!(42));
+    }
+
+    #[test]
+    fn rejects_malformed_listen_lines() {
+        for line in [
+            "",
+            "not json",
+            "[]",
+            // ack 行（mat は読み捨てるが、来ても落ちない）
+            r#"{"listening":true}"#,
+            // value 欠落
+            r#"{"node_id":5,"cluster":"onoff","attribute":"on-off"}"#,
+            // node_id 欠落
+            r#"{"cluster":"onoff","attribute":"on-off","value":true}"#,
+            // node_id が数値でない
+            r#"{"node_id":"5","cluster":"onoff","attribute":"on-off","value":true}"#,
+            // node_id が負
+            r#"{"node_id":-1,"cluster":"onoff","attribute":"on-off","value":true}"#,
+            // cluster が文字列でも数値でもない
+            r#"{"node_id":5,"cluster":null,"attribute":"on-off","value":true}"#,
+        ] {
+            assert!(
+                parse_mat_listen_event(line).is_none(),
+                "受けてはいけない行: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_to_onoff_value_is_the_inverse() {
+        assert_eq!(state_to_onoff_value(State::On), Some(json!(true)));
+        assert_eq!(state_to_onoff_value(State::Off), Some(json!(false)));
+        assert_eq!(state_to_onoff_value(State::Unknown), None);
+        assert_eq!(state_to_onoff_value(State::Open), None);
+    }
+
+    #[test]
+    fn attr_key_joins_cluster_and_attribute() {
+        assert_eq!(attr_key("onoff", "on-off"), ONOFF_KEY);
+        assert_eq!(
+            attr_key("levelcontrol", "current-level"),
+            "levelcontrol/current-level"
+        );
+    }
 
     #[test]
     fn onoff_value_maps_bool_only() {

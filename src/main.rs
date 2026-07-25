@@ -7,6 +7,7 @@ mod cache;
 mod config;
 mod exec;
 mod normalize;
+mod push;
 
 use std::sync::Arc;
 
@@ -55,6 +56,9 @@ struct App {
     /// mesh 取得ジョブの状態とスナップショット（1 スロット・メモリ内）。
     /// 永続化しない — mando 再起動で empty に戻る。
     mesh_job: std::sync::Mutex<MeshJob>,
+    /// light 状態の push ストア（[push] 未設定なら None）。
+    /// 永続化しない — mando 再起動で unprimed から始めてよい。
+    push: Option<Arc<push::PushStore>>,
 }
 
 impl App {
@@ -106,6 +110,11 @@ async fn main() {
 
     warn_missing_node_ids(&config);
 
+    let store = config
+        .push
+        .as_ref()
+        .map(|_| Arc::new(push::PushStore::new(&config)));
+
     let app = Arc::new(App {
         config,
         executor: Executor::new(),
@@ -113,9 +122,14 @@ async fn main() {
         mesh_executor: Executor::new(),
         state_cache: cache::Cache::default(),
         mesh_job: std::sync::Mutex::new(MeshJob::default()),
+        push: store.clone(),
     });
 
-    let router = router(app);
+    if let Some(store) = store {
+        start_push(app.clone(), store);
+    }
+
+    let router = router(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,
@@ -148,6 +162,54 @@ fn warn_missing_node_ids(config: &Config) {
             tracing::warn!(
                 device = %d.name,
                 "kind=light に node_id が無い: push を使わず従来の read 経路のまま"
+            );
+        }
+    }
+}
+
+/// listener と再ベースライン受け口を起動する。どちらも起動をブロックしない。
+fn start_push(app: Shared, store: Arc<push::PushStore>) {
+    let listen = app
+        .config
+        .push
+        .as_ref()
+        .expect("start_push は [push] 有りでのみ呼ぶ")
+        .listen
+        .clone();
+
+    // 再ベースライン read は既存の executor / lane / timeout の枠内で行う。
+    // listener 側をブロックしないよう別タスクで受ける。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let rebased = app.clone();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            rebaseline_push_devices(rebased.clone()).await;
+        }
+    });
+
+    tokio::spawn(async move { push::run_listener(listen, store, tx).await });
+}
+
+/// push 管理下の全 light の基準値を read で確定する。購読の誘発も兼ねるので
+/// 起動時・listener 再接続時に必ず 1 周する（cold-start はこの read で解ける）。
+/// 逐次に回す — 一斉に CASE を張らせない。
+async fn rebaseline_push_devices(app: Shared) {
+    let Some(store) = app.push.clone() else {
+        return;
+    };
+    for device in &app.config.devices {
+        if !store.tracks(&device.name) {
+            continue;
+        }
+        let view = fetch_state(&app, device).await;
+        if view.exec == Some(ExecOutcome::Success) {
+            store.baseline(&device.name, view.state);
+            tracing::debug!(device = %device.name, state = ?view.state, "push 基準値を確定");
+        } else {
+            tracing::warn!(
+                device = %device.name,
+                outcome = ?view.exec,
+                "push 基準値の read に失敗（unprimed のまま）"
             );
         }
     }
@@ -252,6 +314,12 @@ struct StateView {
     exec: Option<ExecOutcome>,
     /// 下層の生 JSON（パースできた場合のみ。デバッグ用）。
     raw: Option<Value>,
+    /// push 管理下の light のみ。"push" = in-memory 即答 / "read" = 下層読み。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
+    /// push 管理下の light のみ。値を信頼できないとき true（原則 7）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale: Option<bool>,
 }
 
 /// get_state を実行し、正規化した状態を返す。
@@ -275,6 +343,8 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
             state: DeviceState::Unknown,
             exec: Some(result.outcome),
             raw: None,
+            source: None,
+            stale: None,
         };
     }
 
@@ -289,6 +359,8 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
                 },
                 exec: Some(result.outcome),
                 raw: Some(raw),
+                source: None,
+                stale: None,
             }
         }
         Err(e) => {
@@ -297,6 +369,8 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
                 state: DeviceState::Unknown,
                 exec: Some(result.outcome),
                 raw: None,
+                source: None,
+                stale: None,
             }
         }
     }
@@ -330,6 +404,12 @@ async fn cached_state(app: &App, device: &Device) -> StateView {
     // 経由せず常に fresh fetch_state を返す（store もしないので read/write とも
     // キャッシュに一切触れない）。
     if device.kind == Kind::Light {
+        // push 管理下なら primed 値で即答（exec ゼロ）→ read フォールバック。
+        if let Some(store) = &app.push {
+            if store.tracks(&device.name) {
+                return push_state(app, store, device).await;
+            }
+        }
         return fetch_state(app, device).await;
     }
 
@@ -341,6 +421,30 @@ async fn cached_state(app: &App, device: &Device) -> StateView {
             (view, cacheable)
         })
         .await
+}
+
+/// push 管理下 light の state（正直さの三段構え）:
+/// primed なら in-memory 即答、unprimed／listener 断なら read で確定、
+/// それも失敗なら `stale: true` で正直に出す。
+async fn push_state(app: &App, store: &Arc<push::PushStore>, device: &Device) -> StateView {
+    if let Some(state) = store.primed_state(&device.name) {
+        return StateView {
+            state,
+            exec: None,
+            raw: None,
+            source: Some(push::SOURCE_PUSH),
+            stale: Some(false),
+        };
+    }
+    let mut view = fetch_state(app, device).await;
+    let ok = view.exec == Some(ExecOutcome::Success);
+    if ok {
+        // 確定できた値を基準値にする（＝以後は exec ゼロで即答できる）。
+        store.baseline(&device.name, view.state);
+    }
+    view.source = Some(push::SOURCE_READ);
+    view.stale = Some(!ok);
+    view
 }
 
 async fn get_state(State(app): State<Shared>, Path(name): Path<String>) -> Response {
@@ -1144,6 +1248,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         })
     }
 
@@ -1157,6 +1262,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         })
     }
 
@@ -1399,6 +1505,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         });
         let res = router(app)
             .oneshot(
@@ -1816,6 +1923,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         };
         let device = app.config.find("slow").unwrap();
         let start = Instant::now();
@@ -1851,6 +1959,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         })
     }
 
@@ -1918,6 +2027,7 @@ mod tests {
             mesh_executor: Executor::new(),
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: None,
         })
     }
 
@@ -1951,6 +2061,136 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["state"], "open");
         assert_eq!(v["exec"], "success");
+        assert!(v.get("source").is_none());
+        assert!(v.get("stale").is_none());
+    }
+
+    /// get_state が exec のたびに 1 文字追記する push 管理下 light を持つ App。
+    /// `[push]` を持つので App.push が入るが、listener は起動しない
+    /// （テストは store を直接動かす）。
+    fn push_app(counter_path: &str, ok: bool) -> Shared {
+        // ok: node_id 付きの mat read 出力を返す / !ok: exit 3（timeout）。
+        let light_get = if ok {
+            format!(
+                r#"["sh", "-c", "printf x >> {counter_path}; printf '{{\"node_id\":5,\"value\":true}}'"]"#
+            )
+        } else {
+            format!(r#"["sh", "-c", "printf x >> {counter_path}; exit 3"]"#)
+        };
+        let plain_get =
+            format!(r#"["sh", "-c", "printf x >> {counter_path}; printf '{{\"value\":true}}'"]"#);
+        let cfg: Config = toml::from_str(&format!(
+            r##"
+            [push]
+            listen = ["true"]
+            [[device]]
+            name = "light"
+            kind = "light"
+            node_id = 5
+            get_state = {light_get}
+            on  = ["true"]
+            off = ["true"]
+            [[device]]
+            name = "plain"
+            kind = "light"
+            get_state = {plain_get}
+            on  = ["true"]
+            off = ["true"]
+            "##
+        ))
+        .unwrap();
+        let store = Arc::new(push::PushStore::new(&cfg));
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: Some(store),
+        })
+    }
+
+    fn tmp_counter(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("mando_push_{tag}_{}.txt", std::process::id()));
+        std::fs::write(&p, "").unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    /// push の価値そのものの証明: primed なら exec が 1 回も走らない。
+    #[tokio::test]
+    async fn primed_light_answers_without_exec() {
+        let p = tmp_counter("primed");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.baseline("light", normalize::State::On);
+
+        let (st, v) = call_on(app, "GET", "/api/devices/light/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "on");
+        assert_eq!(v["source"], "push");
+        assert_eq!(v["stale"], false);
+        // 走らなかった exec の成功を騙らない。
+        assert!(v.get("exec").is_none(), "push 即答に exec は付けない: {v:?}");
+        assert_eq!(exec_count(&p), 0, "primed のとき exec は 1 回も走らない");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// unprimed のときは read が 1 回走り、その結果が基準値になる。
+    #[tokio::test]
+    async fn unprimed_light_reads_once_then_is_primed() {
+        let p = tmp_counter("unprimed");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+
+        let (st, v) = call_on(app.clone(), "GET", "/api/devices/light/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "on");
+        assert_eq!(v["source"], "read");
+        assert_eq!(v["stale"], false);
+        assert_eq!(v["exec"], "success");
+        assert_eq!(exec_count(&p), 1, "unprimed のとき read は 1 回");
+
+        // read が基準値を確立したので 2 回目は exec ゼロ。
+        let (_, v2) = call_on(app, "GET", "/api/devices/light/state").await;
+        assert_eq!(v2["source"], "push");
+        assert_eq!(exec_count(&p), 1, "2 回目は exec しない");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// listener 断のときは read フォールバックし、それも失敗なら stale で正直に出す。
+    #[tokio::test]
+    async fn disconnected_read_failure_is_stale() {
+        let p = tmp_counter("stale");
+        let app = push_app(&p, false); // get_state が exit 3（timeout）
+        // set_connected を呼ばない = 起動直後 / listener 断。
+        let (st, v) = call_on(app, "GET", "/api/devices/light/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "unknown");
+        assert_eq!(v["source"], "read");
+        assert_eq!(v["stale"], true, "信頼できない値は stale と言う");
+        assert_eq!(v["exec"], "timeout");
+        assert_eq!(exec_count(&p), 1);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// node_id の無い light は push 管理外 = 従来の read 経路のまま。
+    #[tokio::test]
+    async fn light_without_node_id_keeps_read_path() {
+        let p = tmp_counter("plain");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.baseline("plain", normalize::State::On); // 管理外なので効かない
+
+        let (_, v) = call_on(app, "GET", "/api/devices/plain/state").await;
+        assert_eq!(v["state"], "on");
+        assert!(v.get("source").is_none(), "push 管理外に source は付けない");
+        assert!(v.get("stale").is_none());
+        assert_eq!(exec_count(&p), 1, "毎回 read する");
+        std::fs::remove_file(&p).ok();
     }
 
     #[tokio::test]
