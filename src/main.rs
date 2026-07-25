@@ -104,6 +104,8 @@ async fn main() {
         "mando 起動"
     );
 
+    warn_missing_node_ids(&config);
+
     let app = Arc::new(App {
         config,
         executor: Executor::new(),
@@ -132,6 +134,23 @@ async fn main() {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown");
+}
+
+/// `[push]` 有りのとき、node_id の設定漏れを起動時に告知する（無しなら
+/// node_id は意味を持たないので黙る）。設定漏れを黙って無視しない —
+/// node_id の無い light はそのデバイスだけ従来の read 経路のままになる。
+fn warn_missing_node_ids(config: &Config) {
+    if config.push.is_none() {
+        return;
+    }
+    for d in &config.devices {
+        if d.kind == Kind::Light && d.node_id.is_none() {
+            tracing::warn!(
+                device = %d.name,
+                "kind=light に node_id が無い: push を使わず従来の read 経路のまま"
+            );
+        }
+    }
 }
 
 /// 安定ミニ API のルーティング（テストからも oneshot で叩く）。

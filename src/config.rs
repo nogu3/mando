@@ -64,6 +64,9 @@ pub struct Config {
     pub health: Option<Health>,
     #[serde(default)]
     pub mesh: Option<Mesh>,
+    /// light 状態の push 取り込み設定（任意）。未設定なら push 機能ごと無効。
+    #[serde(default)]
+    pub push: Option<Push>,
     /// デバイス exec の全体設定（任意）。
     #[serde(default)]
     pub exec: ExecSettings,
@@ -110,6 +113,16 @@ impl Default for CacheSettings {
 
 fn default_state_ttl_ms() -> u64 {
     2_000
+}
+
+/// light 状態の push 取り込み（`mat listen` → SSE）の設定。任意。
+///
+/// listen は無期限ストリームなので、one-shot exec 用の `[exec] timeout_ms` や
+/// レーン直列化は通さない（通すと即座に打ち切られる）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Push {
+    /// 長寿命の listen コマンド配列。
+    pub listen: Vec<String>,
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -309,6 +322,12 @@ pub struct Device {
     /// UI の「個別に操作」展開に使うだけ — mando が members を直列 exec することはない。
     #[serde(default)]
     pub members: Vec<String>,
+    /// push イベントの突合キー（light 専用・任意）。`mat listen` の
+    /// `node_id` と突き合わせる。機器を commission した結果決まる
+    /// デプロイデータなので、実 IP・EPC と同じクラスのものとして config に置く。
+    /// light 以外の kind では無視する。
+    #[serde(default)]
+    pub node_id: Option<u64>,
     /// exec 直列化レーン（任意）。同じ lane のデバイスと直列化される。
     /// 未指定ならデバイス名 = デバイス単位の直列化のみ（他デバイスとは並列）。
     /// echonet 系（enl / casa 経由）は 3610 を専有 bind するため、
@@ -391,6 +410,7 @@ pub enum ConfigError {
     DuplicateLightMember { member: String },
     EmptyHealthCommand,
     EmptyMeshCommand,
+    EmptyPushListen,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -451,6 +471,7 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
             ConfigError::EmptyMeshCommand => write!(f, "mesh: command が空"),
+            ConfigError::EmptyPushListen => write!(f, "push: listen が空"),
         }
     }
 }
@@ -715,6 +736,12 @@ impl Config {
             }
         }
 
+        if let Some(p) = &self.push {
+            if p.listen.is_empty() {
+                return Err(ConfigError::EmptyPushListen);
+            }
+        }
+
         Ok(())
     }
 
@@ -734,6 +761,107 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_absent_is_none() {
+        let c: Config = toml::from_str(
+            r#"
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        )
+        .unwrap();
+        assert!(c.push.is_none(), "[push] 無しなら push 機能ごと無効");
+    }
+
+    #[test]
+    fn push_listen_parses() {
+        let c: Config = toml::from_str(
+            r#"
+            [push]
+            listen = ["mat", "listen", "--count", "4294967295", "--timeout-ms", "0"]
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.push.unwrap().listen.first().unwrap(), "mat");
+    }
+
+    #[test]
+    fn push_empty_listen_rejected() {
+        let p = write_tmp(
+            "pushempty",
+            r#"
+            [push]
+            listen = []
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyPushListen)
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn node_id_parses_and_defaults_to_none() {
+        let p = write_tmp(
+            "nodeid",
+            r#"
+            [push]
+            listen = ["true"]
+            [[device]]
+            name = "desk_light"
+            kind = "light"
+            node_id = 6
+            get_state = ["true"]
+            on = ["true"]
+            off = ["true"]
+            [[device]]
+            name = "plain"
+            kind = "light"
+            get_state = ["true"]
+            on = ["true"]
+            off = ["true"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("desk_light").unwrap().node_id, Some(6));
+        // node_id 無しの light は設定エラーにしない（そのデバイスだけ read 経路）。
+        assert_eq!(cfg.find("plain").unwrap().node_id, None);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn node_id_on_non_light_is_accepted_and_ignored() {
+        // light 以外では無視するだけ（既存 config を壊さない）。
+        let p = write_tmp(
+            "nodeidshutter",
+            r#"
+            [[device]]
+            name = "s1"
+            node_id = 3
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("s1").unwrap().node_id, Some(3));
+        std::fs::remove_file(p).ok();
+    }
 
     fn write_tmp(tag: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir();
@@ -1230,6 +1358,7 @@ mod tests {
             presets: vec![],
             face: None,
             members: vec![],
+            node_id: None,
             lane: None,
         };
         assert_eq!(d.label(), "x");
