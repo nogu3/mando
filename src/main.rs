@@ -277,15 +277,18 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
     }
 
     match serde_json::from_str::<Value>(&result.stdout) {
-        Ok(raw) => StateView {
-            state: match device.kind {
-                Kind::Shutter => normalize_enl_state(&raw),
-                Kind::Light => normalize_mat_onoff(&raw),
-                Kind::Switch => normalize_enl_state(&raw),
-            },
-            exec: result.outcome,
-            raw: Some(raw),
-        },
+        Ok(raw) => {
+            warn_on_node_id_drift(device, &raw);
+            StateView {
+                state: match device.kind {
+                    Kind::Shutter => normalize_enl_state(&raw),
+                    Kind::Light => normalize_mat_onoff(&raw),
+                    Kind::Switch => normalize_enl_state(&raw),
+                },
+                exec: result.outcome,
+                raw: Some(raw),
+            }
+        }
         Err(e) => {
             tracing::warn!(device = %device.name, error = %e, "get_state JSON パース失敗");
             StateView {
@@ -294,6 +297,23 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
                 raw: None,
             }
         }
+    }
+}
+
+/// 再 commission 等で config の node_id が実機とずれたら warn を出す。
+/// 自己修復はしない — 設定の真実は config、という一貫性を優先する。
+/// light は定期ポーリングされないので、warn がログを埋めることはない。
+fn warn_on_node_id_drift(device: &Device, raw: &Value) {
+    let (Some(expected), Some(actual)) = (device.node_id, normalize::read_node_id(raw)) else {
+        return;
+    };
+    if expected != actual {
+        tracing::warn!(
+            device = %device.name,
+            expected,
+            actual,
+            "config の node_id が read の戻り値と不一致（再 commission？ push イベントが突合できない）"
+        );
     }
 }
 

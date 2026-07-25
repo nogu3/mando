@@ -115,11 +115,23 @@ fn classify_str(s: &str) -> State {
 /// → `value` の bool で点灯/消灯を判定する。スキーマや値が想定外なら Unknown。
 /// casa 移行時はこの関数の中身だけ差し替える（設計原則 4）。
 pub fn normalize_mat_onoff(raw: &Value) -> State {
-    match raw.get("value") {
-        Some(Value::Bool(true)) => State::On,
-        Some(Value::Bool(false)) => State::Off,
+    raw.get("value")
+        .map(normalize_onoff_value)
+        .unwrap_or(State::Unknown)
+}
+
+/// `onoff/on-off` の値 → 論理 state。bool 以外は Unknown。
+pub fn normalize_onoff_value(value: &Value) -> State {
+    match value {
+        Value::Bool(true) => State::On,
+        Value::Bool(false) => State::Off,
         _ => State::Unknown,
     }
+}
+
+/// read の戻り値から node_id を取り出す（config とのドリフト検出用）。
+pub fn read_node_id(raw: &Value) -> Option<u64> {
+    raw.get("node_id").and_then(Value::as_u64)
 }
 
 /// グラフ 1 系列。契約 JSON の行を series 別に束ねたもの。
@@ -577,6 +589,26 @@ pub fn normalize_mesh(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn onoff_value_maps_bool_only() {
+        assert_eq!(normalize_onoff_value(&json!(true)), State::On);
+        assert_eq!(normalize_onoff_value(&json!(false)), State::Off);
+        // bool 以外は解釈しない（0 / 1 を on/off と決めつけない）。
+        assert_eq!(normalize_onoff_value(&json!(1)), State::Unknown);
+        assert_eq!(normalize_onoff_value(&json!("on")), State::Unknown);
+        assert_eq!(normalize_onoff_value(&json!(null)), State::Unknown);
+    }
+
+    #[test]
+    fn reads_node_id_for_drift_check() {
+        assert_eq!(
+            read_node_id(&json!({"node_id": 6, "value": true})),
+            Some(6)
+        );
+        assert_eq!(read_node_id(&json!({"value": true})), None);
+        assert_eq!(read_node_id(&json!({"node_id": "6"})), None);
+    }
 
     #[test]
     fn string_value() {
