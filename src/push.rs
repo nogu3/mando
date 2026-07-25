@@ -32,6 +32,11 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// （戻さないと一度荒れたあと永久に上限で待つことになる）。
 const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
+/// stdout が終わったあと子の自然終了を待つ猶予。これを超えて残っていたら
+/// kill する — ここで止まると `set_connected(false)` に到達せず、
+/// 「生きているのに何も届かない」listener になる。
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// デバイス 1 台の push 状態。
 #[derive(Default)]
 struct Slot {
@@ -136,9 +141,10 @@ impl PushStore {
         inner.connected = connected;
         // 断も復帰も世代を進める。跨いだ read の戻りは採用しない。
         inner.generation = inner.generation.wrapping_add(1);
-        if !connected {
-            inner.slots.clear();
-        }
+        // 断で基準値を捨てるのは必須（切れていた間に変わった可能性がある）。
+        // 復帰でも捨てるのは、断中に書かれた値が復帰で primed に昇格しない
+        // ことを構造的に保証するため（実際には断中に書き手はいない）。
+        inner.slots.clear();
     }
 
     /// read で確定した値を基準値として格納する（primed 化）。
@@ -151,6 +157,10 @@ impl PushStore {
     /// 基準値は listener が生きている間だけ意味を持つので、断中も何もしない
     /// （断中の read 結果は呼び出し元の GET state 応答として直接返る）。
     pub fn baseline(&self, device: &str, state: State, generation: u64) {
+        // 管理外のデバイスの slot は作らない（store が持つのは push 管理下だけ）。
+        if !self.tracks(device) {
+            return;
+        }
         let Some(value) = normalize::state_to_onoff_value(state) else {
             return;
         };
@@ -272,7 +282,17 @@ async fn run_once(
             }
         }
     }
-    child.wait().await
+    // stdout が終わった = プロセスが落ちた、もしくは読めなくなった。
+    // 子が生きたまま抜けた場合に wait で永久に止まらないよう、待ちを
+    // 有界にしてから kill する。
+    match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            tracing::warn!("push listener が stdout 終了後も残っている: kill する");
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    }
 }
 
 /// 1 行を store へ反映する。壊れた行・管理外 node はその行だけ捨て、
@@ -468,6 +488,32 @@ mod tests {
             s.primed_state("desk_light"),
             Some(State::Off),
             "壊れた行を挟んでもストリームは続く"
+        );
+    }
+
+    /// stdout に不正な UTF-8 が来ても run_once が速やかに戻ること。
+    /// 戻らないと set_connected(false) に到達せず、「生きているのに何も
+    /// 届かない」listener になる（鮮度モデルが存在しないと仮定する状態）。
+    #[tokio::test]
+    async fn run_once_returns_promptly_on_invalid_utf8_stdout() {
+        let s = Arc::new(store());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // 不正なバイトを 1 行出したあと、自分では終わらない子。
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"printf '\377\n'; sleep 60"#.to_string(),
+        ];
+        let started = Instant::now();
+        let done = tokio::time::timeout(Duration::from_secs(20), run_once(&cmd, &s, &tx)).await;
+        assert!(
+            done.is_ok(),
+            "run_once が戻らない（子を残したまま wait で固まっている）"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "戻るのが遅すぎる: {:?}",
+            started.elapsed()
         );
     }
 

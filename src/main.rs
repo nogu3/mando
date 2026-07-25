@@ -125,10 +125,6 @@ async fn main() {
         push: store.clone(),
     });
 
-    if let Some(store) = store {
-        start_push(app.clone(), store);
-    }
-
     let router = router(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -138,6 +134,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // bind に成功してから listener を起こす。bind 失敗の exit(1) では
+    // デストラクタが走らず kill_on_drop が効かないため、先に起こすと
+    // mat listen の子プロセスが取り残される。
+    if let Some(store) = store {
+        start_push(app.clone(), store);
+    }
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
