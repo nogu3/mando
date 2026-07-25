@@ -378,7 +378,8 @@ const POLL_WINDOW_MS = 2 * 60 * 1000;      // 操作後にポーリングを続�
 const POLL_EXTEND_MS = 30 * 1000;          // 動作中（opening/closing）が見えている間の延長単位。
 const POLL_EXTEND_CAP_MS = 10 * 60 * 1000; // 直近トリガーからの延長上限（固着時の無限ポーリング防止）。
 const MOVING_STATES = new Set(["opening", "closing"]);
-const LIGHT_CATCHUP_MS = 2000; // light: 操作後に 1 回だけ state を追いつき取得するまでの待ち。
+const LIGHT_CATCHUP_MS = 2000; // light: SSE が切れているときの追いつき取得までの待ち（fallback）。
+const LIGHT_SETTLE_MS = 2000;  // light: SSE 接続中に「反映中…」を畳むまでの待ち（通信しない）。
 
 const app = document.getElementById("app");
 const cards = new Map();  // device name -> {statusEl, labelEl, msgEl, buttons, state}
@@ -387,6 +388,7 @@ let pollUntil = 0;          // この時刻までポーリング（アクティ�
 let pollAnchor = 0;         // 直近トリガー（操作 / 表示）時刻。延長上限の基準。
 let pollLoopRunning = false;
 let busyCount = 0;        // 操作中はポーリングを止め、3610 の取り合いを避ける。
+let sseOpen = false;      // /api/events が張れているか。切れている間だけ追いつき取得へ degrade。
 
 async function api(method, path, body) {
   const opts = { method, headers: { "accept": "application/json" } };
@@ -564,7 +566,8 @@ function buildLightTile(dev) {
     lastHue: 30,   // シート再訪時のスライダー初期位置
     lastSat: 100,
     lastBright: 100, // シート再訪時の明るさスライダー初期位置（現在値は state に出ない）
-    catchupTimer: null, // 追いつき取得タイマー（device ごとに 1 本、連打時は張り直し）
+    catchupTimer: null, // 追いつき取得タイマー（SSE 断時のみ。device ごとに 1 本、連打時は張り直し）
+    settleTimer: null,  // SSE 接続中の「反映中…」後始末タイマー（通信しない）
   };
   el.querySelector(".bulb").addEventListener("click", () =>
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
@@ -804,25 +807,51 @@ async function lightAct(name, verb, path, body) {
     const view = await api("POST", path, body);
     const am = ACTION_MSG[view.action] || "";
     if (am) {
-      if (c.catchupTimer) { clearTimeout(c.catchupTimer); c.catchupTimer = null; }
+      clearLightTimers(c);
       c.msgEl.textContent = "⚠ " + am;
       c.statusEl.classList.add("error");
     } else {
-      // 成功 = 送信できただけ。中間表示にして追いつき取得を予約する。
+      // 成功 = 送信できただけ。中間表示にして反映を待つ。
       c.statusEl.classList.remove("error");
       c.msgEl.textContent = "";
       c.labelEl.textContent = "反映中…";
-      scheduleLightCatchup(name);
+      if (sseOpen) {
+        // SSE が張れているなら状態は push で降ってくる。追いつき取得はしない
+        //（primed なら exec ゼロ、という push の価値をここで捨てない）。
+        scheduleLightSettle(name);
+      } else {
+        // 切れているときだけ従来の追いつき取得へ degrade する。
+        scheduleLightCatchup(name);
+      }
     }
   } catch (e) {
     if (c) {
-      if (c.catchupTimer) { clearTimeout(c.catchupTimer); c.catchupTimer = null; }
+      clearLightTimers(c);
       c.msgEl.textContent = "⚠ 通信エラー"; c.statusEl.classList.add("error");
     }
   } finally {
     setDeviceBusy(name, false);
     busyCount--;
   }
+}
+
+/* 保留中の light タイマーを止める（エラー時・連打時）。 */
+function clearLightTimers(c) {
+  if (!c) return;
+  if (c.catchupTimer) { clearTimeout(c.catchupTimer); c.catchupTimer = null; }
+  if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+}
+
+/* SSE 接続中の「反映中…」の後始末。既に同じ状態だと変化が起きず push が
+   来ないので、既知状態へ描き戻して表示を固まらせない。通信はしない。 */
+function scheduleLightSettle(name) {
+  const c = cards.get(name);
+  if (!c) return;
+  if (c.settleTimer) clearTimeout(c.settleTimer);
+  c.settleTimer = setTimeout(() => {
+    c.settleTimer = null;
+    renderState(name, { state: c.state, source: "push", stale: false });
+  }, LIGHT_SETTLE_MS);
 }
 
 function scheduleLightCatchup(name) {
@@ -854,9 +883,31 @@ function renderState(name, view) {
   const labelMap = (c.kind === "switch" && c.face !== "light") ? SWITCH_LABEL : STATE_LABEL;
   c.labelEl.textContent = labelMap[st] || "不明";
   if (c.rootEl) c.rootEl.classList.toggle("lit", st === "on");
-  const m = STATE_MSG[view.exec] || "";
+  // push 由来の即答には exec が付かない（走らなかった exec の成功を騙らないため）。
+  // 値を信頼できないときはサーバが stale を立てるので、それも隠さず出す（原則 7）。
+  const m = STATE_MSG[view.exec] || (view.stale ? "状態不明" : "");
   c.msgEl.textContent = m;
   if (m) c.statusEl.classList.add("error");
+}
+
+/* ── light 状態の push 受信（SSE）──────────────────────
+   接続直後に全 light のスナップショット、以後は変化のたび 1 件。
+   cross-tab / 別端末の操作もライブで反映される。EventSource は自動再接続し、
+   [push] 未設定なら 404 で閉じたまま = 従来の追いつき取得のままになる。 */
+function startEvents() {
+  let es;
+  try {
+    es = new EventSource("/api/events");
+  } catch (e) {
+    return; // EventSource 非対応 = 従来の追いつき取得のまま
+  }
+  es.addEventListener("open", () => { sseOpen = true; });
+  es.addEventListener("error", () => { sseOpen = false; });
+  es.addEventListener("message", (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    if (ev && ev.device) renderState(ev.device, ev);
+  });
 }
 
 /* シートが対象 device（name=null なら無条件）を開いていれば、シート内の操作も止める。 */
@@ -1477,6 +1528,8 @@ async function boot() {
   // グラフが config に無ければセクションごと出さない。
   if (graphList.length) buildGraphSection(graphList);
   fetchHealth();
+  // light が無いページでは張らない（shutter だけの構成では push は要らない）。
+  if (lights.length) startEvents();
   refreshOnce();
   fetchLightStatesOnce(devices);
 }
