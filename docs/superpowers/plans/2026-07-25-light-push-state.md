@@ -80,6 +80,27 @@ push が先に来れば同じ値の再描画になるだけ（冪等）。exec �
 再試行し続ける（**GET state は read フォールバックで動き続ける** — 機能が壊れる
 のではなく push が効かないだけ）。`[push]` を config に入れるのは mat を上げてから。
 
+## 実装中に入った修正（Task 4 のレビュー結果）
+
+計画のコードは scratchpad で compile / test 検証済みだったが、**並行性の穴は
+テストが通ることでは見つからない。** Task 4 のレビューで 2 件の Important が
+出て、以下を追加した（詳細は `.superpowers/sdd/task-4-report.md`）:
+
+1. **接続世代（`Inner.generation`）。** `baseline` は書き込み時点の
+   `connected` しか見ていなかったため、read（最大 15s）が listener の
+   断・再接続（backoff 最短 1s）を跨ぐと、**断の前に読んだ値**が primed /
+   `stale: false` として出てしまう。read を始める前の世代を覚え、跨いだ戻りは
+   採用しない。`baseline` は `baseline(&self, device, state, generation)` の
+   3 引数になった（Task 5 以降もこのシグネチャ）。
+2. **再ベースライン依頼の畳み込み。** listener が連続して落ちると
+   「1 周ぶんの read（N デバイス × 最大 exec timeout）」が unbounded channel に
+   滞留し、不調な matd を余計に叩き続ける。sweep の前に溜まった依頼を drain する。
+3. **stderr をバイトで drain。** 行読みは不正な UTF-8 1 バイトで降りる。
+   降りるとパイプが埋まって子が止まり、stdout が EOF にならないまま
+   「生きているのに何も届かない」listener になる（鮮度モデルが存在しないと
+   仮定している状態）。
+4. **stdout 読み取り失敗を EOF 扱いに。** 起動失敗と混同したログを出さない。
+
 ## File Structure
 
 | ファイル | 責務 | 変更 |
@@ -1608,7 +1629,7 @@ EOF
     fn baseline_broadcasts_with_read_source() {
         let s = connected_store();
         let mut rx = s.subscribe();
-        s.baseline("desk_light", State::Off);
+        s.baseline("desk_light", State::Off, s.generation());
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.source, SOURCE_READ);
         assert_eq!(ev.state, State::Off);
@@ -1724,11 +1745,18 @@ pub struct PushStore {
             tracked,
             inner: Mutex::new(Inner {
                 connected: false,
+                generation: 0,
                 slots: HashMap::new(),
             }),
             tx,
         }
 ```
+
+> `generation` は Task 4 のレビュー修正で入った接続世代（断を跨いだ read の
+> 戻りを基準値にしないための世代印）。`baseline` は
+> `baseline(&self, device: &str, state: State, generation: u64)` の 3 引数で、
+> この Task はその**シグネチャを変えない** — 中の `Self::update` 呼び出しを
+> `self.update(..., source)` にするだけ。
 
 `set_connected` の doc に「断そのものは broadcast しない」理由を追記:
 
