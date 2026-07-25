@@ -37,6 +37,9 @@ state_ttl_ms = 2000   # 既定 2000。0 = TTL 無効（同時読みの合流の�
 # 落ちたら mando が指数 backoff（1s→30s）で再起動し、そのたび全 light の
 # 基準値を捨てて read で再ベースラインする（この read が購読を誘発する）。
 #
+# listen はシェルで包まない（`sh -c "mat listen …"` にすると kill が孫まで
+# 届かず、再起動のたびに listener が二重になる）。実行ファイルを直接書く。
+#
 # [push]
 # listen = ["mat", "listen", "--count", "4294967295", "--timeout-ms", "0"]
 

@@ -568,6 +568,7 @@ function buildLightTile(dev) {
     lastBright: 100, // シート再訪時の明るさスライダー初期位置（現在値は state に出ない）
     catchupTimer: null, // 追いつき取得タイマー（SSE 断時のみ。device ごとに 1 本、連打時は張り直し）
     settleTimer: null,  // SSE 接続中の「反映中…」後始末タイマー（通信しない）
+    pendingPush: false, // 押下後、push が降りてくるのを待っているか（見張り用）
   };
   el.querySelector(".bulb").addEventListener("click", () =>
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
@@ -823,11 +824,11 @@ async function lightAct(name, verb, path, body) {
       c.msgEl.textContent = "";
       c.labelEl.textContent = "反映中…";
       if (sseOpen) {
-        // SSE が張れているなら状態は push で降ってくる。追いつき取得はしない
-        //（primed なら exec ゼロ、という push の価値をここで捨てない）。
-        scheduleLightSettle(name);
+        // SSE が張れていれば状態は push で降ってくる見込み。ただし本当に来るかは
+        // socket の生死では分からないので、見張りを置いて空振りなら読み直す。
+        scheduleLightWatchdog(name);
       } else {
-        // 切れているときだけ従来の追いつき取得へ degrade する。
+        // 切れているときは最初から従来の追いつき取得へ degrade する。
         scheduleLightCatchup(name);
       }
     }
@@ -848,6 +849,7 @@ function clearLightTimers(c) {
   if (!c) return;
   if (c.catchupTimer) { clearTimeout(c.catchupTimer); c.catchupTimer = null; }
   if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+  c.pendingPush = false;
 }
 
 /* 既知状態へ描き戻す（通信しない）。「反映中…」の後始末はここに集約する。
@@ -859,15 +861,24 @@ function rerenderKnown(name) {
   if (c) renderState(name, { state: c.state });
 }
 
-/* SSE 接続中の「反映中…」の後始末。既に同じ状態だと変化が起きず push が
-   来ないので、既知状態へ描き戻して表示を固まらせない。通信はしない。 */
-function scheduleLightSettle(name) {
+/* 押下後、push が降りてくるのを待つ見張り。LIGHT_SETTLE_MS の間に対象デバイスの
+   イベントが来なければ、このデバイスに push は届いていないと判断して従来の
+   追いつき取得へ落ちる。sseOpen は「ブラウザとの socket が生きているか」しか
+   語らない — node_id 未設定・mat が古い・matd 停止・node_id ドリフトでは
+   イベントは永久に来ないので、それだけを根拠に確認をやめてはいけない（原則 7）。
+   通信するのは見張りが空振りしたときだけ。 */
+function scheduleLightWatchdog(name) {
   const c = cards.get(name);
   if (!c) return;
   if (c.settleTimer) clearTimeout(c.settleTimer);
+  c.pendingPush = true;
   c.settleTimer = setTimeout(() => {
     c.settleTimer = null;
-    rerenderKnown(name);
+    if (!c.pendingPush) return; // push が来て解除済み
+    c.pendingPush = false;
+    // 押しても状態が変わらなかった場合もここに来る（変化がなければ
+    // サーバは broadcast しない）。読み直せば「反映中…」も畳める。
+    scheduleLightCatchup(name);
   }, LIGHT_SETTLE_MS);
 }
 
@@ -923,7 +934,10 @@ function startEvents() {
   es.addEventListener("message", (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch (_) { return; }
-    if (ev && ev.device) renderState(ev.device, ev);
+    if (!ev || !ev.device) return;
+    const c = cards.get(ev.device);
+    if (c) c.pendingPush = false; // push が来た = 見張り解除
+    renderState(ev.device, ev);
   });
 }
 

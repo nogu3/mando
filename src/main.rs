@@ -440,12 +440,12 @@ async fn cached_state(app: &App, device: &Device) -> StateView {
 /// primed なら in-memory 即答、unprimed／listener 断なら read で確定、
 /// それも失敗なら `stale: true` で正直に出す。
 async fn push_state(app: &App, store: &Arc<push::PushStore>, device: &Device) -> StateView {
-    if let Some(state) = store.primed_state(&device.name) {
+    if let Some((state, source)) = store.primed_state(&device.name) {
         return StateView {
             state,
             exec: None,
             raw: None,
-            source: Some(push::SOURCE_PUSH),
+            source: Some(source),
             stale: Some(false),
         };
     }
@@ -520,6 +520,11 @@ async fn run_light_action(app: &App, device: &Device, cmd: &[String]) -> LightAc
             stderr = %result.stderr.trim(),
             "set 非成功"
         );
+    }
+    // 送信した = 状態が変わったかもしれない。基準値を落として、次の read が
+    // 実機を見に行くようにする（push が先に来ればそれが基準値になる）。
+    if let Some(store) = &app.push {
+        store.invalidate(&device.name);
     }
     LightActionView {
         action: result.outcome,
@@ -1192,19 +1197,29 @@ async fn events(State(app): State<Shared>) -> Response {
     // （逆順だと間のイベントが落ちる）。重複は同じ値の再描画で無害。
     let rx = store.subscribe();
     let snapshot = store.snapshot();
-    let live = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => return Some((ev, rx)),
-                // 遅いクライアントは取りこぼす。次の変化 or 再接続時の
-                // スナップショットで追いつく。
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!(missed = n, "SSE クライアントがイベントを取りこぼした");
+    let live = futures_util::stream::unfold(
+        (rx, store, std::collections::VecDeque::new()),
+        |(mut rx, store, mut queued)| async move {
+            loop {
+                if let Some(ev) = queued.pop_front() {
+                    return Some((ev, (rx, store, queued)));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                match rx.recv().await {
+                    Ok(ev) => return Some((ev, (rx, store, queued))),
+                    // 取りこぼした分は現在スナップショットで埋め直す。次の変化を
+                    // 待つと、変化が来なければ古い表示のまま残ってしまう。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(
+                            missed = n,
+                            "SSE クライアントがイベントを取りこぼした: スナップショットで再同期する"
+                        );
+                        queued.extend(store.snapshot());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
             }
-        }
-    });
+        },
+    );
     let stream = futures_util::stream::iter(snapshot)
         .chain(live)
         .map(|ev| Event::default().json_data(&ev));
@@ -2253,7 +2268,10 @@ mod tests {
         let (st, v) = call_on(app, "GET", "/api/devices/light/state").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["state"], "on");
-        assert_eq!(v["source"], "push");
+        // このセットアップは baseline（read）で primed にしている。source は
+        // 値を確立した出どころと同じ粒度で持つ（Fix 2）ので "read" と名乗る —
+        // ここが問うているのは exec ゼロであって、出どころそのものではない。
+        assert_eq!(v["source"], "read");
         assert_eq!(v["stale"], false);
         // 走らなかった exec の成功を騙らない。
         assert!(v.get("exec").is_none(), "push 即答に exec は付けない: {v:?}");
@@ -2279,8 +2297,32 @@ mod tests {
 
         // read が基準値を確立したので 2 回目は exec ゼロ。
         let (_, v2) = call_on(app, "GET", "/api/devices/light/state").await;
-        assert_eq!(v2["source"], "push");
+        assert_eq!(
+            v2["source"], "read",
+            "read で確立した基準値は read と名乗る（/api/events のスナップショットと一致させる）"
+        );
         assert_eq!(exec_count(&p), 1, "2 回目は exec しない");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 操作 POST は状態の確認ではないので、直後の GET が押下前の値を
+    /// primed のまま返してはいけない（原則 7）。
+    #[tokio::test]
+    async fn light_set_invalidates_the_baseline() {
+        let p = tmp_counter("setinval");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.baseline("light", normalize::State::On, store.generation());
+
+        let (st, _) = call_on(app.clone(), "POST", "/api/devices/light/off").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(exec_count(&p), 0, "set 自体は state を読まない");
+
+        // 基準値が落ちているので次の GET は read で実機を見に行く。
+        let (_, v) = call_on(app, "GET", "/api/devices/light/state").await;
+        assert_eq!(v["source"], "read");
+        assert_eq!(exec_count(&p), 1);
         std::fs::remove_file(&p).ok();
     }
 

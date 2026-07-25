@@ -27,6 +27,10 @@ pub const SOURCE_PUSH: &str = "push";
 pub const SOURCE_READ: &str = "read";
 
 /// SSE で配る 1 件。接続直後のスナップショットも変化イベントも同じ形。
+///
+/// `stale` は構造上つねに false — イベントは信頼できる store からしか出ない。
+/// フィールドを残しているのは、将来 listener 断そのものを通知する形に
+/// 拡張したときに同じ形で運べるようにするため（今は live なデータではない）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StateEvent {
     pub device: String,
@@ -51,22 +55,20 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 /// 「生きているのに何も届かない」listener になる。
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
 
+/// 再ベースラインを頼むまでに子の生存を見る猶予。起動即死（mat が古い /
+/// matd 不在）を backoff で繰り返す間、全 light の read を延々と撒かない。
+const REBASELINE_DELAY: Duration = Duration::from_secs(3);
+
 /// デバイス 1 台の push 状態。
+#[derive(Default)]
 struct Slot {
     /// `"cluster/attribute"` → 最新値の汎用マップ。今 state に写すのは
     /// `onoff/on-off` だけ。明るさ・色は読み出す属性を足すだけで済む。
     attrs: HashMap<String, Value>,
-    /// 直近にこの slot を更新した出どころ。
-    source: &'static str,
-}
-
-impl Default for Slot {
-    fn default() -> Self {
-        Slot {
-            attrs: HashMap::new(),
-            source: SOURCE_PUSH,
-        }
-    }
+    /// `onoff/on-off` を最後に確定させた出どころ。state を導く値と同じ粒度で
+    /// 持つ — slot 全体で 1 つにすると、明るさ・色のイベントが read 由来の
+    /// onoff の出どころを "push" に書き換えてしまう。
+    onoff_source: Option<&'static str>,
 }
 
 impl Slot {
@@ -81,6 +83,12 @@ impl Slot {
             Some(State::Unknown) | None => None,
             Some(s) => Some(s),
         }
+    }
+
+    /// state とその出どころ。どちらも `update` が同時に書くので、片方だけ
+    /// 埋まっていることはない。
+    fn state_with_source(&self) -> Option<(State, &'static str)> {
+        Some((self.state()?, self.onoff_source?))
     }
 }
 
@@ -144,14 +152,14 @@ impl PushStore {
         self.tracked.iter().any(|n| n == device)
     }
 
-    /// primed（listener 接続中 かつ 基準値確立済み）なら push 値を返す。
-    /// これが Some なら GET state は exec ゼロで即答できる。
-    pub fn primed_state(&self, device: &str) -> Option<State> {
+    /// primed（listener 接続中 かつ 基準値確立済み）なら push 値とその出どころを
+    /// 返す。これが Some なら GET state は exec ゼロで即答できる。
+    pub fn primed_state(&self, device: &str) -> Option<(State, &'static str)> {
         let inner = self.lock();
         if !inner.connected {
             return None;
         }
-        inner.slots.get(device)?.state()
+        inner.slots.get(device)?.state_with_source()
     }
 
     /// 現在の接続世代。read を**始める前**に取り、`baseline` に渡す。
@@ -209,6 +217,15 @@ impl PushStore {
         );
     }
 
+    /// 操作を送ったので基準値を落とす。次の GET は read で実機を見に行く
+    /// （push イベントが先に来ればそれが基準値になり、read は起きない）。
+    /// 送信できたことは状態の確認ではないので、押下前の値を primed の
+    /// まま出し続けてはいけない（原則 7）。
+    pub fn invalidate(&self, device: &str) {
+        let mut inner = self.lock();
+        inner.slots.remove(device);
+    }
+
     /// listener からの 1 イベントを取り込む。突合できる論理デバイスが
     /// 無ければ false（家には mando 管理外の Matter ノードが多数いる）。
     pub fn apply(&self, ev: &PushEvent) -> bool {
@@ -236,8 +253,11 @@ impl PushStore {
     ) {
         let slot = inner.slots.entry(device.to_string()).or_default();
         let before = slot.state();
+        let is_onoff = key == normalize::ONOFF_KEY;
         slot.attrs.insert(key, value);
-        slot.source = source;
+        if is_onoff {
+            slot.onoff_source = Some(source);
+        }
         let after = slot.state();
         if after == before {
             return;
@@ -268,11 +288,11 @@ impl PushStore {
         self.tracked
             .iter()
             .filter_map(|name| {
-                let slot = inner.slots.get(name)?;
+                let (state, source) = inner.slots.get(name)?.state_with_source()?;
                 Some(StateEvent {
                     device: name.clone(),
-                    state: slot.state()?,
-                    source: slot.source,
+                    state,
+                    source,
                     stale: false,
                 })
             })
@@ -351,7 +371,19 @@ async fn run_once(
     // 接続扱いを先にしないと、直後の再ベースライン read が基準値を
     // 格納できない（baseline は断中に何もしない）。
     store.set_connected(true);
-    let _ = rebaseline.send(());
+    // 再ベースラインは子が少し生き延びてから頼む。即死した場合は
+    // set_connected(false) が世代を進めるので、この依頼は捨てられる。
+    {
+        let store = store.clone();
+        let rebaseline = rebaseline.clone();
+        let generation = store.generation();
+        tokio::spawn(async move {
+            tokio::time::sleep(REBASELINE_DELAY).await;
+            if store.generation() == generation {
+                let _ = rebaseline.send(());
+            }
+        });
+    }
 
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -463,6 +495,11 @@ mod tests {
         }
     }
 
+    /// 出どころを無視して state だけ見る（多くのテストは出どころに関心がない）。
+    fn primed(s: &PushStore, device: &str) -> Option<State> {
+        s.primed_state(device).map(|(st, _)| st)
+    }
+
     #[test]
     fn tracks_only_lights_with_node_id() {
         let s = store();
@@ -481,29 +518,29 @@ mod tests {
         let s = connected_store();
         assert!(s.apply(&onoff_event(5, true)));
         // 1 つの node_id が複数の論理デバイスの代表になりうる。
-        assert_eq!(s.primed_state("living_lights"), Some(State::On));
-        assert_eq!(s.primed_state("living_south_light"), Some(State::On));
-        assert_eq!(s.primed_state("desk_light"), None);
+        assert_eq!(primed(&s, "living_lights"), Some(State::On));
+        assert_eq!(primed(&s, "living_south_light"), Some(State::On));
+        assert_eq!(primed(&s, "desk_light"), None);
     }
 
     #[test]
     fn unknown_node_is_ignored() {
         let s = connected_store();
         assert!(!s.apply(&onoff_event(99, true)), "管理外 node は false");
-        assert_eq!(s.primed_state("living_lights"), None);
+        assert_eq!(primed(&s, "living_lights"), None);
     }
 
     #[test]
     fn unprimed_while_disconnected_even_with_a_value() {
         let s = connected_store();
         s.apply(&onoff_event(6, true));
-        assert_eq!(s.primed_state("desk_light"), Some(State::On));
+        assert_eq!(primed(&s, "desk_light"), Some(State::On));
         // 再接続時は全 light を unprimed に落として read で再ベースラインする。
         s.set_connected(false);
-        assert_eq!(s.primed_state("desk_light"), None);
+        assert_eq!(primed(&s, "desk_light"), None);
         s.set_connected(true);
         assert_eq!(
-            s.primed_state("desk_light"),
+            primed(&s, "desk_light"),
             None,
             "再接続しただけで古い値を primed に戻してはいけない"
         );
@@ -513,13 +550,13 @@ mod tests {
     fn baseline_primes_and_is_ignored_while_disconnected() {
         let s = store();
         s.baseline("desk_light", State::On, s.generation());
-        assert_eq!(s.primed_state("desk_light"), None, "断中は基準値を持たない");
+        assert_eq!(primed(&s, "desk_light"), None, "断中は基準値を持たない");
         s.set_connected(true);
         s.baseline("desk_light", State::On, s.generation());
-        assert_eq!(s.primed_state("desk_light"), Some(State::On));
+        assert_eq!(primed(&s, "desk_light"), Some(State::On));
         // 解釈できない state は基準値にしない。
         s.baseline("living_lights", State::Unknown, s.generation());
-        assert_eq!(s.primed_state("living_lights"), None);
+        assert_eq!(primed(&s, "living_lights"), None);
     }
 
     #[test]
@@ -531,13 +568,13 @@ mod tests {
         s.set_connected(true);
         s.baseline("desk_light", State::On, generation);
         assert_eq!(
-            s.primed_state("desk_light"),
+            primed(&s, "desk_light"),
             None,
             "断を跨いだ read の戻りを基準値にしてはいけない"
         );
         // 現在の世代の read はちゃんと採用される。
         s.baseline("desk_light", State::On, s.generation());
-        assert_eq!(s.primed_state("desk_light"), Some(State::On));
+        assert_eq!(primed(&s, "desk_light"), Some(State::On));
     }
 
     #[test]
@@ -550,9 +587,45 @@ mod tests {
             attribute: "current-level".into(),
             value: json!(120),
         });
-        assert_eq!(s.primed_state("desk_light"), None);
+        assert_eq!(primed(&s, "desk_light"), None);
         s.apply(&onoff_event(6, false));
-        assert_eq!(s.primed_state("desk_light"), Some(State::Off));
+        assert_eq!(primed(&s, "desk_light"), Some(State::Off));
+    }
+
+    #[test]
+    fn onoff_source_is_not_overwritten_by_other_attributes() {
+        let s = connected_store();
+        s.baseline("desk_light", State::On, s.generation());
+        assert_eq!(
+            s.primed_state("desk_light"),
+            Some((State::On, SOURCE_READ)),
+            "read で確立した基準値の出どころは read"
+        );
+        // 明るさイベントは onoff の出どころを書き換えない。
+        s.apply(&PushEvent {
+            node_id: 6,
+            cluster: "levelcontrol".into(),
+            attribute: "current-level".into(),
+            value: json!(120),
+        });
+        assert_eq!(
+            s.primed_state("desk_light"),
+            Some((State::On, SOURCE_READ)),
+            "onoff を動かさない属性が出どころを書き換えてはいけない"
+        );
+        // onoff の push が来たら出どころは push になる。
+        s.apply(&onoff_event(6, false));
+        assert_eq!(s.primed_state("desk_light"), Some((State::Off, SOURCE_PUSH)));
+    }
+
+    #[test]
+    fn invalidate_drops_the_baseline() {
+        let s = connected_store();
+        s.apply(&onoff_event(6, true));
+        assert_eq!(primed(&s, "desk_light"), Some(State::On));
+        // 操作を送ったら基準値を落とす（送信は確認ではない）。
+        s.invalidate("desk_light");
+        assert_eq!(primed(&s, "desk_light"), None);
     }
 
     #[test]
@@ -615,22 +688,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_once_streams_lines_and_asks_for_rebaseline() {
+    async fn run_once_streams_lines_and_asks_for_rebaseline_after_a_grace() {
         let s = Arc::new(store());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let script = concat!(
             r#"printf '{"node_id":6,"cluster":"onoff","attribute":"on-off","value":true}\n'; "#,
             r#"printf 'garbage\n'; "#,
-            r#"printf '{"node_id":6,"cluster":"onoff","attribute":"on-off","value":false}\n'"#,
+            r#"printf '{"node_id":6,"cluster":"onoff","attribute":"on-off","value":false}\n'; "#,
+            r#"exec sleep 30"#,
         );
         let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
-        let status = run_once(&cmd, &s, &tx).await.unwrap();
-        assert!(status.success());
-        assert!(rx.try_recv().is_ok(), "接続時に再ベースラインを依頼する");
+        // 子は自分で終わらないので、依頼が届くまで待ってから見る。
+        let listen = tokio::spawn({
+            let s = s.clone();
+            async move { run_once(&cmd, &s, &tx).await }
+        });
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+        assert!(got.is_ok(), "猶予のあとに再ベースラインを依頼する");
         assert_eq!(
-            s.primed_state("desk_light"),
+            primed(&s, "desk_light"),
             Some(State::Off),
             "壊れた行を挟んでもストリームは続く"
+        );
+        listen.abort();
+    }
+
+    #[tokio::test]
+    async fn run_once_skips_rebaseline_when_the_child_dies_instantly() {
+        // mat が古い / matd 不在で即死するケース。read を撒かない。
+        let s = Arc::new(store());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cmd = vec!["sh".to_string(), "-c".to_string(), "exit 2".to_string()];
+        let status = run_once(&cmd, &s, &tx).await.unwrap();
+        assert_eq!(status.code(), Some(2));
+        // 呼び出し側（run_listener）が世代を進める。
+        s.set_connected(false);
+        let got = tokio::time::timeout(Duration::from_secs(6), rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "即死した listener で再ベースラインを頼んではいけない"
         );
     }
 
@@ -683,13 +779,13 @@ mod tests {
         ] {
             ingest(&s, line);
         }
-        assert_eq!(s.primed_state("desk_light"), None, "壊れた行で state を作らない");
+        assert_eq!(primed(&s, "desk_light"), None, "壊れた行で state を作らない");
         // 壊れた行の後も正常な行は取り込める。
         ingest(
             &s,
             r#"{"timestamp":"t","node_id":6,"endpoint":1,"cluster":"onoff","attribute":"on-off","value":true,"priming":false,"recovered":false}"#,
         );
-        assert_eq!(s.primed_state("desk_light"), Some(State::On));
+        assert_eq!(primed(&s, "desk_light"), Some(State::On));
     }
 
     #[test]
@@ -700,7 +796,7 @@ mod tests {
             r#"{"node_id":6,"cluster":"onoff","attribute":"on-off","value":true,"priming":true,"recovered":false}"#,
         );
         assert_eq!(
-            s.primed_state("desk_light"),
+            primed(&s, "desk_light"),
             Some(State::On),
             "priming も recovered もその時点の実値を運ぶので受ける"
         );
