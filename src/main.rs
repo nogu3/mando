@@ -183,6 +183,10 @@ fn start_push(app: Shared, store: Arc<push::PushStore>) {
     let rebased = app.clone();
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
+            // 溜まった依頼は 1 回に畳む。listener が短時間に何度も落ちると
+            // 1 周ぶんの read（N デバイス × 最大 exec timeout）が滞留し、
+            // 不調な matd を余計に叩き続けることになる。
+            while rx.try_recv().is_ok() {}
             rebaseline_push_devices(rebased.clone()).await;
         }
     });
@@ -201,9 +205,10 @@ async fn rebaseline_push_devices(app: Shared) {
         if !store.tracks(&device.name) {
             continue;
         }
+        let generation = store.generation();
         let view = fetch_state(&app, device).await;
         if view.exec == Some(ExecOutcome::Success) {
-            store.baseline(&device.name, view.state);
+            store.baseline(&device.name, view.state, generation);
             tracing::debug!(device = %device.name, state = ?view.state, "push 基準値を確定");
         } else {
             tracing::warn!(
@@ -436,11 +441,13 @@ async fn push_state(app: &App, store: &Arc<push::PushStore>, device: &Device) ->
             stale: Some(false),
         };
     }
+    // read を始める前の世代を覚える。断を跨いだ戻りは基準値にしない。
+    let generation = store.generation();
     let mut view = fetch_state(app, device).await;
     let ok = view.exec == Some(ExecOutcome::Success);
     if ok {
         // 確定できた値を基準値にする（＝以後は exec ゼロで即答できる）。
-        store.baseline(&device.name, view.state);
+        store.baseline(&device.name, view.state, generation);
     }
     view.source = Some(push::SOURCE_READ);
     view.stale = Some(!ok);
@@ -2124,7 +2131,7 @@ mod tests {
         let app = push_app(&p, true);
         let store = app.push.clone().unwrap();
         store.set_connected(true);
-        store.baseline("light", normalize::State::On);
+        store.baseline("light", normalize::State::On, store.generation());
 
         let (st, v) = call_on(app, "GET", "/api/devices/light/state").await;
         assert_eq!(st, StatusCode::OK);
@@ -2183,7 +2190,7 @@ mod tests {
         let app = push_app(&p, true);
         let store = app.push.clone().unwrap();
         store.set_connected(true);
-        store.baseline("plain", normalize::State::On); // 管理外なので効かない
+        store.baseline("plain", normalize::State::On, store.generation()); // 管理外なので効かない
 
         let (_, v) = call_on(app, "GET", "/api/devices/plain/state").await;
         assert_eq!(v["state"], "on");

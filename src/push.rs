@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, Kind};
@@ -58,6 +58,9 @@ impl Slot {
 struct Inner {
     /// listener が生きているか。
     connected: bool,
+    /// 接続世代。`set_connected` のたびに進む。断を挟んだ read の戻りを
+    /// 基準値として採用しないための世代印。
+    generation: u64,
     /// device 名 → slot。
     slots: HashMap<String, Slot>,
 }
@@ -94,6 +97,7 @@ impl PushStore {
             tracked,
             inner: Mutex::new(Inner {
                 connected: false,
+                generation: 0,
                 slots: HashMap::new(),
             }),
         }
@@ -118,6 +122,11 @@ impl PushStore {
         inner.slots.get(device)?.state()
     }
 
+    /// 現在の接続世代。read を**始める前**に取り、`baseline` に渡す。
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
     /// listener の接続状態を切り替える。false にすると全デバイスの基準値を
     /// 捨てる（切れていた間に状態が変化した可能性があり、`mat listen` は
     /// 新規クライアント接続へ priming を replay しないため、再 read が唯一の
@@ -125,6 +134,8 @@ impl PushStore {
     pub fn set_connected(&self, connected: bool) {
         let mut inner = self.lock();
         inner.connected = connected;
+        // 断も復帰も世代を進める。跨いだ read の戻りは採用しない。
+        inner.generation = inner.generation.wrapping_add(1);
         if !connected {
             inner.slots.clear();
         }
@@ -132,14 +143,19 @@ impl PushStore {
 
     /// read で確定した値を基準値として格納する（primed 化）。
     ///
-    /// 基準値は listener が生きている間だけ意味を持つので、断中は何もしない
+    /// `generation` は read を**始める前**に `generation()` で取った値。
+    /// 断・再接続を跨いだ read の戻りは基準値にしない — 切れていた間に状態が
+    /// 変わった可能性があり、`mat listen` は新規接続へ priming を replay
+    /// しないので、その値が今も正しい保証がない。
+    ///
+    /// 基準値は listener が生きている間だけ意味を持つので、断中も何もしない
     /// （断中の read 結果は呼び出し元の GET state 応答として直接返る）。
-    pub fn baseline(&self, device: &str, state: State) {
+    pub fn baseline(&self, device: &str, state: State, generation: u64) {
         let Some(value) = normalize::state_to_onoff_value(state) else {
             return;
         };
         let mut inner = self.lock();
-        if !inner.connected {
+        if !inner.connected || inner.generation != generation {
             return;
         }
         Self::update(&mut inner, device, normalize::ONOFF_KEY.to_string(), value);
@@ -215,11 +231,25 @@ async fn run_once(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    // stderr は読み捨てないとパイプが埋まって子が止まる。診断は debug に残す。
+    // stderr は読み捨てないとパイプが埋まって子が止まる。止まると stdout が
+    // EOF にならず、listener が「生きているのに何も届かない」状態に陥って
+    // primed 値を信頼できるものとして出し続けてしまう。不正な UTF-8 で
+    // 降りないよう、行ではなくバイトで読んで lossy に落とす。
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(line = %line, "push listener stderr");
+        let mut stderr = stderr;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    tracing::debug!(chunk = %chunk.trim_end(), "push listener stderr");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "push listener stderr の読み取りを終了");
+                    break;
+                }
+            }
         }
     });
 
@@ -230,8 +260,17 @@ async fn run_once(
     let _ = rebaseline.send(());
 
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        ingest(store, &line);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => ingest(store, &line),
+            Ok(None) => break,
+            Err(e) => {
+                // ストリーム読み取りの失敗は「終わった」として扱い、終了
+                // ステータスは下で観測する（起動失敗と混同しない）。
+                tracing::warn!(error = %e, "push listener stdout の読み取りに失敗");
+                break;
+            }
+        }
     }
     child.wait().await
 }
@@ -291,6 +330,12 @@ mod tests {
         get_state = ["true"]
         on = ["true"]
         off = ["true"]
+        [[device]]
+        name = "blind"
+        node_id = 7
+        get_state = ["true"]
+        open = ["true"]
+        close = ["true"]
     "##;
 
     fn store() -> PushStore {
@@ -321,6 +366,10 @@ mod tests {
         assert!(s.tracks("desk_light"));
         assert!(!s.tracks("plain"), "node_id 無しは push 管理外");
         assert!(!s.tracks("ghost"));
+        assert!(
+            !s.tracks("blind"),
+            "node_id があっても light 以外は push 管理外"
+        );
     }
 
     #[test]
@@ -359,14 +408,32 @@ mod tests {
     #[test]
     fn baseline_primes_and_is_ignored_while_disconnected() {
         let s = store();
-        s.baseline("desk_light", State::On);
+        s.baseline("desk_light", State::On, s.generation());
         assert_eq!(s.primed_state("desk_light"), None, "断中は基準値を持たない");
         s.set_connected(true);
-        s.baseline("desk_light", State::On);
+        s.baseline("desk_light", State::On, s.generation());
         assert_eq!(s.primed_state("desk_light"), Some(State::On));
         // 解釈できない state は基準値にしない。
-        s.baseline("living_lights", State::Unknown);
+        s.baseline("living_lights", State::Unknown, s.generation());
         assert_eq!(s.primed_state("living_lights"), None);
+    }
+
+    #[test]
+    fn baseline_from_a_read_that_straddled_a_disconnect_is_dropped() {
+        let s = connected_store();
+        // read 開始時の世代を取ったあとで listener が落ちて復帰する。
+        let generation = s.generation();
+        s.set_connected(false);
+        s.set_connected(true);
+        s.baseline("desk_light", State::On, generation);
+        assert_eq!(
+            s.primed_state("desk_light"),
+            None,
+            "断を跨いだ read の戻りを基準値にしてはいけない"
+        );
+        // 現在の世代の read はちゃんと採用される。
+        s.baseline("desk_light", State::On, s.generation());
+        assert_eq!(s.primed_state("desk_light"), Some(State::On));
     }
 
     #[test]
