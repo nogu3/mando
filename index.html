@@ -379,7 +379,10 @@ const POLL_EXTEND_MS = 30 * 1000;          // 動作中（opening/closing）が�
 const POLL_EXTEND_CAP_MS = 10 * 60 * 1000; // 直近トリガーからの延長上限（固着時の無限ポーリング防止）。
 const MOVING_STATES = new Set(["opening", "closing"]);
 const LIGHT_CATCHUP_MS = 2000; // light: SSE が切れているときの追いつき取得までの待ち（fallback）。
-const LIGHT_SETTLE_MS = 2000;  // light: 押下後に push を待つ見張りの猶予（空振りなら読む）。
+// light: 押下後に push を待つ見張りの猶予（空振りなら読む）。実機実測の push 到達は
+// desk 1.2 秒 / リビング 8 灯 0.8〜3.1 秒。2000 だとこの分布の内側に入ってしまい、
+// 遅い灯では push が来る途中で read を撒く（消したかった read が戻る）ので 4000 にする。
+const LIGHT_SETTLE_MS = 4000;
 
 const app = document.getElementById("app");
 const cards = new Map();  // device name -> {statusEl, labelEl, msgEl, buttons, state}

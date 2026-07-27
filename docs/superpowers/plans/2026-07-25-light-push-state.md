@@ -20,7 +20,7 @@
 - 成果物はバイナリ 1 個 + `config.toml`（`index.html` / `mesh.html` は焼き込み）
 - backoff の既定値: `BACKOFF_MIN = 1s`、`BACKOFF_MAX = 30s`、`BACKOFF_RESET_AFTER = 60s`
 - broadcast バッファ: `BROADCAST_CAPACITY = 64`
-- クライアント定数: `LIGHT_CATCHUP_MS = 2000`（既存・SSE 断時の fallback）、`LIGHT_SETTLE_MS = 2000`（新規・push を待つ見張り。空振り時のみ読む）
+- クライアント定数: `LIGHT_CATCHUP_MS = 2000`（既存・SSE 断時の fallback）、`LIGHT_SETTLE_MS = 4000`（新規・push を待つ見張り。空振り時のみ読む。当初 2000 → jarvis 実測の push 到達 0.8〜3.1 秒を吸収できず read を撒いたため 4000 へ）
 
 ## 設計からの逸脱・補足（5 点）
 
@@ -2089,8 +2089,12 @@ EOF
 
 ```javascript
 const LIGHT_CATCHUP_MS = 2000; // light: SSE が切れているときの追いつき取得までの待ち（fallback）。
-const LIGHT_SETTLE_MS = 2000;  // light: SSE 接続中に「反映中…」を畳むまでの待ち（通信しない）。
+const LIGHT_SETTLE_MS = 4000;  // light: 押下後に push を待つ見張りの猶予（空振りなら読む）。
 ```
+
+> `LIGHT_SETTLE_MS` は当初 2000 で、かつ「通信しない再描画」だった。実装中の修正 9 で
+> 見張りに変わり、さらに jarvis の実測（push 到達 0.8〜3.1 秒）が 2000 の内側に
+> 収まっていたため 4000 へ引き上げた。詳細は上の「実装中に入った修正」を参照。
 
 `let busyCount = 0; …` の直後に:
 
