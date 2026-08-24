@@ -2431,40 +2431,60 @@ EOF
 コードのタスクとは別に、実機で以下を確認する。**夜間を避け、終了時は必ず元の
 on/off 状態へ戻す。**
 
+> **実施済み（2026-08-25 朝）。全項目クリア。** 実施時の発見:
+>
+> - 「push 基準値を確定」は `tracing::debug!` で、本番の `RUST_LOG=mando=info` では
+>   出ない。全 light が `source: "push"` かつ `exec` なしで即答することを同等の確認とした。
+> - **entrance_light の node_id が実ドリフト**（config=13、実機=23。再 commission による）。
+>   drift warn と read fallback が設計どおり動いていたのを本番ログで確認
+>   → 「node_id を間違える」項目の実証を兼ねる。jarvis-iac 側で 13→23 に修正。
+> - **バグ発見: `[push]` 有効時、mando が SIGTERM で終了しない。** graceful shutdown
+>   開始後も push supervisor が生きて listener を再起動し、systemd が 10 秒後に
+>   SIGKILL で回収する（cgroup ごと殺されるので孤児は残らない）。shutdown 経路で
+>   supervisor task を abort する修正が必要（未着手）。
+
 前提:
 
-- [ ] jarvis の `mat` が `listen` を持つ版であること（`mat listen --help` が通る。mat ≥ 0.25.0）
-- [ ] `matd` が常駐していること（mando の unit に `MAT_MATD_SOCKET` が渡っている）
-- [ ] jarvis-iac の `roles/mando/files/config.toml` に `[push] listen` と各 light の `node_id` を追記し、Ansible で配って mando を再起動する（config はリポジトリ管理外・`~/.config/mando/`）
+- [x] jarvis の `mat` が `listen` を持つ版であること（`mat listen --help` が通る。mat ≥ 0.25.0）— mat 1.28.0
+- [x] `matd` が常駐していること（mando の unit に `MAT_MATD_SOCKET` が渡っている）
+- [x] jarvis-iac の `roles/mando/files/config.toml` に `[push] listen` と各 light の `node_id` を追記し、Ansible で配って mando を再起動する（config はリポジトリ管理外・`~/.config/mando/`）
 
 確認:
 
-- [ ] mando 起動後、`curl -s localhost:8080/api/devices/living_lights/state` が
+- [x] mando 起動後、`curl -s localhost:8080/api/devices/living_lights/state` が
       **exec ゼロで即答**すること。判定は `source` ではなく **`exec` が付かないこと**で行う
       — 再ベースライン read 直後の出どころは `"read"` が正しい（`"push"` になるのは
       実際に listen イベントを受けたあと）。`~即答` だけだと warm read 100ms でも
-      満たせてしまい、primed 経路の退行を隠す
-- [ ] `journalctl --user -u mando` に「push 基準値を確定」が全 light 分出ていること。
-      `node_id` 不一致の warn が出ていないこと
-- [ ] 別端末（or `curl -XPOST`）で on → **開いている UI がポーリングなしで反映**されること
-- [ ] 既に点いているライトの「つける」を押しても「反映中…」で固まらないこと
+      満たせてしまい、primed 経路の退行を隠す — 全 13 light が ~2ms・`exec` なし
+- [x] `journalctl --user -u mando` に「push 基準値を確定」が全 light 分出ていること。
+      `node_id` 不一致の warn が出ていないこと — 確定ログは debug レベルで info 運用では
+      出ない（冒頭の注記）。source=push 即答で代替確認。不一致 warn は entrance_light の
+      実ドリフトのみ（jarvis-iac で修正）
+- [x] 別端末（or `curl -XPOST`）で on → **開いている UI がポーリングなしで反映**されること
+- [x] 既に点いているライトの「つける」を押しても「反映中…」で固まらないこと
       （見張りが空振りして ~2 秒後に read へ落ちる。これが見張りの受け入れテスト）
-- [ ] **色 / 明るさ / プリセットを押す** → onoff イベントは来ないので必ず見張りが
+- [x] **色 / 明るさ / プリセットを押す** → onoff イベントは来ないので必ず見張りが
       空振りする経路。~2 秒で表示が畳まれ、read が 1 回だけ走ること
-- [ ] `systemctl --user restart matd` → listener が再接続し、再ベースライン後に
-      再び exec ゼロで即答へ戻ること（backoff のログが出る）
-- [ ] **`matd` を数分止めたまま**にする → `journalctl` の sweep / backoff の間隔を見て、
+- [x] `systemctl --user restart matd` → listener が再接続し、再ベースライン後に
+      再び exec ゼロで即答へ戻ること（backoff のログが出る）— ~60 秒で復帰。
+      cold CASE で数台の初回 read が落ちるが sweep が回収する
+- [x] **`matd` を数分止めたまま**にする → `journalctl` の sweep / backoff の間隔を見て、
       `mat read` を撒き続けていないこと（子が 3 秒生き延びるまで再ベースラインを
-      頼まない仕掛けが効いているか。warn 行数も数える）
-- [ ] **`matd` を止めた状態で UI からライトを押す** → 「反映中…」のあと read の結果か
+      頼まない仕掛けが効いているか。warn 行数も数える）— 30 秒間隔の backoff に収束、
+      5 分停止で WARN 18 行のみ
+- [x] **`matd` を止めた状態で UI からライトを押す** → 「反映中…」のあと read の結果か
       「状態不明」が出ること。**押下前の状態へ黙って戻らないこと**（原則 7 の要）
-- [ ] **`node_id` を意図的に外した light** を `[push]` 有りで置く → 起動時 warn が出て、
+      — state は `unknown + stale:true`、POST は `{"action":"failed"}`
+- [x] **`node_id` を意図的に外した light** を `[push]` 有りで置く → 起動時 warn が出て、
       かつそのタイルを押しても確認が効くこと（見張りが read へ落ちる決定的ケース）
-- [ ] **`node_id` を意図的に間違える** → 起動 sweep でドリフト warn が出ること。
-      そのタイルを押したときの挙動も見る
-- [ ] **2 つ目のタブ / 端末を開いたまま**にして cross-tab 反映を確認。スマホの通信を
-      切って戻す → 再接続スナップショットで表示が直ること
-- [ ] `curl -N localhost:8080/api/events` を開いたまま `matd` を再起動 → 再ベースラインの
+- [x] **`node_id` を意図的に間違える** → 起動 sweep でドリフト warn が出ること。
+      そのタイルを押したときの挙動も見る — entrance_light の実ドリフトで実証
+      （warn 継続出力・read fallback で操作可）
+- [x] **2 つ目のタブ / 端末を開いたまま**にして cross-tab 反映を確認。スマホの通信を
+      切って戻す → 再接続スナップショットで表示が直ること — cross-tab は curl POST →
+      UI 反映で確認。通信断→復帰はサーバ側の再接続スナップショット送出を確認済み
+      （実機の機内モード試験は任意で残し）
+- [x] `curl -N localhost:8080/api/events` を開いたまま `matd` を再起動 → 再ベースラインの
       変化イベントが流れ、ストリームが切れないこと（subscribe→snapshot の順序と KeepAlive）
-- [ ] `[push]` をコメントアウトして再起動 → `/api/events` が 404、UI は従来の
+- [x] `[push]` をコメントアウトして再起動 → `/api/events` が 404、UI は従来の
       追いつき取得で動くこと（degrade の確認）
