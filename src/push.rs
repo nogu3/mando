@@ -113,7 +113,9 @@ pub struct PushStore {
     /// push 管理下のデバイス名（config 記載順。スナップショットの順序）。
     tracked: Vec<String>,
     inner: Mutex<Inner>,
-    tx: broadcast::Sender<StateEvent>,
+    /// close() で Sender を落とすと全購読者が Closed を受けて SSE が終端する。
+    /// None = shutdown 済み（以後の subscribe は即 Closed、send は捨てる）。
+    tx: Mutex<Option<broadcast::Sender<StateEvent>>>,
 }
 
 impl PushStore {
@@ -139,7 +141,7 @@ impl PushStore {
                 generation: 0,
                 slots: HashMap::new(),
             }),
-            tx,
+            tx: Mutex::new(Some(tx)),
         }
     }
 
@@ -275,18 +277,32 @@ impl PushStore {
             return;
         }
         if let Some(state) = after {
-            // 購読者ゼロなら Err。捨ててよい。
-            let _ = self.tx.send(StateEvent {
-                device: device.to_string(),
-                state,
-                source,
-                stale: false,
-            });
+            // 購読者ゼロなら Err。捨ててよい。close 後（None）も同様に捨てる。
+            if let Some(tx) = self.tx.lock().expect("push tx poisoned").as_ref() {
+                let _ = tx.send(StateEvent {
+                    device: device.to_string(),
+                    state,
+                    source,
+                    stale: false,
+                });
+            }
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
-        self.tx.subscribe()
+        match self.tx.lock().expect("push tx poisoned").as_ref() {
+            Some(tx) => tx.subscribe(),
+            // close 済み: Sender を即座に落とした受け口を返す。購読者は
+            // 最初の recv で Closed を受け、SSE は開始と同時に終端する。
+            None => broadcast::channel(1).1,
+        }
+    }
+
+    /// shutdown 用。broadcast の Sender を落とし、全 SSE ストリームを終端させる。
+    /// これが無いと graceful shutdown が無限ストリームの完了を待ち続け、
+    /// systemd の TimeoutStopSec で SIGKILL に落ちる。
+    pub fn close(&self) {
+        self.tx.lock().expect("push tx poisoned").take();
     }
 
     /// SSE 接続直後に送る現在スナップショット。基準値が確立していない
@@ -654,6 +670,42 @@ mod tests {
             None,
             "同じ代表ノードを共有するデバイスも基準値を落とす"
         );
+    }
+
+    /// shutdown で SSE を終端するための釘: close() で既存購読者は Closed を
+    /// 受け、以後の subscribe も即 Closed になる（graceful shutdown が
+    /// 無限ストリームを待ち続けない）。
+    #[test]
+    fn close_ends_existing_and_future_subscribers() {
+        let s = connected_store();
+        let mut rx = s.subscribe();
+        s.close();
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ),
+            "close 後、既存購読者は Closed を受ける"
+        );
+        let mut fresh = s.subscribe();
+        assert!(
+            matches!(
+                fresh.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ),
+            "close 後の subscribe は即 Closed（shutdown 中の新規 SSE を待たせない）"
+        );
+    }
+
+    /// close 後に listen イベントや baseline が届いても落ちない
+    /// （shutdown と listener 停止のレースは起きうる）。
+    #[test]
+    fn apply_and_baseline_after_close_are_harmless() {
+        let s = connected_store();
+        s.close();
+        s.apply(&onoff_event(6, true));
+        s.baseline("desk_light", State::Off, s.generation());
+        assert_eq!(primed(&s, "desk_light"), Some(State::Off), "格納自体は生きる");
     }
 
     #[test]

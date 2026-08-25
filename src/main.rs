@@ -142,19 +142,48 @@ async fn main() {
     // bind に成功してから push listener を起こす。bind 失敗の exit(1) では
     // デストラクタが走らず kill_on_drop が効かないため、先に起こすと
     // mat listen の子プロセスが取り残される。
-    if let Some(store) = store {
-        start_push(app, store);
-    }
+    let push_tasks = match store.clone() {
+        Some(s) => start_push(app, s),
+        None => Vec::new(),
+    };
 
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(run_shutdown(wait_for_signal(), store, push_tasks))
         .await
         .expect("server error");
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+/// SIGINT（unit の KillSignal / Ctrl-C）または SIGTERM（systemd 既定）を待つ。
+async fn wait_for_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM ハンドラを登録できない");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// シグナル受信後の後始末。SSE を終端し（store.close）、push のタスクを
+/// 止めてから axum の drain に入る。どちらも放置すると graceful shutdown が
+/// 完了せず、systemd の TimeoutStopSec（10 秒）で SIGKILL に落ちる。
+/// listener タスクの abort は kill_on_drop で mat listen の子も道連れにする。
+async fn run_shutdown(
+    signal: impl std::future::Future<Output = ()>,
+    store: Option<Arc<push::PushStore>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
+    signal.await;
     tracing::info!("shutdown");
+    if let Some(store) = store {
+        store.close();
+    }
+    for t in &tasks {
+        t.abort();
+    }
+    for t in tasks {
+        // JoinError（cancelled）は正常系。abort の完了だけ待つ。
+        let _ = t.await;
+    }
 }
 
 /// `[push]` 有りのとき、node_id の設定漏れを起動時に告知する（無しなら
@@ -175,7 +204,8 @@ fn warn_missing_node_ids(config: &Config) {
 }
 
 /// listener と再ベースライン受け口を起動する。どちらも起動をブロックしない。
-fn start_push(app: Shared, store: Arc<push::PushStore>) {
+/// 返り値は shutdown で止めるべきタスク（再ベースライン受け・listener）。
+fn start_push(app: Shared, store: Arc<push::PushStore>) -> Vec<tokio::task::JoinHandle<()>> {
     let listen = app
         .config
         .push
@@ -188,7 +218,7 @@ fn start_push(app: Shared, store: Arc<push::PushStore>) {
     // listener 側をブロックしないよう別タスクで受ける。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let rebased = app.clone();
-    tokio::spawn(async move {
+    let rebase_task = tokio::spawn(async move {
         while rx.recv().await.is_some() {
             // 溜まった依頼は 1 回に畳む。listener が短時間に何度も落ちると
             // 1 周ぶんの read（N デバイス × 最大 exec timeout）が滞留し、
@@ -198,7 +228,8 @@ fn start_push(app: Shared, store: Arc<push::PushStore>) {
         }
     });
 
-    tokio::spawn(async move { push::run_listener(listen, store, tx).await });
+    let listen_task = tokio::spawn(async move { push::run_listener(listen, store, tx).await });
+    vec![rebase_task, listen_task]
 }
 
 /// push 管理下の全 light の基準値を read で確定する。購読の誘発も兼ねるので
@@ -2204,6 +2235,72 @@ mod tests {
         assert_eq!(change["device"], "light");
         assert_eq!(change["state"], "off");
         assert_eq!(change["source"], "push");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// shutdown の要: store.close() で開きっぱなしの SSE ボディが「終わる」。
+    /// これが無いと graceful shutdown が SSE の完了を待ち続け、systemd の
+    /// TimeoutStopSec で SIGKILL に落ちる。
+    #[tokio::test]
+    async fn sse_stream_ends_when_store_closes() {
+        let p = tmp_counter("sseclose");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        store.set_connected(true);
+        store.baseline("light", normalize::State::On, store.generation());
+
+        let res = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = res.into_body();
+        // ストリームが生きていることを確かめてから閉じる。
+        let _ = next_sse_data(&mut body).await;
+
+        store.close();
+        let end = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            // keep-alive 等の残フレームは読み流し、終端（None）まで進む。
+            while let Some(frame) = body.frame().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(end.is_ok(), "close 後も SSE ボディが終わらない");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// shutdown の全体像: シグナルが来たら store を閉じ（SSE 終端）、
+    /// push のタスク（listener / 再ベースライン受け）を止めてから返る。
+    /// タスクを放置すると shutdown 中に listener が再起動して read を撒く。
+    #[tokio::test]
+    async fn run_shutdown_closes_store_and_stops_push_tasks() {
+        let p = tmp_counter("shutdown");
+        let app = push_app(&p, true);
+        let store = app.push.clone().unwrap();
+        let mut rx = store.subscribe();
+        // 永遠に終わらないタスク = abort されない限り run_shutdown は返れない。
+        let t1 = tokio::spawn(std::future::pending::<()>());
+        let t2 = tokio::spawn(std::future::pending::<()>());
+
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_shutdown(std::future::ready(()), Some(store.clone()), vec![t1, t2]),
+        )
+        .await;
+        assert!(done.is_ok(), "push タスクが止まらず run_shutdown が返らない");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+            ),
+            "shutdown で store が閉じられていない（SSE が終端しない）"
+        );
         std::fs::remove_file(&p).ok();
     }
 
