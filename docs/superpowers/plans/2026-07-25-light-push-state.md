@@ -2438,10 +2438,12 @@ on/off 状態へ戻す。**
 > - **entrance_light の node_id が実ドリフト**（config=13、実機=23。再 commission による）。
 >   drift warn と read fallback が設計どおり動いていたのを本番ログで確認
 >   → 「node_id を間違える」項目の実証を兼ねる。jarvis-iac 側で 13→23 に修正。
-> - **バグ発見: `[push]` 有効時、mando が SIGTERM で終了しない。** graceful shutdown
->   開始後も push supervisor が生きて listener を再起動し、systemd が 10 秒後に
->   SIGKILL で回収する（cgroup ごと殺されるので孤児は残らない）。shutdown 経路で
->   supervisor task を abort する修正が必要（未着手）。
+> - **バグ発見: `[push]` 有効時、mando が graceful shutdown を完了できない。**
+>   開きっぱなしの SSE を drain が待ち続け、push supervisor は shutdown を知らず
+>   listener を再起動し、systemd が 10 秒後に SIGKILL で回収していた（cgroup ごと
+>   殺されるので孤児は残らない）。→ **同日修正済み**: shutdown で
+>   `PushStore::close()`（SSE 終端）+ push タスク abort + SIGTERM 対応。
+>   実機で SSE を開いたまま restart 0.05 秒・SIGKILL なしを確認。
 
 前提:
 
