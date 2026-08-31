@@ -1090,10 +1090,11 @@ async function refreshOnce() {
   await pollOnce();
 }
 
-/* ── light の初回 state 取得（1 回だけ・ポーリングなし）── */
+/* ── light の初回 state 取得（1 回だけ・ポーリングなし）──
+   並列に投げる: サーバ側は device ごとに別レーン（exec_lane）なので並列可。
+   逐次だと 1 台の exec timeout (15s) が直列に積み上がる（issue #6）。 */
 async function fetchLightStatesOnce(devices) {
-  for (const dev of devices) {
-    if (dev.kind !== "light") continue;
+  await Promise.all(devices.filter((dev) => dev.kind === "light").map(async (dev) => {
     try {
       const view = await api("GET", `/api/devices/${encodeURIComponent(dev.name)}/state`);
       renderState(dev.name, view);
@@ -1101,7 +1102,7 @@ async function fetchLightStatesOnce(devices) {
       const c = cards.get(dev.name);
       if (c) { c.msgEl.textContent = "接続なし"; c.statusEl.classList.add("error"); }
     }
-  }
+  }));
 }
 
 /* ── マシン健全性バナー（異常時のみ表示）────────────── */
@@ -1138,10 +1139,11 @@ async function fetchHealth() {
 }
 
 /* ── きろく（embalse グラフ）─────────────────────── */
-// dataviz 検証済みカテゴリカルパレット（ダーク面 #10141d で全チェック PASS）。
-// 系列へ初出順に固定割当する。循環させない — 5 系列以上は先頭 4 系列のみ描画
-// （必要なら config 側でグラフを分割する）。
-const GRAPH_COLORS = ["#3987e5", "#008300", "#d55181", "#c98500"];
+// dataviz 検証済みカテゴリカルパレット（ダーク面 #10141d で全チェック PASS、
+// 5色版 2026-09-01 再検証済み）。系列へ初出順に固定割当する。循環させない —
+// 色数超過の系列は描画せず、凡例に「他 N 系列」を出す（issue #7: 無音で
+// 消える故障モードの封鎖。必要なら config 側でグラフを分割する）。
+const GRAPH_COLORS = ["#3987e5", "#008300", "#d55181", "#c98500", "#8a7ae8"];
 // スタックド棒（円収支）: 支出=ニュートラル、得=緑/青（案 E）。色は series の符号で割当。
 const STACK_NEG_COLOR = "#6b7488";              // 支出（合計が負の系列）
 const STACK_POS_COLORS = ["#18b88a", "#6ea8fe"]; // 得（合計が正の系列）を初出順に
@@ -1226,7 +1228,9 @@ async function loadGraphs() {
 }
 
 function renderGraph(gc, view) {
-  const series = view.series.filter((s) => s.points.length).slice(0, GRAPH_COLORS.length);
+  const alive = view.series.filter((s) => s.points.length);
+  const series = alive.slice(0, GRAPH_COLORS.length);
+  const dropped = alive.slice(GRAPH_COLORS.length);
   if (!series.length) {
     gc.bodyEl.innerHTML = `<div class="gmsg">まだデータがありません</div>`;
     return;
@@ -1272,6 +1276,14 @@ function renderGraph(gc, view) {
       k.append(d, s.label);
       gc.legendEl.appendChild(k);
     });
+    // 色数超過で描画されなかった系列を無音で捨てない（issue #7）。
+    if (dropped.length) {
+      const k = document.createElement("span");
+      k.className = "k";
+      k.textContent = `他 ${dropped.length} 系列`;
+      k.title = dropped.map((s) => s.label).join(", ");
+      gc.legendEl.appendChild(k);
+    }
   }
 
   gc.bodyEl.innerHTML = "";
