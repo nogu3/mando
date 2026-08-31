@@ -86,8 +86,61 @@ impl App {
 
 type Shared = Arc<App>;
 
+/// `--version` / `--check` の引数処理（issue #8）。該当したらここで exit する。
+/// サーバの通常起動（引数なし）は素通し — 挙動を 1 バイトも変えない。
+/// clap を足すほどの面ではないので std::env::args で捌く。
+fn handle_cli_args() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--version") | Some("-V") => {
+            println!("mando {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some("--check") => {
+            // --check [--config <path>]。省略時は MANDO_CONFIG → config.toml。
+            let path = match (args.get(1).map(String::as_str), args.get(2)) {
+                (Some("--config"), Some(p)) => p.clone(),
+                (Some("--config"), None) => {
+                    eprintln!("[mando] --config にはパスが要る");
+                    std::process::exit(2);
+                }
+                (Some(other), _) => {
+                    eprintln!("[mando] 不明な引数: {other}");
+                    std::process::exit(2);
+                }
+                (None, _) => {
+                    std::env::var("MANDO_CONFIG").unwrap_or_else(|_| "config.toml".into())
+                }
+            };
+            match Config::check(&path) {
+                Ok(unknown) if unknown.is_empty() => {
+                    println!("[mando] check OK: {path}");
+                    std::process::exit(0);
+                }
+                Ok(unknown) => {
+                    eprintln!("[mando] check FAILED: このバイナリが理解しないキーがある (path: {path})");
+                    for k in unknown {
+                        eprintln!("[mando]   unknown key: {k}");
+                    }
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("[mando] check FAILED: {e} (path: {path})");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("[mando] 不明な引数: {other}");
+            std::process::exit(2);
+        }
+        None => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    handle_cli_args();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

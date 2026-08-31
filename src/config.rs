@@ -518,6 +518,22 @@ impl Config {
         Ok(cfg)
     }
 
+    /// `--check` 用: config を読み、この Config 構造体が理解しない（= runtime が
+    /// 黙って無視する）キーのパスを列挙する。load と同じ validate も通す。
+    /// runtime のパースは寛容なまま（deny_unknown_fields は付けない）— 厳格さは
+    /// デプロイ時のここに置く（issue #8）。
+    pub fn check(path: impl AsRef<Path>) -> Result<Vec<String>, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
+        let mut unknown = Vec::new();
+        let de = toml::de::Deserializer::new(&text);
+        let cfg: Config = serde_ignored::deserialize(de, |ignored| {
+            unknown.push(ignored.to_string());
+        })
+        .map_err(ConfigError::Parse)?;
+        cfg.validate()?;
+        Ok(unknown)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.devices.is_empty() {
             return Err(ConfigError::Empty);
@@ -895,6 +911,54 @@ mod tests {
     fn rejects_empty() {
         let p = write_tmp("empty", "bind = \"0.0.0.0:8080\"\n");
         assert!(matches!(Config::load(&p), Err(ConfigError::Empty)));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn check_passes_valid_config_with_no_unknown_keys() {
+        let p = write_tmp(
+            "check_ok",
+            r##"
+            bind = "127.0.0.1:9999"
+            [[device]]
+            name = "shutter"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "##,
+        );
+        assert_eq!(Config::check(&p).unwrap(), Vec::<String>::new());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn check_reports_unknown_keys_with_paths() {
+        let p = write_tmp(
+            "check_unknown",
+            r##"
+            bind = "127.0.0.1:9999"
+            [push2]
+            foo = 1
+            [[device]]
+            name = "shutter"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            wibble = "x"
+            "##,
+        );
+        let unknown = Config::check(&p).unwrap();
+        assert!(unknown.iter().any(|k| k.starts_with("push2")), "{unknown:?}");
+        assert!(unknown.iter().any(|k| k.contains("wibble")), "{unknown:?}");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn check_still_fails_on_semantically_invalid_config() {
+        // 未知キー検出だけでなく load と同じ検証（validate）も通す — デプロイ前
+        // ゲートとして「起動できない config」を素通しさせない。
+        let p = write_tmp("check_invalid", "bind = \"0.0.0.0:8080\"\n");
+        assert!(matches!(Config::check(&p), Err(ConfigError::Empty)));
         std::fs::remove_file(p).ok();
     }
 
