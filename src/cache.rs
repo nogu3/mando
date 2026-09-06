@@ -136,7 +136,11 @@ mod tests {
                 })
                 .await;
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "失敗はキャッシュされず毎回 fetch");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "失敗はキャッシュされず毎回 fetch"
+        );
     }
 
     #[tokio::test]
@@ -172,9 +176,7 @@ mod tests {
         let cache: Cache<u32> = Cache::default();
         let ttl = Duration::from_millis(500);
         cache.store("k", 5).await;
-        let v = cache
-            .get_or_fetch("k", ttl, || async { (999, true) })
-            .await;
+        let v = cache.get_or_fetch("k", ttl, || async { (999, true) }).await;
         assert_eq!(v, 5, "store 済みの確定値を TTL 内は返す");
     }
 

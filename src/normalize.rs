@@ -408,7 +408,10 @@ fn read_link(v: &Value) -> Option<MeshLink> {
     Some(MeshLink {
         lqi: o.get("lqi").and_then(Value::as_u64).map(|n| n as u8),
         rssi: o.get("avg_rssi").and_then(Value::as_i64),
-        fer: o.get("frame_error_rate").and_then(Value::as_u64).map(|n| n as u8),
+        fer: o
+            .get("frame_error_rate")
+            .and_then(Value::as_u64)
+            .map(|n| n as u8),
     })
 }
 
@@ -668,10 +671,8 @@ mod tests {
     #[test]
     fn parses_listen_event_with_numeric_ids() {
         // 未知 cluster / attribute は数値のまま来る（mat の read と同じ規律）。
-        let ev = parse_mat_listen_event(
-            r#"{"node_id":9,"cluster":1234,"attribute":7,"value":42}"#,
-        )
-        .unwrap();
+        let ev = parse_mat_listen_event(r#"{"node_id":9,"cluster":1234,"attribute":7,"value":42}"#)
+            .unwrap();
         assert_eq!(ev.cluster, "1234");
         assert_eq!(ev.attribute, "7");
         assert_eq!(ev.value, json!(42));
@@ -732,10 +733,7 @@ mod tests {
 
     #[test]
     fn reads_node_id_for_drift_check() {
-        assert_eq!(
-            read_node_id(&json!({"node_id": 6, "value": true})),
-            Some(6)
-        );
+        assert_eq!(read_node_id(&json!({"node_id": 6, "value": true})), Some(6));
         assert_eq!(read_node_id(&json!({"value": true})), None);
         assert_eq!(read_node_id(&json!({"node_id": "6"})), None);
     }
@@ -1022,10 +1020,10 @@ mod tests {
     fn graph_rows_invalid_rows_dropped() {
         let rows = [
             json!({"ts": "t1", "value": "not-a-number"}), // value 非数値
-            json!({"value": 1.0}),                         // ts 欠落
-            json!({"ts": "t2"}),                           // value 欠落
-            json!("garbage"),                              // オブジェクトですらない
-            json!({"ts": "t3", "value": 3.0}),             // 唯一の正常行
+            json!({"value": 1.0}),                        // ts 欠落
+            json!({"ts": "t2"}),                          // value 欠落
+            json!("garbage"),                             // オブジェクトですらない
+            json!({"ts": "t3", "value": 3.0}),            // 唯一の正常行
         ];
         let s = normalize_graph_rows(&rows, "x", None).series;
         assert_eq!(s.len(), 1);
@@ -1271,7 +1269,11 @@ mod tests {
     #[test]
     fn mesh_route_only_edge() {
         let v = normalize_mesh(&sample(), &th(), None);
-        let e = v.edges.iter().find(|e| e.b == "ext:AABBCCDDEEFF0011").unwrap();
+        let e = v
+            .edges
+            .iter()
+            .find(|e| e.b == "ext:AABBCCDDEEFF0011")
+            .unwrap();
         assert_eq!(e.grade, "route_only");
         assert_eq!(e.lqi, None);
         assert_eq!(e.rssi, None);
@@ -1306,11 +1308,23 @@ mod tests {
                          "b_sees_a": null}]
             })
         };
-        assert_eq!(normalize_mesh(&mk(3, 88), &th(), None).edges[0].grade, "weak");
-        assert_eq!(normalize_mesh(&mk(2, 30), &th(), None).edges[0].grade, "weak");
-        assert_eq!(normalize_mesh(&mk(0, 88), &th(), None).edges[0].grade, "bad");
+        assert_eq!(
+            normalize_mesh(&mk(3, 88), &th(), None).edges[0].grade,
+            "weak"
+        );
+        assert_eq!(
+            normalize_mesh(&mk(2, 30), &th(), None).edges[0].grade,
+            "weak"
+        );
+        assert_eq!(
+            normalize_mesh(&mk(0, 88), &th(), None).edges[0].grade,
+            "bad"
+        );
         // しきい値未満の誤り率は等級を変えない
-        assert_eq!(normalize_mesh(&mk(3, 29), &th(), None).edges[0].grade, "good");
+        assert_eq!(
+            normalize_mesh(&mk(3, 29), &th(), None).edges[0].grade,
+            "good"
+        );
     }
 
     /// 両視点のうち悪いほうを採る。LQI が同値なら誤り率が大きいほう。
@@ -1351,7 +1365,11 @@ mod tests {
                      "b_sees_a": null}]
         });
         assert_eq!(normalize_mesh(&raw, &th(), None).edges[0].grade, "fair");
-        let strict = crate::config::MeshThresholds { lqi_fair: 3, lqi_weak: 2, fer_weak: 30 };
+        let strict = crate::config::MeshThresholds {
+            lqi_fair: 3,
+            lqi_weak: 2,
+            fer_weak: 30,
+        };
         assert_eq!(normalize_mesh(&raw, &strict, None).edges[0].grade, "weak");
     }
 

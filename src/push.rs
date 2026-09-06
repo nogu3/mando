@@ -250,7 +250,13 @@ impl PushStore {
         let key = normalize::attr_key(&ev.cluster, &ev.attribute);
         let mut inner = self.lock();
         for device in &devices {
-            self.update(&mut inner, device, key.clone(), ev.value.clone(), SOURCE_PUSH);
+            self.update(
+                &mut inner,
+                device,
+                key.clone(),
+                ev.value.clone(),
+                SOURCE_PUSH,
+            );
         }
         true
     }
@@ -348,7 +354,10 @@ pub async fn run_listener(
         if started.elapsed() >= BACKOFF_RESET_AFTER {
             backoff = BACKOFF_MIN;
         }
-        tracing::info!(wait_ms = backoff.as_millis() as u64, "push listener を再起動する");
+        tracing::info!(
+            wait_ms = backoff.as_millis() as u64,
+            "push listener を再起動する"
+        );
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
@@ -643,7 +652,10 @@ mod tests {
         );
         // onoff の push が来たら出どころは push になる。
         s.apply(&onoff_event(6, false));
-        assert_eq!(s.primed_state("desk_light"), Some((State::Off, SOURCE_PUSH)));
+        assert_eq!(
+            s.primed_state("desk_light"),
+            Some((State::Off, SOURCE_PUSH))
+        );
     }
 
     #[test]
@@ -681,10 +693,7 @@ mod tests {
         let mut rx = s.subscribe();
         s.close();
         assert!(
-            matches!(
-                rx.try_recv(),
-                Err(broadcast::error::TryRecvError::Closed)
-            ),
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Closed)),
             "close 後、既存購読者は Closed を受ける"
         );
         let mut fresh = s.subscribe();
@@ -705,7 +714,11 @@ mod tests {
         s.close();
         s.apply(&onoff_event(6, true));
         s.baseline("desk_light", State::Off, s.generation());
-        assert_eq!(primed(&s, "desk_light"), Some(State::Off), "格納自体は生きる");
+        assert_eq!(
+            primed(&s, "desk_light"),
+            Some(State::Off),
+            "格納自体は生きる"
+        );
     }
 
     #[test]
@@ -859,7 +872,11 @@ mod tests {
         ] {
             ingest(&s, line);
         }
-        assert_eq!(primed(&s, "desk_light"), None, "壊れた行で state を作らない");
+        assert_eq!(
+            primed(&s, "desk_light"),
+            None,
+            "壊れた行で state を作らない"
+        );
         // 壊れた行の後も正常な行は取り込める。
         ingest(
             &s,

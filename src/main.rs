@@ -27,7 +27,9 @@ use serde_json::Value;
 
 use config::{Config, Device, Face, Kind};
 use exec::{ExecOutcome, Executor};
-use normalize::{normalize_enl_state, normalize_mat_onoff, GraphSeries, MeshView, State as DeviceState};
+use normalize::{
+    normalize_enl_state, normalize_mat_onoff, GraphSeries, MeshView, State as DeviceState,
+};
 
 /// 焼き込んだ UI（設計原則 8）。config は外、UI はバイナリの一部。
 const INDEX_HTML: &str = include_str!("../index.html");
@@ -78,9 +80,7 @@ impl App {
 
     /// mesh スナップショットの鮮度上限（config の [mesh] ttl_ms）。
     fn mesh_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(
-            self.config.mesh.as_ref().map(|m| m.ttl_ms).unwrap_or(0),
-        )
+        std::time::Duration::from_millis(self.config.mesh.as_ref().map(|m| m.ttl_ms).unwrap_or(0))
     }
 }
 
@@ -108,9 +108,7 @@ fn handle_cli_args() {
                     eprintln!("[mando] 不明な引数: {other}");
                     std::process::exit(2);
                 }
-                (None, _) => {
-                    std::env::var("MANDO_CONFIG").unwrap_or_else(|_| "config.toml".into())
-                }
+                (None, _) => std::env::var("MANDO_CONFIG").unwrap_or_else(|_| "config.toml".into()),
             };
             match Config::check(&path) {
                 Ok(unknown) if unknown.is_empty() => {
@@ -118,7 +116,9 @@ fn handle_cli_args() {
                     std::process::exit(0);
                 }
                 Ok(unknown) => {
-                    eprintln!("[mando] check FAILED: このバイナリが理解しないキーがある (path: {path})");
+                    eprintln!(
+                        "[mando] check FAILED: このバイナリが理解しないキーがある (path: {path})"
+                    );
                     for k in unknown {
                         eprintln!("[mando]   unknown key: {k}");
                     }
@@ -577,9 +577,7 @@ async fn run_action(app: &App, device: &Device, cmd: &[String]) -> ActionView {
     let state = fetch_state(app, device).await;
     // 確定値でキャッシュを更新（成功時のみ）。直後のポーリングが古い値を見ない。
     if state.exec == Some(ExecOutcome::Success) {
-        app.state_cache
-            .store(&device.name, state.clone())
-            .await;
+        app.state_cache.store(&device.name, state.clone()).await;
     }
     ActionView {
         action: result.outcome,
@@ -1012,9 +1010,13 @@ async fn get_graph(
     };
     let normalized =
         normalize::normalize_graph_rows(&rows, graph.label(), graph.series_labels.as_ref());
-    let summary_unit = normalized
-        .summary
-        .map(|_| graph.unit_daily.as_deref().unwrap_or(&graph.unit).to_string());
+    let summary_unit = normalized.summary.map(|_| {
+        graph
+            .unit_daily
+            .as_deref()
+            .unwrap_or(&graph.unit)
+            .to_string()
+    });
     Json(GraphView {
         name: graph.name.clone(),
         period: period.to_string(),
@@ -1310,7 +1312,9 @@ async fn events(State(app): State<Shared>) -> Response {
     let stream = futures_util::stream::iter(snapshot)
         .chain(live)
         .map(|ev| Event::default().json_data(&ev));
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1490,9 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn mesh_refresh_produces_snapshot() {
-        let app = app_from(&format!(
-            "{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"
-        ));
+        let app = app_from(&format!("{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"));
         let (s, _) = call_on(app.clone(), "POST", "/api/mesh/refresh").await;
         assert_eq!(s, StatusCode::ACCEPTED);
 
@@ -1513,10 +1515,8 @@ mod tests {
     #[tokio::test]
     async fn mesh_refresh_is_single_flight() {
         // 走った回数をファイル行数で数える。
-        let counter = std::env::temp_dir().join(format!(
-            "mando-mesh-singleflight-{}",
-            std::process::id()
-        ));
+        let counter =
+            std::env::temp_dir().join(format!("mando-mesh-singleflight-{}", std::process::id()));
         std::fs::remove_file(&counter).ok();
         let cmd = format!(
             r#"["sh", "-c", "echo x >> {}; sleep 0.4; printf '{{\"network\":{{\"partition_ids\":[1]}},\"nodes\":[],\"edges\":[]}}'"]"#,
@@ -1553,10 +1553,8 @@ mod tests {
     /// 矛盾した組を返してはいけない（設計原則7: 正直に出す）。
     #[tokio::test]
     async fn mesh_refresh_clears_stale_error_while_running() {
-        let marker = std::env::temp_dir().join(format!(
-            "mando-mesh-clear-error-{}",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("mando-mesh-clear-error-{}", std::process::id()));
         std::fs::remove_file(&marker).ok();
         let cmd = format!(
             r#"["sh", "-c", "if [ -f {p} ]; then sleep 2; printf '{{\"network\":{{\"partition_ids\":[]}},\"nodes\":[],\"edges\":[]}}'; else touch {p}; exit 1; fi"]"#,
@@ -1598,9 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn mesh_page_is_served_when_configured() {
-        let app = app_from(&format!(
-            "{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"
-        ));
+        let app = app_from(&format!("{MESH_DEVICE}\n[mesh]\ncommand = {MESH_OK_CMD}\n"));
         let res = router(app)
             .oneshot(
                 Request::builder()
@@ -1653,7 +1649,11 @@ mod tests {
         (status, json)
     }
 
-    async fn call_with_cfg(cfg_toml: &str, method: &str, path: &str) -> (axum::http::StatusCode, Value) {
+    async fn call_with_cfg(
+        cfg_toml: &str,
+        method: &str,
+        path: &str,
+    ) -> (axum::http::StatusCode, Value) {
         let app = Arc::new(App {
             config: toml::from_str(cfg_toml).unwrap(),
             executor: Executor::new(),
@@ -1709,9 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_exec_failure_is_502() {
-        let cfg = format!(
-            "{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n"
-        );
+        let cfg = format!("{MINIMAL_DEVICE}\n[health]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n");
         let (st, v) = call_with_cfg(&cfg, "GET", "/api/health").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
         assert_eq!(v["error"], "health query failed");
@@ -1810,7 +1808,12 @@ mod tests {
 
     #[tokio::test]
     async fn color_valid_hex_returns_action_only() {
-        let (st, v) = call_json("POST", "/api/devices/light/color", r##"{"color":"#ff69b4"}"##).await;
+        let (st, v) = call_json(
+            "POST",
+            "/api/devices/light/color",
+            r##"{"color":"#ff69b4"}"##,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "success");
         // light 例外: state は同梱しない。
@@ -1821,7 +1824,12 @@ mod tests {
     async fn color_substitution_reaches_argv() {
         // 偽装 sh は "$1" = "#ff69b4" のときだけ成功する。別の正常 hex を送ると
         // 置換値がそのまま argv に渡っていれば failed になる。
-        let (st, v) = call_json("POST", "/api/devices/light/color", r##"{"color":"#00ff00"}"##).await;
+        let (st, v) = call_json(
+            "POST",
+            "/api/devices/light/color",
+            r##"{"color":"#00ff00"}"##,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "failed");
     }
@@ -1865,7 +1873,12 @@ mod tests {
 
     #[tokio::test]
     async fn brightness_valid_returns_action_only() {
-        let (st, v) = call_json("POST", "/api/devices/light/brightness", r##"{"brightness":50}"##).await;
+        let (st, v) = call_json(
+            "POST",
+            "/api/devices/light/brightness",
+            r##"{"brightness":50}"##,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "success");
         // light 例外: state は同梱しない。
@@ -1876,7 +1889,12 @@ mod tests {
     async fn brightness_substitution_reaches_argv() {
         // 偽装 sh は "$1" = "50" のときだけ成功する。別の正常値を送ると
         // 置換値がそのまま argv に渡っていれば failed になる。
-        let (st, v) = call_json("POST", "/api/devices/light/brightness", r##"{"brightness":75}"##).await;
+        let (st, v) = call_json(
+            "POST",
+            "/api/devices/light/brightness",
+            r##"{"brightness":75}"##,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["action"], "failed");
     }
@@ -1937,7 +1955,7 @@ mod tests {
         assert_eq!(v["unit"], "W");
         let s = &v["series"][0];
         assert_eq!(s["label"], "太陽光発電"); // series 省略行は graph label に束ねる
-        // ts 昇順にソートされる（スタブは逆順で返す）。
+                                              // ts 昇順にソートされる（スタブは逆順で返す）。
         assert_eq!(s["points"][0][1], 100.0);
         assert_eq!(s["points"][1][1], 200.0);
     }
@@ -1948,7 +1966,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["summary"], 5.6); // @summary 行が sub 要約値に
         assert_eq!(v["summary_unit"], "kWh"); // unit_daily
-        // @summary は series に混ざらない（先頭系列は generation のまま）。
+                                              // @summary は series に混ざらない（先頭系列は generation のまま）。
         assert_eq!(v["series"][0]["label"], "太陽光発電");
         assert_eq!(v["series"].as_array().unwrap().len(), 1);
     }
@@ -1988,7 +2006,7 @@ mod tests {
         let (st, v) = call("GET", "/api/graphs/strict?period=today").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["series"].as_array().unwrap().len(), 0); // 0 行 → 200 + 空 series
-        // week を送ると置換値がそのまま argv に渡っていれば exit 1 → 502。
+                                                              // week を送ると置換値がそのまま argv に渡っていれば exit 1 → 502。
         let (st, _) = call("GET", "/api/graphs/strict?period=week").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
     }
@@ -2189,7 +2207,8 @@ mod tests {
 
     #[tokio::test]
     async fn light_state_bypasses_cache() {
-        let path = std::env::temp_dir().join(format!("mando_cache_light_{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mando_cache_light_{}.txt", std::process::id()));
         let p = path.to_string_lossy().to_string();
         std::fs::write(&path, "").unwrap();
 
@@ -2346,7 +2365,10 @@ mod tests {
             run_shutdown(std::future::ready(()), Some(store.clone()), vec![t1, t2]),
         )
         .await;
-        assert!(done.is_ok(), "push タスクが止まらず run_shutdown が返らない");
+        assert!(
+            done.is_ok(),
+            "push タスクが止まらず run_shutdown が返らない"
+        );
         assert!(
             matches!(
                 rx.try_recv(),
@@ -2427,7 +2449,10 @@ mod tests {
         assert_eq!(v["source"], "read");
         assert_eq!(v["stale"], false);
         // 走らなかった exec の成功を騙らない。
-        assert!(v.get("exec").is_none(), "push 即答に exec は付けない: {v:?}");
+        assert!(
+            v.get("exec").is_none(),
+            "push 即答に exec は付けない: {v:?}"
+        );
         assert_eq!(exec_count(&p), 0, "primed のとき exec は 1 回も走らない");
         std::fs::remove_file(&p).ok();
     }
@@ -2506,7 +2531,7 @@ mod tests {
     async fn disconnected_read_failure_is_stale() {
         let p = tmp_counter("stale");
         let app = push_app(&p, false); // get_state が exit 3（timeout）
-        // set_connected を呼ばない = 起動直後 / listener 断。
+                                       // set_connected を呼ばない = 起動直後 / listener 断。
         let (st, v) = call_on(app, "GET", "/api/devices/light/state").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["state"], "unknown");

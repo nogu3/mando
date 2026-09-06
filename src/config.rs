@@ -438,7 +438,10 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "device {device}: preset 名が重複: {preset}")
             }
             ConfigError::NonShutterInGroup { group, member } => {
-                write!(f, "group {group}: シャッター以外はグループに入れられない: {member}")
+                write!(
+                    f,
+                    "group {group}: シャッター以外はグループに入れられない: {member}"
+                )
             }
             ConfigError::DuplicateGroupMember { device } => {
                 write!(f, "device {device}: 複数のグループに所属できない（UI が個別行をデバイスごとに 1 つしか持てないため）")
@@ -458,13 +461,22 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "graph {graph}: 未知の chart 値 {value}（対応: stacked）")
             }
             ConfigError::UnknownLightMember { device, member } => {
-                write!(f, "device {device}: members が未知の device を参照: {member}")
+                write!(
+                    f,
+                    "device {device}: members が未知の device を参照: {member}"
+                )
             }
             ConfigError::NonLightMember { device, member } => {
-                write!(f, "device {device}: members に light 以外は入れられない: {member}")
+                write!(
+                    f,
+                    "device {device}: members に light 以外は入れられない: {member}"
+                )
             }
             ConfigError::NestedLightMembers { device, member } => {
-                write!(f, "device {device}: member {member} は自身が members を持つため入れ子にできない")
+                write!(
+                    f,
+                    "device {device}: member {member} は自身が members を持つため入れ子にできない"
+                )
             }
             ConfigError::DuplicateLightMember { member } => {
                 write!(f, "device {member}: members に複数回指定されている（同一グループ内の重複または複数グループへの所属）")
@@ -479,11 +491,7 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// kind に応じた必須コマンドの検査。None は Missing、空配列は Empty。
-fn require(
-    device: &str,
-    field: &'static str,
-    v: &Option<Vec<String>>,
-) -> Result<(), ConfigError> {
+fn require(device: &str, field: &'static str, v: &Option<Vec<String>>) -> Result<(), ConfigError> {
     match v {
         Some(c) if !c.is_empty() => Ok(()),
         Some(_) => Err(ConfigError::EmptyCommand(device.to_string())),
@@ -495,11 +503,7 @@ fn require(
 }
 
 /// この kind では書けないフィールドの検査。
-fn forbid(
-    device: &str,
-    field: &'static str,
-    v: &Option<Vec<String>>,
-) -> Result<(), ConfigError> {
+fn forbid(device: &str, field: &'static str, v: &Option<Vec<String>>) -> Result<(), ConfigError> {
     if v.is_some() {
         Err(ConfigError::ForbiddenField {
             device: device.to_string(),
@@ -599,8 +603,7 @@ impl Config {
                         if color.is_empty() {
                             return Err(ConfigError::EmptyCommand(d.name.clone()));
                         }
-                        let count: usize =
-                            color.iter().map(|s| s.matches("{color}").count()).sum();
+                        let count: usize = color.iter().map(|s| s.matches("{color}").count()).sum();
                         if count != 1 {
                             return Err(ConfigError::ColorPlaceholder {
                                 device: d.name.clone(),
@@ -708,9 +711,7 @@ impl Config {
                 }
                 // デバイスが複数グループに所属していないかチェック
                 if !seen_m.insert(m) {
-                    return Err(ConfigError::DuplicateGroupMember {
-                        device: m.clone(),
-                    });
+                    return Err(ConfigError::DuplicateGroupMember { device: m.clone() });
                 }
             }
         }
@@ -948,7 +949,10 @@ mod tests {
             "##,
         );
         let unknown = Config::check(&p).unwrap();
-        assert!(unknown.iter().any(|k| k.starts_with("push2")), "{unknown:?}");
+        assert!(
+            unknown.iter().any(|k| k.starts_with("push2")),
+            "{unknown:?}"
+        );
         assert!(unknown.iter().any(|k| k.contains("wibble")), "{unknown:?}");
         std::fs::remove_file(p).ok();
     }
@@ -1186,7 +1190,10 @@ mod tests {
             cmd = []
             "##,
         );
-        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
         std::fs::remove_file(p).ok();
     }
 
@@ -1650,7 +1657,10 @@ mod tests {
             color = []
             "##,
         );
-        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
         std::fs::remove_file(p).ok();
     }
 
@@ -1731,7 +1741,10 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::ForbiddenField { field: "brightness", .. })
+            Err(ConfigError::ForbiddenField {
+                field: "brightness",
+                ..
+            })
         ));
         std::fs::remove_file(p).ok();
     }
@@ -1750,7 +1763,10 @@ mod tests {
             brightness = []
             "##,
         );
-        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
         std::fs::remove_file(p).ok();
     }
 
@@ -1958,7 +1974,10 @@ mod tests {
         let h = cfg.health.as_ref().unwrap();
         assert_eq!(h.label.as_deref(), Some("jarvis"));
         assert_eq!(h.command, vec!["embalse-query", "health"]);
-        assert_eq!(h.labels.as_ref().unwrap().get("cpu_used_pct").unwrap(), "CPU");
+        assert_eq!(
+            h.labels.as_ref().unwrap().get("cpu_used_pct").unwrap(),
+            "CPU"
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -2032,7 +2051,10 @@ mod tests {
         assert_eq!(m.thresholds.lqi_fair, 3);
         assert_eq!(m.thresholds.lqi_weak, 2);
         assert_eq!(m.thresholds.fer_weak, 10);
-        assert_eq!(m.labels.as_ref().unwrap().get("desk_light").unwrap(), "デスクライト");
+        assert_eq!(
+            m.labels.as_ref().unwrap().get("desk_light").unwrap(),
+            "デスクライト"
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -2241,7 +2263,10 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::ForbiddenField { field: "members", .. })
+            Err(ConfigError::ForbiddenField {
+                field: "members",
+                ..
+            })
         ));
         std::fs::remove_file(p).ok();
     }
@@ -2276,7 +2301,10 @@ mod tests {
             "##,
         );
         let cfg = Config::load(&p).unwrap();
-        assert_eq!(cfg.find_graph("power_balance").unwrap().chart.as_deref(), Some("stacked"));
+        assert_eq!(
+            cfg.find_graph("power_balance").unwrap().chart.as_deref(),
+            Some("stacked")
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -2297,7 +2325,10 @@ mod tests {
             query = ["curl","{period}"]
             "##,
         );
-        assert!(matches!(Config::load(&p), Err(ConfigError::UnknownChart { .. })));
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::UnknownChart { .. })
+        ));
         std::fs::remove_file(p).ok();
     }
 }

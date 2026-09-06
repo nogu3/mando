@@ -218,15 +218,11 @@ mod tests {
         let start = Instant::now();
         let a = {
             let ex = ex.clone();
-            tokio::spawn(
-                async move { ex.run("lane_a", &["sleep".into(), "0.3".into()]).await },
-            )
+            tokio::spawn(async move { ex.run("lane_a", &["sleep".into(), "0.3".into()]).await })
         };
         let b = {
             let ex = ex.clone();
-            tokio::spawn(
-                async move { ex.run("lane_b", &["sleep".into(), "0.3".into()]).await },
-            )
+            tokio::spawn(async move { ex.run("lane_b", &["sleep".into(), "0.3".into()]).await })
         };
         a.await.unwrap();
         b.await.unwrap();
