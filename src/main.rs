@@ -267,48 +267,151 @@ fn start_push(app: Shared, store: Arc<push::PushStore>) -> Vec<tokio::task::Join
         .listen
         .clone();
 
-    // 再ベースライン read は既存の executor / lane / timeout の枠内で行う。
-    // listener 側をブロックしないよう別タスクで受ける。
+    // 基準値 read（prime）は既存の executor / lane / timeout の枠内で行う。
+    // listener 側をブロックしないよう別タスクで受ける。1 回の依頼で prime
+    // ループ（全 light primed まで数ラウンド、以後は定期）を回し、ループの
+    // 途中で次の依頼（listener 再接続）が来たら走っているループを捨てて
+    // 新しい世代で最初からやり直す。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let rebased = app.clone();
-    let rebase_task = tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // 溜まった依頼は 1 回に畳む。listener が短時間に何度も落ちると
-            // 1 周ぶんの read（N デバイス × 最大 exec timeout）が滞留し、
-            // 不調な matd を余計に叩き続けることになる。
+    let primed = app.clone();
+    let prime_task = tokio::spawn(async move {
+        let mut pending = false;
+        loop {
+            if !pending && rx.recv().await.is_none() {
+                return;
+            }
+            // 溜まった依頼は 1 回に畳む。
             while rx.try_recv().is_ok() {}
-            rebaseline_push_devices(rebased.clone()).await;
+            pending = false;
+            tokio::select! {
+                _ = prime_push_devices(primed.clone(), PRIME_SCHEDULE.clone()) => {}
+                next = rx.recv() => match next {
+                    Some(()) => pending = true,
+                    None => return,
+                },
+            }
         }
     });
 
     let listen_task = tokio::spawn(async move { push::run_listener(listen, store, tx).await });
-    vec![rebase_task, listen_task]
+    vec![prime_task, listen_task]
 }
 
-/// push 管理下の全 light の基準値を read で確定する。購読の誘発も兼ねるので
-/// 起動時・listener 再接続時に必ず 1 周する（cold-start はこの read で解ける）。
-/// 逐次に回す — 一斉に CASE を張らせない。
-async fn rebaseline_push_devices(app: Shared) {
+/// prime ラウンド間の待ち。startup を使い切ったら steady で定期再 prime。
+#[derive(Clone)]
+struct PrimeSchedule {
+    startup: Vec<std::time::Duration>,
+    steady: std::time::Duration,
+}
+
+/// 本番のスケジュール。matd の購読確立は 19 ノードで実測 1〜2 分（遅い
+/// ノードは 10 分超）なので、起動直後は詰めて回し、その後は 60 秒毎。
+static PRIME_SCHEDULE: std::sync::LazyLock<PrimeSchedule> = std::sync::LazyLock::new(|| {
+    use std::time::Duration;
+    PrimeSchedule {
+        startup: [5u64, 10, 20, 30]
+            .iter()
+            .map(|s| Duration::from_secs(*s))
+            .collect(),
+        steady: Duration::from_secs(60),
+    }
+});
+
+/// push 管理下で unprimed の light を read で基準値確定する（prime）。
+///
+/// 起動時・listener 再接続時に依頼され、全 light が primed になるか listener
+/// が切れる（世代が進む）までラウンドを回す。1 ラウンド = `[push] status`
+/// があればそれを 1 回叩き、購読が established なノードの light だけ逐次 read
+/// する（establishing 中のノードを read すると matd の購読確立 CASE と read の
+/// CASE が同じデバイスで競合し、Timeout / SessionFailed になる）。status
+/// 未設定なら全 unprimed を read する。read 失敗は次のラウンドで再試行。
+///
+/// mando と matd が同時に再起動した場合、たいていの light は matd の priming
+/// burst（listen 経由）で primed になり、ここでの read はゼロか数台で済む。
+/// read が要るのは matd が先に動いていて priming を見逃したときだけ。
+async fn prime_push_devices(app: Shared, schedule: PrimeSchedule) {
     let Some(store) = app.push.clone() else {
         return;
     };
-    for device in &app.config.devices {
-        if !store.tracks(&device.name) {
-            continue;
+    let generation = store.generation();
+    let mut round = 0usize;
+    loop {
+        if store.generation() != generation {
+            tracing::debug!("prime: listener の世代が進んだので中断");
+            return;
         }
-        let generation = store.generation();
-        let view = fetch_state(&app, device).await;
-        if view.exec == Some(ExecOutcome::Success) {
-            store.baseline(&device.name, view.state, generation);
-            tracing::debug!(device = %device.name, state = ?view.state, "push 基準値を確定");
-        } else {
-            tracing::warn!(
-                device = %device.name,
-                outcome = ?view.exec,
-                "push 基準値の read に失敗（unprimed のまま）"
-            );
+        let unprimed: Vec<&Device> = app
+            .config
+            .devices
+            .iter()
+            .filter(|d| store.tracks(&d.name) && store.primed_state(&d.name).is_none())
+            .collect();
+        if unprimed.is_empty() {
+            tracing::info!(rounds = round, "prime: 全 light の基準値が確立");
+            return;
         }
+
+        let established = match &app.config.push.as_ref().and_then(|p| p.status.as_ref()) {
+            Some(cmd) => Some(matd_established_nodes(&app, cmd).await),
+            None => None,
+        };
+        for device in &unprimed {
+            if store.generation() != generation {
+                return;
+            }
+            if let (Some(established), Some(node_id)) = (&established, device.node_id) {
+                if !established.contains(&node_id) {
+                    tracing::debug!(device = %device.name, node_id, "prime: 購読未確立、今回は読まない");
+                    continue;
+                }
+            }
+            let view = fetch_state_with(&app, device, ReadFailLog::Info).await;
+            if view.exec == Some(ExecOutcome::Success) {
+                store.baseline(&device.name, view.state, generation);
+                tracing::debug!(device = %device.name, state = ?view.state, "prime: 基準値を確定");
+            }
+        }
+
+        // 起動ラウンドを使い切っても残っているものは 1 回だけ warn し、
+        // 以後は steady 間隔で黙って再試行を続ける。
+        let wait = match schedule.startup.get(round) {
+            Some(w) => *w,
+            None => {
+                if round == schedule.startup.len() {
+                    let left: Vec<&str> = unprimed
+                        .iter()
+                        .filter(|d| store.primed_state(&d.name).is_none())
+                        .map(|d| d.name.as_str())
+                        .collect();
+                    if !left.is_empty() {
+                        tracing::warn!(
+                            devices = ?left,
+                            steady_s = schedule.steady.as_secs(),
+                            "prime: 起動ラウンドを終えても unprimed が残る（定期再試行に移る）"
+                        );
+                    }
+                }
+                schedule.steady
+            }
+        };
+        round += 1;
+        tokio::time::sleep(wait).await;
     }
+}
+
+/// `[push] status` を叩いて購読 established な node_id 集合を得る。コマンド失敗・
+/// 解釈不能は空集合（＝何も確立していない扱い。read を撒かない側に倒す）。
+async fn matd_established_nodes(app: &App, cmd: &[String]) -> std::collections::HashSet<u64> {
+    let result = run_bounded(&app.executor, "push-status", cmd, app.exec_timeout()).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::debug!(
+            outcome = ?result.outcome,
+            stderr = %result.stderr.trim(),
+            "prime: status コマンド非成功（購読未確立扱い）"
+        );
+        return Default::default();
+    }
+    normalize::parse_matd_status_established(&result.stdout)
 }
 
 /// 安定ミニ API のルーティング（テストからも oneshot で叩く）。
@@ -421,6 +524,19 @@ struct StateView {
 
 /// get_state を実行し、正規化した状態を返す。
 async fn fetch_state(app: &App, device: &Device) -> StateView {
+    fetch_state_with(app, device, ReadFailLog::Warn).await
+}
+
+/// get_state 非成功をどのレベルで記録するか。UI からの read は warn（利用者に
+/// 見える失敗）、起動シーケンス中の prime read は info（matd の購読確立と
+/// 競合しうる想定内の失敗。次のラウンドで再試行される）。
+#[derive(Clone, Copy)]
+enum ReadFailLog {
+    Warn,
+    Info,
+}
+
+async fn fetch_state_with(app: &App, device: &Device, on_fail: ReadFailLog) -> StateView {
     let result = run_bounded(
         &app.executor,
         device.exec_lane(),
@@ -430,12 +546,20 @@ async fn fetch_state(app: &App, device: &Device) -> StateView {
     .await;
 
     if result.outcome != ExecOutcome::Success {
-        tracing::warn!(
-            device = %device.name,
-            outcome = ?result.outcome,
-            stderr = %result.stderr.trim(),
-            "get_state 非成功"
-        );
+        match on_fail {
+            ReadFailLog::Warn => tracing::warn!(
+                device = %device.name,
+                outcome = ?result.outcome,
+                stderr = %result.stderr.trim(),
+                "get_state 非成功"
+            ),
+            ReadFailLog::Info => tracing::info!(
+                device = %device.name,
+                outcome = ?result.outcome,
+                stderr = %result.stderr.trim(),
+                "prime: get_state 非成功（次のラウンドで再試行）"
+            ),
+        }
         return StateView {
             state: DeviceState::Unknown,
             exec: Some(result.outcome),
@@ -2429,6 +2553,176 @@ mod tests {
         let p = std::env::temp_dir().join(format!("mando_push_{tag}_{}.txt", std::process::id()));
         std::fs::write(&p, "").unwrap();
         p.to_string_lossy().to_string()
+    }
+
+    /// prime ループのテスト用 App。light(node 5) の get_state / [push] status を
+    /// 任意のシェル片で差し替える。counter_path は get_state の exec 回数。
+    fn prime_app(counter_path: &str, get_state_sh: &str, status_sh: Option<&str>) -> Shared {
+        let status = match status_sh {
+            Some(sh) => format!(
+                r#"status = ["sh", "-c", {}]"#,
+                serde_json::to_string(sh).unwrap()
+            ),
+            None => String::new(),
+        };
+        let get =
+            serde_json::to_string(&format!("printf x >> {counter_path}; {get_state_sh}")).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            r##"
+            [push]
+            listen = ["true"]
+            {status}
+            [[device]]
+            name = "light"
+            kind = "light"
+            node_id = 5
+            get_state = ["sh", "-c", {get}]
+            on  = ["true"]
+            off = ["true"]
+            "##
+        ))
+        .unwrap();
+        let store = Arc::new(push::PushStore::new(&cfg));
+        store.set_connected(true);
+        Arc::new(App {
+            config: cfg,
+            executor: Executor::new(),
+            graph_executor: Executor::new(),
+            mesh_executor: Executor::new(),
+            state_cache: cache::Cache::default(),
+            mesh_job: std::sync::Mutex::new(MeshJob::default()),
+            push: Some(store),
+        })
+    }
+
+    /// テストは待ちを ms 単位に縮める（本番は秒単位）。
+    fn fast_schedule() -> PrimeSchedule {
+        PrimeSchedule {
+            startup: vec![std::time::Duration::from_millis(50)],
+            steady: std::time::Duration::from_millis(50),
+        }
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timeout: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    const ON_JSON: &str = r#"printf '{"node_id":5,"value":true}'"#;
+
+    /// status が「まだ establishing」と言う間は read を 1 回も撒かず、
+    /// established に変わった次のラウンドで read して primed になる。
+    #[tokio::test]
+    async fn prime_waits_for_node_to_be_established() {
+        let p = tmp_counter("prime_gate");
+        let status_file = format!("{p}.status");
+        std::fs::write(
+            &status_file,
+            r#"{"nodes":[{"node_id":5,"state":"establishing"}]}"#,
+        )
+        .unwrap();
+        let app = prime_app(&p, ON_JSON, Some(&format!("cat {status_file}")));
+        let store = app.push.clone().unwrap();
+        let task = tokio::spawn(prime_push_devices(app.clone(), fast_schedule()));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(exec_count(&p), 0, "establishing の間は read を撒かない");
+        assert_eq!(store.primed_state("light"), None);
+
+        std::fs::write(
+            &status_file,
+            r#"{"nodes":[{"node_id":5,"state":"established"}]}"#,
+        )
+        .unwrap();
+        wait_until(|| store.primed_state("light").is_some(), "primed になる").await;
+        assert_eq!(exec_count(&p), 1, "established 後に read は 1 回");
+        // 全 light が primed になればループは終わる。
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("primed 後に prime ループが終わらない")
+            .unwrap();
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&status_file).ok();
+    }
+
+    /// status コマンド自体が失敗する間は「何も確立していない」扱いで read しない。
+    #[tokio::test]
+    async fn prime_reads_nothing_while_status_command_fails() {
+        let p = tmp_counter("prime_status_fail");
+        let app = prime_app(&p, ON_JSON, Some("exit 1"));
+        let task = tokio::spawn(prime_push_devices(app.clone(), fast_schedule()));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(exec_count(&p), 0);
+        task.abort();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// priming イベントで既に primed なら read は 1 回も走らずループは即終わる。
+    #[tokio::test]
+    async fn prime_skips_devices_already_primed_by_push() {
+        let p = tmp_counter("prime_already");
+        let app = prime_app(&p, ON_JSON, None);
+        let store = app.push.clone().unwrap();
+        assert!(store.apply(&normalize::PushEvent {
+            node_id: 5,
+            cluster: "onoff".into(),
+            attribute: "on-off".into(),
+            value: serde_json::json!(true),
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            prime_push_devices(app.clone(), fast_schedule()),
+        )
+        .await
+        .expect("primed 済みなら即終わる");
+        assert_eq!(exec_count(&p), 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// status 未設定: 即 read し、失敗したら次のラウンドで再試行、成功で primed。
+    #[tokio::test]
+    async fn prime_retries_failed_read_until_success() {
+        let p = tmp_counter("prime_retry");
+        let flag = format!("{p}.ok");
+        let app = prime_app(&p, &format!("test -f {flag} || exit 6; {ON_JSON}"), None);
+        let store = app.push.clone().unwrap();
+        let task = tokio::spawn(prime_push_devices(app.clone(), fast_schedule()));
+        wait_until(|| exec_count(&p) >= 2, "失敗後に再試行される").await;
+        assert_eq!(
+            store.primed_state("light"),
+            None,
+            "失敗中は unprimed のまま"
+        );
+        std::fs::write(&flag, "").unwrap();
+        wait_until(|| store.primed_state("light").is_some(), "成功で primed").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("primed 後に終わる")
+            .unwrap();
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&flag).ok();
+    }
+
+    /// listener が切れた（世代が進んだ）ら prime ループは止まり、read を続けない。
+    #[tokio::test]
+    async fn prime_stops_when_listener_disconnects() {
+        let p = tmp_counter("prime_disc");
+        let app = prime_app(&p, "exit 6", None);
+        let store = app.push.clone().unwrap();
+        let task = tokio::spawn(prime_push_devices(app.clone(), fast_schedule()));
+        wait_until(|| exec_count(&p) >= 1, "1 回は read する").await;
+        store.set_connected(false);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("断でループが止まらない")
+            .unwrap();
+        let after = exec_count(&p);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(exec_count(&p), after, "断後に read が続いている");
+        std::fs::remove_file(&p).ok();
     }
 
     /// push の価値そのものの証明: primed なら exec が 1 回も走らない。

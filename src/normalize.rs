@@ -183,6 +183,29 @@ pub fn parse_mat_listen_event(line: &str) -> Option<PushEvent> {
     })
 }
 
+/// `matd status` の 1 行 JSON → 購読が `established` な node_id の集合。
+///
+/// 実出力例: `{"nodes":[{"node_id":5,"state":"established",...},
+///   {"node_id":6,"state":"establishing",...}, {"node_id":7,"state":"down",...}]}`
+/// establishing / down は含めない。壊れた JSON・`nodes` 欠落・node_id 不正の
+/// 要素は無視して空（or 部分）集合を返す — 「分からない」は「まだ確立していない」
+/// 側に倒す（read を撒かない）。matd の出力形の知識はここに閉じる（設計原則 4）。
+pub fn parse_matd_status_established(text: &str) -> std::collections::HashSet<u64> {
+    let Ok(raw) = serde_json::from_str::<Value>(text) else {
+        return Default::default();
+    };
+    raw.get("nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter(|n| n.get("state").and_then(Value::as_str) == Some("established"))
+                .filter_map(|n| n.get("node_id")?.as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// cluster / attribute の値（chip-tool 記法名 or 数値 ID）を文字列キーへ。
 fn name_or_number(v: &Value) -> Option<String> {
     match v {
@@ -648,6 +671,30 @@ pub fn normalize_mesh(
 
 #[cfg(test)]
 mod tests {
+
+    /// matd status の nodes[] から「購読が established なノード」だけを拾う。
+    /// establishing / down は含めない。壊れた JSON・nodes 欠落は空集合。
+    #[test]
+    fn matd_status_established_nodes() {
+        let json = r#"{"timestamp":"t","version":"1.34.0","uptime_s":3,"native":"ready",
+            "listen_clients":1,
+            "nodes":[
+              {"node_id":5,"state":"established","for_s":1,"subscription_id":7},
+              {"node_id":6,"state":"establishing","for_s":3,"attempts":1},
+              {"node_id":7,"state":"down","for_s":9,"attempts":2,"backoff_s":8},
+              {"node_id":"bad","state":"established"},
+              {"state":"established"}
+            ]}"#;
+        let established = parse_matd_status_established(json);
+        assert_eq!(established, [5u64].into_iter().collect());
+        assert!(parse_matd_status_established("not json").is_empty());
+        assert!(parse_matd_status_established(r#"{"nodes":"x"}"#).is_empty());
+        assert!(
+            parse_matd_status_established(r#"{"native":{"kind":"store_missing"},"nodes":[]}"#)
+                .is_empty()
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -46,7 +46,10 @@
    > 張り、状態を in-memory に持って `/api/events`（SSE）でブラウザまで push する。
    > 値の古さは TTL で腐らせず、信頼できるかどうかは **listener が生きているか**だけで
    > 決まる（primed なら exec ゼロで即答、unprimed／断なら read、それも失敗なら
-   > `stale: true`）。「INF 通知のための常駐化はしない」は **echonet 限定**の話で、
+   > `stale: true`）。基準値の read（prime）は `[push] status` があれば matd の
+   > 購読が established なノードだけに限り、全 light primed まで backoff 付きで
+   > 回る（matd の購読確立 CASE と競合させない。起動シーケンス中の read 失敗は
+   > info、起動ラウンド後も残れば warn 1 回 → 60 秒毎に再試行）。「INF 通知のための常駐化はしない」は **echonet 限定**の話で、
    > Matter は matd が常駐購読を持つのが mat ファミリの設計なので、この非対称は意図的
    > （`docs/superpowers/specs/2026-07-25-light-push-state-design.md`）。
 

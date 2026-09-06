@@ -203,6 +203,17 @@ API バージョニングはしない（利用者は同梱 UI のみ）。
 **起動時**: listener を spawn し、全 light の再ベースライン read を**非同期で**走らせる
 （起動をブロックしない。read は既存の executor / lane / timeout の枠内で行う）。
 
+> **2026-09-06 追記（prime の matd 購読確立待ち）:** hogar で matd と mando が同時に
+> 再起動すると、この起動時 read が matd の購読確立 CASE と同じデバイスで競合し、
+> `session_failed` / `timeout` の WARN が 4〜9 件出て数台が unprimed のまま残った。
+> 対策として再ベースラインを「prime ループ」にした: `[push] status`（`matd status`）
+> があれば購読 `established` なノードの light だけ read し、全 light primed まで
+> 5/10/20/30 秒間隔で回り、残れば 60 秒毎に再試行する（listener 再接続で世代が
+> 進めば中断して新しい世代でやり直す）。同時再起動では matd の priming burst
+> （listen が既に接続済みなので届く）がほぼ全台を primed にし、read はゼロか
+> 数台で済む。prime 中の read 失敗は info、起動ラウンド後も残れば warn 1 回。
+> 「次の GET state 成功で primed」は従来どおり。
+
 ## クライアント（index.html）
 
 > **実装時の訂正:** 「SSE 接続中は `scheduleLightCatchup` を張らない」は、

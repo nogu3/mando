@@ -35,13 +35,23 @@ state_ttl_ms = 2000   # 既定 2000。0 = TTL 無効（同時読みの合流の�
 # （通すと即座に打ち切られる）。--count は「この件数を受けたら exit 0」なので
 # 実質無限（u32 上限）を渡す。--timeout-ms 0 は無期限待ち。
 # 落ちたら mando が指数 backoff（1s→30s）で再起動し、そのたび全 light の
-# 基準値を捨てて read で再ベースラインする（この read が購読を誘発する）。
+# 基準値を捨てて read で基準値を取り直す（prime。この read が購読を誘発する）。
 #
 # listen はシェルで包まない（`sh -c "mat listen …"` にすると kill が孫まで
 # 届かず、再起動のたびに listener が二重になる）。実行ファイルを直接書く。
 #
+# status（任意）: 購読状態を問うコマンド（`matd status`。socket は明示する）。
+# 設定すると prime の read を「購読が established なノード」に限る。matd と
+# mando を同時に再起動すると、matd が購読確立の CASE を張っている最中に read
+# の CASE が同じデバイスへ飛んで Timeout / SessionFailed になる（実測 4〜9 件）
+# ため、確立を待ってから読む。prime は全 light primed まで 5/10/20/30 秒間隔で
+# 回り、残れば 60 秒毎に再試行する。未設定なら全 light を即 read する（失敗は
+# 同じスケジュールで再試行）。同時再起動ではたいてい matd の priming burst が
+# listen 経由で先に primed にするので、read はゼロか数台で済む。
+#
 # [push]
 # listen = ["mat", "listen", "--count", "4294967295", "--timeout-ms", "0"]
+# status = ["matd", "status", "--socket", "/run/matd/matd.sock"]
 
 [[device]]
 name      = "shutter"        # URL とフロントが使う安定識別子（変えると URL が変わる）

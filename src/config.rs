@@ -123,6 +123,12 @@ fn default_state_ttl_ms() -> u64 {
 pub struct Push {
     /// 長寿命の listen コマンド配列。
     pub listen: Vec<String>,
+    /// 任意: 購読状態を問うコマンド配列（`matd status`）。設定すると起動時 /
+    /// 再接続時の基準値 read を「購読が established なノード」に限り、matd の
+    /// 購読確立 CASE と read の CASE が同じデバイスで競合するのを避ける。
+    /// 未設定なら従来どおり全 light を read する（失敗は再試行）。
+    #[serde(default)]
+    pub status: Option<Vec<String>>,
 }
 
 /// 複数デバイスをまとめて一括操作するためのグループ。
@@ -391,26 +397,68 @@ pub enum ConfigError {
     DuplicateName(String),
     EmptyCommand(String),
     EmptyGroup(String),
-    UnknownMember { group: String, member: String },
+    UnknownMember {
+        group: String,
+        member: String,
+    },
     DuplicateGroup(String),
-    MissingCommand { device: String, field: &'static str },
-    ForbiddenField { device: String, field: &'static str },
-    DuplicatePreset { device: String, preset: String },
-    NonShutterInGroup { group: String, member: String },
-    DuplicateGroupMember { device: String },
-    ColorPlaceholder { device: String, count: usize },
-    BrightnessPlaceholder { device: String, count: usize },
+    MissingCommand {
+        device: String,
+        field: &'static str,
+    },
+    ForbiddenField {
+        device: String,
+        field: &'static str,
+    },
+    DuplicatePreset {
+        device: String,
+        preset: String,
+    },
+    NonShutterInGroup {
+        group: String,
+        member: String,
+    },
+    DuplicateGroupMember {
+        device: String,
+    },
+    ColorPlaceholder {
+        device: String,
+        count: usize,
+    },
+    BrightnessPlaceholder {
+        device: String,
+        count: usize,
+    },
     DuplicateGraph(String),
     EmptyGraphQuery(String),
-    PeriodPlaceholder { graph: String, count: usize },
-    UnknownChart { graph: String, value: String },
-    UnknownLightMember { device: String, member: String },
-    NonLightMember { device: String, member: String },
-    NestedLightMembers { device: String, member: String },
-    DuplicateLightMember { member: String },
+    PeriodPlaceholder {
+        graph: String,
+        count: usize,
+    },
+    UnknownChart {
+        graph: String,
+        value: String,
+    },
+    UnknownLightMember {
+        device: String,
+        member: String,
+    },
+    NonLightMember {
+        device: String,
+        member: String,
+    },
+    NestedLightMembers {
+        device: String,
+        member: String,
+    },
+    DuplicateLightMember {
+        member: String,
+    },
     EmptyHealthCommand,
     EmptyMeshCommand,
     EmptyPushListen,
+    /// `[push] status` が空配列。
+    EmptyPushStatus,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -484,6 +532,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyHealthCommand => write!(f, "health: command が空"),
             ConfigError::EmptyMeshCommand => write!(f, "mesh: command が空"),
             ConfigError::EmptyPushListen => write!(f, "push: listen が空"),
+            ConfigError::EmptyPushStatus => write!(f, "push: status が空"),
         }
     }
 }
@@ -757,6 +806,9 @@ impl Config {
             if p.listen.is_empty() {
                 return Err(ConfigError::EmptyPushListen);
             }
+            if p.status.as_ref().is_some_and(|s| s.is_empty()) {
+                return Err(ConfigError::EmptyPushStatus);
+            }
         }
 
         Ok(())
@@ -809,6 +861,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.push.unwrap().listen.first().unwrap(), "mat");
+    }
+
+    #[test]
+    fn push_status_is_optional_and_parses() {
+        let base = r#"
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+        "#;
+        let without: Config =
+            toml::from_str(&format!("[push]\nlisten = [\"true\"]\n{base}")).unwrap();
+        assert!(without.push.unwrap().status.is_none());
+        let with: Config = toml::from_str(&format!(
+            "[push]\nlisten = [\"true\"]\nstatus = [\"matd\", \"status\"]\n{base}"
+        ))
+        .unwrap();
+        assert_eq!(
+            with.push.unwrap().status.as_deref(),
+            Some(&["matd".to_string(), "status".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn push_empty_status_rejected() {
+        let p = write_tmp(
+            "pushstatusempty",
+            r#"
+            [push]
+            listen = ["true"]
+            status = []
+            [[device]]
+            name = "s1"
+            get_state = ["true"]
+            open = ["true"]
+            close = ["true"]
+            "#,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyPushStatus)
+        ));
     }
 
     #[test]

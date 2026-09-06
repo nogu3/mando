@@ -55,7 +55,7 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 /// 「生きているのに何も届かない」listener になる。
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
 
-/// 再ベースラインを頼むまでに子の生存を見る猶予。起動即死（mat が古い /
+/// prime（再ベースライン read）を頼むまでに子の生存を見る猶予。起動即死（mat が古い /
 /// matd 不在）を backoff で繰り返す間、全 light の read を延々と撒かない。
 const REBASELINE_DELAY: Duration = Duration::from_secs(3);
 
@@ -335,7 +335,7 @@ impl PushStore {
 }
 
 /// listen サブプロセスを回し続ける。落ちたら指数 backoff で再起動し、
-/// そのたび全デバイスの基準値を捨てて再ベースライン read を依頼する
+/// そのたび全デバイスの基準値を捨てて prime（基準値 read）を依頼する
 /// （read は購読の誘発も兼ね、これが cold-start を解消する）。
 pub async fn run_listener(
     cmd: Vec<String>,
