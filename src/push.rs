@@ -343,16 +343,31 @@ pub async fn run_listener(
     rebaseline: mpsc::UnboundedSender<()>,
 ) {
     let mut backoff = BACKOFF_MIN;
+    // 連続した断の回数。健全に生きたあとの断でリセットする（backoff と同じ判定）。
+    let mut losses: u32 = 0;
     loop {
         let started = Instant::now();
-        match run_once(&cmd, &store, &rebaseline).await {
-            // code=None は猶予超過で mando が kill した場合（直前に warn 済み）。
-            Ok(status) => tracing::warn!(code = ?status.code(), "push listener が終了した"),
-            Err(e) => tracing::warn!(error = %e, "push listener を起動できない"),
-        }
+        let outcome = run_once(&cmd, &store, &rebaseline).await;
         store.set_connected(false);
         if started.elapsed() >= BACKOFF_RESET_AFTER {
             backoff = BACKOFF_MIN;
+            losses = 0;
+        }
+        losses += 1;
+        // 単発〜2 回の断は matd の restart / コンテナ再作成で日常的に起きる想定内
+        // （数秒で戻り、prime ループが基準値を取り直す）。続くなら warn。
+        // code=None は猶予超過で mando が kill した場合（直前に warn 済み）。
+        match (&outcome, listener_loss_is_alarming(losses)) {
+            (Ok(status), true) => {
+                tracing::warn!(code = ?status.code(), losses, "push listener が終了した（断が続く）")
+            }
+            (Ok(status), false) => {
+                tracing::info!(code = ?status.code(), losses, "push listener が終了した")
+            }
+            (Err(e), true) => {
+                tracing::warn!(error = %e, losses, "push listener を起動できない（断が続く）")
+            }
+            (Err(e), false) => tracing::info!(error = %e, losses, "push listener を起動できない"),
         }
         tracing::info!(
             wait_ms = backoff.as_millis() as u64,
@@ -361,6 +376,11 @@ pub async fn run_listener(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+/// 連続 `losses` 回目の listener 断を warn にするか。1〜2 回は想定内（info）。
+fn listener_loss_is_alarming(losses: u32) -> bool {
+    losses >= 3
 }
 
 /// listen を 1 回起動し、stdout が終わる（＝プロセスが落ちる）まで読み続ける。
@@ -778,6 +798,16 @@ mod tests {
         s.apply(&onoff_event(6, false));
         s.set_connected(false);
         assert!(s.snapshot().is_empty());
+    }
+
+    /// listener の断は 1〜2 回連続までは想定内（matd の restart / コンテナ再作成で
+    /// 数秒消える）で info、3 回続いたら warn。
+    #[test]
+    fn listener_loss_is_alarming_only_when_it_repeats() {
+        assert!(!listener_loss_is_alarming(1));
+        assert!(!listener_loss_is_alarming(2));
+        assert!(listener_loss_is_alarming(3));
+        assert!(listener_loss_is_alarming(10));
     }
 
     #[tokio::test]

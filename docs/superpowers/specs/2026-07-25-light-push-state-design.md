@@ -212,7 +212,9 @@ API バージョニングはしない（利用者は同梱 UI のみ）。
 > 進めば中断して新しい世代でやり直す）。同時再起動では matd の priming burst
 > （listen が既に接続済みなので届く）がほぼ全台を primed にし、read はゼロか
 > 数台で済む。prime 中の read 失敗は info、起動ラウンド後も残れば warn 1 回。
-> 「次の GET state 成功で primed」は従来どおり。
+> 「次の GET state 成功で primed」は従来どおり。listener の断（`mat listen` の
+> exit 13 等）も 1〜2 回連続までは info（matd の restart / コンテナ再作成で数秒
+> 消えるのは想定内）、3 回続いたら warn。
 
 ## クライアント（index.html）
 
