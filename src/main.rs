@@ -340,54 +340,31 @@ async fn prime_push_devices(app: Shared, schedule: PrimeSchedule) {
             tracing::debug!("prime: listener の世代が進んだので中断");
             return;
         }
-        let unprimed: Vec<&Device> = app
-            .config
-            .devices
-            .iter()
-            .filter(|d| store.tracks(&d.name) && store.primed_state(&d.name).is_none())
-            .collect();
-        if unprimed.is_empty() {
+        if unprimed_devices(&app, &store).is_empty() {
             tracing::info!(rounds = round, "prime: 全 light の基準値が確立");
             return;
         }
+        let outcome = prime_round(&app, &store, generation).await;
 
-        let established = match &app.config.push.as_ref().and_then(|p| p.status.as_ref()) {
-            Some(cmd) => Some(matd_established_nodes(&app, cmd).await),
-            None => None,
-        };
-        for device in &unprimed {
-            if store.generation() != generation {
-                return;
-            }
-            if let (Some(established), Some(node_id)) = (&established, device.node_id) {
-                if !established.contains(&node_id) {
-                    tracing::debug!(device = %device.name, node_id, "prime: 購読未確立、今回は読まない");
-                    continue;
-                }
-            }
-            let view = fetch_state_with(&app, device, ReadFailLog::Info).await;
-            if view.exec == Some(ExecOutcome::Success) {
-                store.baseline(&device.name, view.state, generation);
-                tracing::debug!(device = %device.name, state = ?view.state, "prime: 基準値を確定");
-            }
-        }
-
-        // 起動ラウンドを使い切っても残っているものは 1 回だけ warn し、
-        // 以後は steady 間隔で黙って再試行を続ける。
+        // 起動ラウンドを使い切っても残っているものは 1 回だけ報告し、以後は
+        // steady 間隔で黙って再試行を続ける。read して失敗したものだけが
+        // mando の warn。購読待ち（read していない）は matd のペースの話なので info。
         let wait = match schedule.startup.get(round) {
             Some(w) => *w,
             None => {
                 if round == schedule.startup.len() {
-                    let left: Vec<&str> = unprimed
-                        .iter()
-                        .filter(|d| store.primed_state(&d.name).is_none())
-                        .map(|d| d.name.as_str())
-                        .collect();
-                    if !left.is_empty() {
+                    if !outcome.failed.is_empty() {
                         tracing::warn!(
-                            devices = ?left,
+                            devices = ?outcome.failed,
                             steady_s = schedule.steady.as_secs(),
-                            "prime: 起動ラウンドを終えても unprimed が残る（定期再試行に移る）"
+                            "prime: 起動ラウンドを終えても read に失敗する light が残る（定期再試行に移る）"
+                        );
+                    }
+                    if !outcome.waiting.is_empty() {
+                        tracing::info!(
+                            devices = ?outcome.waiting,
+                            steady_s = schedule.steady.as_secs(),
+                            "prime: 起動ラウンドを終えても購読待ちの light が残る（定期再試行に移る）"
                         );
                     }
                 }
@@ -397,6 +374,54 @@ async fn prime_push_devices(app: Shared, schedule: PrimeSchedule) {
         round += 1;
         tokio::time::sleep(wait).await;
     }
+}
+
+/// push 管理下でまだ基準値の無い light（config 記載順）。
+fn unprimed_devices<'a>(app: &'a App, store: &push::PushStore) -> Vec<&'a Device> {
+    app.config
+        .devices
+        .iter()
+        .filter(|d| store.tracks(&d.name) && store.primed_state(&d.name).is_none())
+        .collect()
+}
+
+/// 1 ラウンドの結果。primed になったものは含めない（store を見れば分かる）。
+#[derive(Debug, Default, PartialEq)]
+struct PrimeRoundOutcome {
+    /// 購読未確立（or status 不明）で read しなかった light。
+    waiting: Vec<String>,
+    /// read したが失敗した light（次のラウンドで再試行）。
+    failed: Vec<String>,
+}
+
+/// prime 1 ラウンド: `[push] status` があれば 1 回叩き、購読 established なノードの
+/// unprimed light だけ逐次 read して基準値にする。status 無しなら全 unprimed を read。
+async fn prime_round(app: &App, store: &push::PushStore, generation: u64) -> PrimeRoundOutcome {
+    let mut outcome = PrimeRoundOutcome::default();
+    let established = match app.config.push.as_ref().and_then(|p| p.status.as_ref()) {
+        Some(cmd) => Some(matd_established_nodes(app, cmd).await),
+        None => None,
+    };
+    for device in unprimed_devices(app, store) {
+        if store.generation() != generation {
+            return outcome;
+        }
+        if let (Some(established), Some(node_id)) = (&established, device.node_id) {
+            if !established.contains(&node_id) {
+                tracing::debug!(device = %device.name, node_id, "prime: 購読未確立、今回は読まない");
+                outcome.waiting.push(device.name.clone());
+                continue;
+            }
+        }
+        let view = fetch_state_with(app, device, ReadFailLog::Info).await;
+        if view.exec == Some(ExecOutcome::Success) {
+            store.baseline(&device.name, view.state, generation);
+            tracing::debug!(device = %device.name, state = ?view.state, "prime: 基準値を確定");
+        } else {
+            outcome.failed.push(device.name.clone());
+        }
+    }
+    outcome
 }
 
 /// `[push] status` を叩いて購読 established な node_id 集合を得る。コマンド失敗・
@@ -2612,6 +2637,37 @@ mod tests {
     }
 
     const ON_JSON: &str = r#"printf '{"node_id":5,"value":true}'"#;
+
+    /// 1 ラウンドの結果を「購読待ち（read していない）」と「read して失敗」に
+    /// 分ける。前者は matd のペースの問題で mando の warn 対象ではない。
+    #[tokio::test]
+    async fn prime_round_separates_waiting_from_failed() {
+        let p = tmp_counter("round_wait");
+        let app = prime_app(
+            &p,
+            ON_JSON,
+            Some(r#"printf '{"nodes":[{"node_id":5,"state":"establishing"}]}'"#),
+        );
+        let store = app.push.clone().unwrap();
+        let out = prime_round(&app, &store, store.generation()).await;
+        assert_eq!(out.waiting, vec!["light".to_string()]);
+        assert!(out.failed.is_empty());
+        assert_eq!(exec_count(&p), 0);
+        std::fs::remove_file(&p).ok();
+
+        let p = tmp_counter("round_fail");
+        let app = prime_app(
+            &p,
+            "exit 6",
+            Some(r#"printf '{"nodes":[{"node_id":5,"state":"established"}]}'"#),
+        );
+        let store = app.push.clone().unwrap();
+        let out = prime_round(&app, &store, store.generation()).await;
+        assert!(out.waiting.is_empty());
+        assert_eq!(out.failed, vec!["light".to_string()]);
+        assert_eq!(exec_count(&p), 1);
+        std::fs::remove_file(&p).ok();
+    }
 
     /// status が「まだ establishing」と言う間は read を 1 回も撒かず、
     /// established に変わった次のラウンドで read して primed になる。
