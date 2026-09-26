@@ -465,6 +465,9 @@ fn router(app: Shared) -> Router {
         .route("/api/mesh", get(get_mesh))
         .route("/api/mesh/refresh", post(refresh_mesh))
         .route("/mesh", get(mesh_page))
+        .route("/api/rules", get(list_rules))
+        .route("/api/rules/:name/pause", post(pause_rule))
+        .route("/api/rules/:name/resume", post(resume_rule))
         .with_state(app)
 }
 
@@ -1273,6 +1276,84 @@ fn health_unavailable() -> Response {
         .into_response()
 }
 
+/// ルール操作は devices の executor（3610 レーン）とは別レーンで直列化する。
+const RULES_LANE: &str = "rules";
+
+fn rules_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"rules not configured"}"#.to_string(),
+    )
+        .into_response()
+}
+
+fn rules_query_failed() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"rules query failed"}"#.to_string(),
+    )
+        .into_response()
+}
+
+/// `list` テンプレを exec し、契約 JSON 配列をそのまま返す。pause/resume の
+/// 直後にも呼ぶ（成功後の最新状態を返すため）。
+async fn rules_list_response(app: &App, list: &[String]) -> Response {
+    let result = run_bounded(&app.executor, RULES_LANE, list, app.exec_timeout()).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::warn!(outcome = ?result.outcome, stderr = %result.stderr.trim(), "rules list 非成功");
+        return rules_query_failed();
+    }
+    match serde_json::from_str::<Value>(&result.stdout) {
+        Ok(v @ Value::Array(_)) => Json(v).into_response(),
+        _ => {
+            tracing::warn!("rules list の stdout が JSON 配列でない");
+            rules_query_failed()
+        }
+    }
+}
+
+async fn list_rules(State(app): State<Shared>) -> Response {
+    let Some(rules) = &app.config.rules else {
+        return rules_not_configured();
+    };
+    rules_list_response(&app, &rules.list).await
+}
+
+/// pause/resume 共通処理。コマンド配列の末尾にルール名を 1 引数として足して
+/// exec し、成功したら最新の list を返す。
+async fn rule_action(app: &App, name: &str, pause: bool) -> Response {
+    let Some(rules) = &app.config.rules else {
+        return rules_not_configured();
+    };
+    let mut cmd = if pause {
+        rules.pause.clone()
+    } else {
+        rules.resume.clone()
+    };
+    cmd.push(name.to_string());
+    let result = run_bounded(&app.executor, RULES_LANE, &cmd, app.exec_timeout()).await;
+    if result.outcome != ExecOutcome::Success {
+        tracing::warn!(rule = %name, outcome = ?result.outcome, stderr = %result.stderr.trim(), "rules action 非成功");
+        let detail = result.stderr.lines().next().unwrap_or("").to_string();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "rules action failed", "name": name, "detail": detail })),
+        )
+            .into_response();
+    }
+    rules_list_response(app, &rules.list).await
+}
+
+async fn pause_rule(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    rule_action(&app, &name, true).await
+}
+
+async fn resume_rule(State(app): State<Shared>, Path(name): Path<String>) -> Response {
+    rule_action(&app, &name, false).await
+}
+
 /// [mesh] 未設定 → 404。
 fn mesh_not_configured() -> Response {
     (
@@ -1871,6 +1952,84 @@ mod tests {
         );
         let (st, _) = call_with_cfg(&cfg, "GET", "/api/health").await;
         assert_eq!(st, StatusCode::BAD_GATEWAY);
+    }
+
+    /// rules テスト用フェイク。list/pause/resume を sh スクリプトとして
+    /// tempdir に書き出し、pause が受け取った最後の引数を argv ファイルに
+    /// 記録 → list がそれを見て 1 件の JSON 配列を返す。resume は常に失敗。
+    fn rules_cfg(dir: &std::path::Path) -> String {
+        let log = dir.join("argv");
+        let list_sh = dir.join("list.sh");
+        let pause_sh = dir.join("pause.sh");
+        let resume_sh = dir.join("resume.sh");
+        std::fs::write(
+            &list_sh,
+            format!(
+                "#!/bin/sh\nif [ -f \"{log}\" ]; then\n  n=$(cat \"{log}\")\n  printf '[{{\"name\":\"%s\",\"trigger\":\"time\",\"at\":\"00:00\",\"paused\":true}}]' \"$n\"\nelse\n  printf '[]'\nfi\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &pause_sh,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > \"{log}\"\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(&resume_sh, "#!/bin/sh\nexit 11\n").unwrap();
+        format!(
+            "{MINIMAL_DEVICE}\n[rules]\nlist   = [\"sh\", \"{list}\"]\npause  = [\"sh\", \"{pause}\"]\nresume = [\"sh\", \"{resume}\"]\n",
+            list = list_sh.display(),
+            pause = pause_sh.display(),
+            resume = resume_sh.display(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rules_not_configured_is_404() {
+        let (st, v) = call_with_cfg(MINIMAL_DEVICE, "GET", "/api/rules").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "rules not configured");
+    }
+
+    #[tokio::test]
+    async fn rules_list_passes_through_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, v) = call_with_cfg(&rules_cfg(dir.path()), "GET", "/api/rules").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn rules_pause_passes_decoded_name_as_one_arg_and_returns_list() {
+        let dir = tempfile::tempdir().unwrap();
+        // "リビングエアコン 0時OFF" を URL エンコード
+        let path = "/api/rules/%E3%83%AA%E3%83%93%E3%83%B3%E3%82%B0%E3%82%A8%E3%82%A2%E3%82%B3%E3%83%B3%200%E6%99%82OFF/pause";
+        let (st, v) = call_with_cfg(&rules_cfg(dir.path()), "POST", path).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v[0]["name"], "リビングエアコン 0時OFF");
+        assert_eq!(v[0]["paused"], true);
+    }
+
+    #[tokio::test]
+    async fn rules_action_failure_is_502() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, v) = call_with_cfg(&rules_cfg(dir.path()), "POST", "/api/rules/x/resume").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "rules action failed");
+        assert_eq!(v["name"], "x");
+    }
+
+    #[tokio::test]
+    async fn rules_list_non_json_is_502() {
+        let cfg = format!(
+            "{MINIMAL_DEVICE}\n[rules]\nlist = [\"sh\", \"-c\", \"printf nope\"]\npause = [\"true\"]\nresume = [\"true\"]\n"
+        );
+        let (st, v) = call_with_cfg(&cfg, "GET", "/api/rules").await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "rules query failed");
     }
 
     #[tokio::test]

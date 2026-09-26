@@ -64,6 +64,9 @@ pub struct Config {
     pub health: Option<Health>,
     #[serde(default)]
     pub mesh: Option<Mesh>,
+    /// casad ルールの一時停止（任意）。
+    #[serde(default)]
+    pub rules: Option<Rules>,
     /// light 状態の push 取り込み設定（任意）。未設定なら push 機能ごと無効。
     #[serde(default)]
     pub push: Option<Push>,
@@ -204,6 +207,15 @@ pub struct Health {
     /// metric 名 → UI 表示名の置換マップ（任意）。無いキーは metric 名を素通し。
     #[serde(default)]
     pub labels: Option<std::collections::HashMap<String, String>>,
+}
+
+/// casad ルールの一覧・一時停止のコマンド定義（任意）。未設定なら /api/rules ごと無効。
+/// pause / resume はコマンド配列の末尾にルール名を 1 引数として足して exec する。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Rules {
+    pub list: Vec<String>,
+    pub pause: Vec<String>,
+    pub resume: Vec<String>,
 }
 
 /// Thread メッシュ表示のコマンド定義（任意）。未設定なら /mesh ごと無効。
@@ -459,6 +471,8 @@ pub enum ConfigError {
     EmptyPushListen,
     /// `[push] status` が空配列。
     EmptyPushStatus,
+    /// `[rules]` の list / pause / resume のいずれかが空配列。
+    EmptyRulesCommand,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -533,6 +547,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyMeshCommand => write!(f, "mesh: command が空"),
             ConfigError::EmptyPushListen => write!(f, "push: listen が空"),
             ConfigError::EmptyPushStatus => write!(f, "push: status が空"),
+            ConfigError::EmptyRulesCommand => write!(f, "rules: list/pause/resume のいずれかが空"),
         }
     }
 }
@@ -808,6 +823,12 @@ impl Config {
             }
             if p.status.as_ref().is_some_and(|s| s.is_empty()) {
                 return Err(ConfigError::EmptyPushStatus);
+            }
+        }
+
+        if let Some(r) = &self.rules {
+            if r.list.is_empty() || r.pause.is_empty() || r.resume.is_empty() {
+                return Err(ConfigError::EmptyRulesCommand);
             }
         }
 

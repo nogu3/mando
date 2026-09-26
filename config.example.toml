@@ -301,3 +301,10 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # alias → 表示名の置換（[health.labels] と同型）。無いキーは alias を素通し。
 # [mesh.labels]
 # desk_light = "デスクライト"
+
+# casad ルールの一覧・一時停止（任意）。未設定なら画面の「ルール」セクションごと出ない。
+# pause / resume は末尾にルール名を 1 引数として足して実行する。
+# [rules]
+# list   = ["casad", "rules", "list", "--json"]
+# pause  = ["casad", "rules", "pause"]
+# resume = ["casad", "rules", "resume"]
