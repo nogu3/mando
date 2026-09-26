@@ -303,8 +303,9 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # desk_light = "デスクライト"
 
 # casad ルールの一覧・一時停止（任意）。未設定なら画面の「ルール」セクションごと出ない。
-# pause / resume は末尾にルール名を 1 引数として足して実行する。
+# pause / resume は末尾にルール名を 1 引数として足して実行する。`--` で終えて
+# `-` で始まるルール名がオプションとして誤解釈されないようにする。
 # [rules]
 # list   = ["casad", "rules", "list", "--json"]
-# pause  = ["casad", "rules", "pause"]
-# resume = ["casad", "rules", "resume"]
+# pause  = ["casad", "rules", "pause", "--"]
+# resume = ["casad", "rules", "resume", "--"]

@@ -348,6 +348,7 @@
   .rule button.act { min-width: 72px; min-height: 40px; font-size: 13px; letter-spacing: .02em; padding: 0 10px; }
   .rules-more > summary { cursor: pointer; padding: 8px 4px; opacity: .8; color: var(--muted); font-size: 13px; }
   .rule-msg { color: var(--warn); font-size: .85em; padding: 2px 4px; }
+  .rule-msg:empty { display: none; }
 
   .boot { color: var(--muted); padding: 28px 6px; text-align: center; }
 </style>
@@ -1155,6 +1156,7 @@ async function fetchHealth() {
 // 停止中を最上段、時刻ルール、その他（イベント）は折りたたみ。
 // [rules] 未設定（404）や取得失敗ではセクションごと出さない。
 let rulesBox = null;
+let rulesHeading = null;
 
 async function loadRules() {
   let list;
@@ -1163,11 +1165,20 @@ async function loadRules() {
   } catch (e) {
     return;
   }
+  if (!list.length) {
+    // ルールが 0 件ならセクションごと出さない（作成済みなら隠す）。
+    if (rulesHeading) rulesHeading.hidden = true;
+    if (rulesBox) rulesBox.hidden = true;
+    return;
+  }
   if (!rulesBox) {
-    app.appendChild(sectionHeading("⏸ ルール"));
+    rulesHeading = sectionHeading("⏸ ルール");
+    app.appendChild(rulesHeading);
     rulesBox = document.createElement("div");
     app.appendChild(rulesBox);
   }
+  rulesHeading.hidden = false;
+  rulesBox.hidden = false;
   renderRules(list);
 }
 
@@ -1695,7 +1706,7 @@ async function boot() {
   loadRules();
 }
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOnce(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refreshOnce(); loadRules(); } });
 
 boot();
 </script>
