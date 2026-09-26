@@ -1856,6 +1856,21 @@ mod tests {
         assert!(body.contains("その他のルール"));
     }
 
+    #[tokio::test]
+    async fn index_has_page_tabs() {
+        let res = router(test_app())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // 操作 / 表示 / ルール の 3 タブ
+        assert!(body.contains(r#"id="pagetabs""#));
+        for pane in ["ops", "view", "rules"] {
+            assert!(body.contains(&format!(r#"data-pane="{pane}""#)), "{pane}");
+        }
+    }
+
     async fn call(method: &str, path: &str) -> (axum::http::StatusCode, Value) {
         let res = router(test_app())
             .oneshot(

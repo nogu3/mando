@@ -288,6 +288,34 @@
   .drow .status { margin-top: 3px; min-height: 16px; }
   .drow button.act { width: 46px; min-height: 44px; font-size: 15px; border-radius: 12px; }
 
+  /* ── ページタブ（操作 / 表示 / ルール）──────────────── */
+  #pagetabs {
+    position: sticky; top: 0; z-index: 20;
+    max-width: 560px; margin: 0 auto; padding: 8px 14px;
+    display: flex; gap: 2px;
+    background: var(--bg);
+  }
+  #pagetabs[hidden] { display: none; }
+  #pagetabs .ttabs {
+    flex: 1; display: flex; gap: 2px;
+    background: rgba(255,255,255,.05); border: 1px solid var(--line);
+    border-radius: 999px; padding: 3px;
+  }
+  #pagetabs button {
+    flex: 1; appearance: none; border: none; border-radius: 999px;
+    background: none; color: var(--muted); font-size: 13px; font-weight: 700;
+    padding: 8px 10px; cursor: pointer; touch-action: manipulation; user-select: none;
+    transition: background var(--tap), color var(--tap);
+  }
+  #pagetabs button[hidden] { display: none; }
+  #pagetabs button.sel { background: var(--accent); color: #0b1020; }
+  #pagetabs .tbadge {
+    display: inline-block; min-width: 18px; margin-left: 6px; padding: 1px 6px;
+    border-radius: 999px; background: var(--closed); color: #0b1020;
+    font-size: 11px; line-height: 16px;
+  }
+  #pagetabs .tbadge[hidden] { display: none; }
+
   /* ── きろく（embalse グラフ）─────────────────── */
   .sec.krow { display: flex; align-items: center; gap: 10px; }
   .ptabs {
@@ -360,6 +388,13 @@
   <span class="sub">家のリモコン</span>
 </header>
 <div id="hbanner" hidden></div>
+<nav id="pagetabs" hidden>
+  <div class="ttabs">
+    <button type="button" data-pane="ops" class="sel">🎛 操作</button>
+    <button type="button" data-pane="view" hidden>📊 表示</button>
+    <button type="button" data-pane="rules" hidden>⏸ ルール<span class="tbadge" hidden></span></button>
+  </div>
+</nav>
 <main id="app">
   <div class="boot">読み込み中…</div>
 </main>
@@ -1152,11 +1187,48 @@ async function fetchHealth() {
   box.hidden = false;
 }
 
+/* ── ページタブ（操作 / 表示 / ルール）──────────────── */
+// 開くたびに「操作」から始める。表示・ルールは中身があるときだけタブを出す。
+// きろくの取得は IntersectionObserver 任せなので、表示タブを初めて開いたときに走る。
+const pageTabs = document.getElementById("pagetabs");
+const panes = {}; // pane name -> div
+
+function buildPanes() {
+  for (const name of ["ops", "view", "rules"]) {
+    const el = document.createElement("div");
+    el.className = "pane";
+    el.hidden = name !== "ops";
+    panes[name] = el;
+    app.appendChild(el);
+  }
+  for (const b of pageTabs.querySelectorAll("button")) {
+    b.addEventListener("click", () => showPane(b.dataset.pane));
+  }
+}
+
+function showPane(name) {
+  for (const [n, el] of Object.entries(panes)) el.hidden = n !== name;
+  for (const b of pageTabs.querySelectorAll("button")) {
+    b.classList.toggle("sel", b.dataset.pane === name);
+  }
+  window.scrollTo(0, 0);
+}
+
+function tabButton(name) {
+  return pageTabs.querySelector(`button[data-pane="${name}"]`);
+}
+
+// タブの出し入れ。操作タブしか無ければタブバーごと隠す。
+function setTabEnabled(name, on) {
+  tabButton(name).hidden = !on;
+  if (!on && !panes[name].hidden) showPane("ops");
+  pageTabs.hidden = !["view", "rules"].some((n) => !tabButton(n).hidden);
+}
+
 /* ── ⏸ ルール（casad rules の一時停止）──────────────── */
 // 停止中を最上段、時刻ルール、その他（イベント）は折りたたみ。
-// [rules] 未設定（404）や取得失敗ではセクションごと出さない。
+// [rules] 未設定（404）や取得失敗ではタブごと出さない。
 let rulesBox = null;
-let rulesHeading = null;
 
 async function loadRules() {
   let list;
@@ -1166,19 +1238,15 @@ async function loadRules() {
     return;
   }
   if (!list.length) {
-    // ルールが 0 件ならセクションごと出さない（作成済みなら隠す）。
-    if (rulesHeading) rulesHeading.hidden = true;
-    if (rulesBox) rulesBox.hidden = true;
+    // ルールが 0 件ならタブごと出さない。
+    setTabEnabled("rules", false);
     return;
   }
   if (!rulesBox) {
-    rulesHeading = sectionHeading("⏸ ルール");
-    app.appendChild(rulesHeading);
     rulesBox = document.createElement("div");
-    app.appendChild(rulesBox);
+    panes.rules.appendChild(rulesBox);
   }
-  rulesHeading.hidden = false;
-  rulesBox.hidden = false;
+  setTabEnabled("rules", true);
   renderRules(list);
 }
 
@@ -1211,6 +1279,10 @@ function renderRules(list) {
   const paused = list.filter((r) => r.paused);
   const timed = list.filter((r) => !r.paused && r.trigger === "time");
   const others = list.filter((r) => !r.paused && r.trigger !== "time");
+  // 停止中の件数をタブに出す（操作タブにいても止めっぱなしに気づけるように）。
+  const badge = tabButton("rules").querySelector(".tbadge");
+  badge.textContent = String(paused.length);
+  badge.hidden = paused.length === 0;
   for (const r of paused) box.appendChild(ruleRow(r));
   for (const r of timed) box.appendChild(ruleRow(r));
   rulesBox.appendChild(box);
@@ -1277,7 +1349,7 @@ function buildGraphSection(graphList) {
     tabs.appendChild(b);
   }
   head.appendChild(tabs);
-  app.appendChild(head);
+  panes.view.appendChild(head);
 
   for (const g of graphList) {
     const card = document.createElement("div");
@@ -1295,8 +1367,9 @@ function buildGraphSection(graphList) {
       legendEl: card.querySelector(".glegend"),
       bodyEl: card.querySelector(".gbody"),
     });
-    app.appendChild(card);
+    panes.view.appendChild(card);
   }
+  setTabEnabled("view", true);
   // 取得はセクションが初めて画面に入ったときまで遅らせる
   // （開いてすぐの操作を重い読み出しで邪魔しない・ポーリングはしない）。
   const io = new IntersectionObserver((entries) => {
@@ -1657,6 +1730,7 @@ async function boot() {
     return;
   }
   app.innerHTML = "";
+  buildPanes();
   const byName = new Map(devices.map((d) => [d.name, d]));
   const lights = devices.filter((d) => d.kind === "light");
   const switchLights = devices.filter((d) => d.kind === "switch" && d.face === "light");
@@ -1671,29 +1745,29 @@ async function boot() {
   );
 
   if (lights.length || switchLights.length) {
-    app.appendChild(sectionHeading("💡 照明"));
-    for (const g of lightGroups) app.appendChild(buildLightGroupCard(g, byName));
+    panes.ops.appendChild(sectionHeading("💡 照明"));
+    for (const g of lightGroups) panes.ops.appendChild(buildLightGroupCard(g, byName));
     if (soloLights.length || switchLights.length) {
       const tiles = document.createElement("div");
       tiles.className = "tiles";
       for (const dev of soloLights) tiles.appendChild(buildLightTile(dev));
       for (const dev of switchLights) tiles.appendChild(buildSwitchTile(dev));
-      app.appendChild(tiles);
+      panes.ops.appendChild(tiles);
     }
   }
   if (plainSwitches.length) {
-    app.appendChild(sectionHeading("🔌 スイッチ"));
+    panes.ops.appendChild(sectionHeading("🔌 スイッチ"));
     const tiles = document.createElement("div");
     tiles.className = "tiles";
     for (const dev of plainSwitches) tiles.appendChild(buildSwitchTile(dev));
-    app.appendChild(tiles);
+    panes.ops.appendChild(tiles);
   }
   if (shutters.length) {
-    app.appendChild(sectionHeading("🪟 シャッター"));
-    for (const g of grps) app.appendChild(buildGroup(g, byName));
+    panes.ops.appendChild(sectionHeading("🪟 シャッター"));
+    for (const g of grps) panes.ops.appendChild(buildGroup(g, byName));
     // グループ非所属の shutter は従来カードで並べる（グループ所属は行で登録済み）。
     for (const dev of shutters) {
-      if (!grouped.has(dev.name)) app.appendChild(buildCard(dev));
+      if (!grouped.has(dev.name)) panes.ops.appendChild(buildCard(dev));
     }
   }
   // グラフが config に無ければセクションごと出さない。
