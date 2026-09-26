@@ -336,6 +336,19 @@
   .hbanner.crit  { background: rgba(240,99,90,.12);   border-color: rgba(240,99,90,.45);  color: var(--warn); }
   .hbanner.stale { background: rgba(139,147,167,.10); border-color: rgba(139,147,167,.35); color: var(--muted); }
 
+  /* ── ⏸ ルール（casad rules の一時停止）──────────── */
+  .rules { display: flex; flex-direction: column; gap: 6px; }
+  .rule {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    border-radius: 12px; background: var(--panel); border: 1px solid var(--line);
+  }
+  .rule .rname { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 700; }
+  .rule .rat { font-variant-numeric: tabular-nums; opacity: .7; font-size: 12px; color: var(--muted); }
+  .rule.paused { outline: 2px solid var(--closed); }
+  .rule button.act { min-width: 72px; min-height: 40px; font-size: 13px; letter-spacing: .02em; padding: 0 10px; }
+  .rules-more > summary { cursor: pointer; padding: 8px 4px; opacity: .8; color: var(--muted); font-size: 13px; }
+  .rule-msg { color: var(--warn); font-size: .85em; padding: 2px 4px; }
+
   .boot { color: var(--muted); padding: 28px 6px; text-align: center; }
 </style>
 </head>
@@ -1138,6 +1151,85 @@ async function fetchHealth() {
   box.hidden = false;
 }
 
+/* ── ⏸ ルール（casad rules の一時停止）──────────────── */
+// 停止中を最上段、時刻ルール、その他（イベント）は折りたたみ。
+// [rules] 未設定（404）や取得失敗ではセクションごと出さない。
+let rulesBox = null;
+
+async function loadRules() {
+  let list;
+  try {
+    list = await api("GET", "/api/rules");
+  } catch (e) {
+    return;
+  }
+  if (!rulesBox) {
+    app.appendChild(sectionHeading("⏸ ルール"));
+    rulesBox = document.createElement("div");
+    app.appendChild(rulesBox);
+  }
+  renderRules(list);
+}
+
+function ruleRow(r) {
+  const row = document.createElement("div");
+  row.className = "rule" + (r.paused ? " paused" : "");
+  const name = document.createElement("span");
+  name.className = "rname";
+  name.textContent = r.name;
+  const at = document.createElement("span");
+  at.className = "rat";
+  at.textContent = r.at || "";
+  const btn = document.createElement("button");
+  btn.className = "act " + (r.paused ? "on" : "off");
+  btn.textContent = r.paused ? "再開" : "止める";
+  const msg = document.createElement("div");
+  msg.className = "rule-msg";
+  btn.addEventListener("click", () => ruleAct(r, btn, msg));
+  row.append(name, at, btn);
+  const wrap = document.createElement("div");
+  wrap.append(row, msg);
+  return wrap;
+}
+
+function renderRules(list) {
+  const openMore = rulesBox.querySelector("details")?.open ?? false;
+  rulesBox.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "rules";
+  const paused = list.filter((r) => r.paused);
+  const timed = list.filter((r) => !r.paused && r.trigger === "time");
+  const others = list.filter((r) => !r.paused && r.trigger !== "time");
+  for (const r of paused) box.appendChild(ruleRow(r));
+  for (const r of timed) box.appendChild(ruleRow(r));
+  rulesBox.appendChild(box);
+  if (others.length) {
+    const more = document.createElement("details");
+    more.className = "rules-more";
+    more.open = openMore;
+    const sum = document.createElement("summary");
+    sum.textContent = `その他のルール（${others.length}）`;
+    const inner = document.createElement("div");
+    inner.className = "rules";
+    for (const r of others) inner.appendChild(ruleRow(r));
+    more.append(sum, inner);
+    rulesBox.appendChild(more);
+  }
+}
+
+async function ruleAct(r, btn, msg) {
+  const verb = r.paused ? "resume" : "pause";
+  btn.disabled = true;
+  msg.textContent = "";
+  try {
+    const list = await api("POST", `/api/rules/${encodeURIComponent(r.name)}/${verb}`);
+    renderRules(list);
+  } catch (e) {
+    btn.disabled = false;
+    msg.textContent = "操作に失敗しました";
+  }
+}
+
 /* ── きろく（embalse グラフ）─────────────────────── */
 // dataviz 検証済みカテゴリカルパレット（ダーク面 #10141d で全チェック PASS、
 // 5色版 2026-09-01 再検証済み）。系列へ初出順に固定割当する。循環させない —
@@ -1600,6 +1692,7 @@ async function boot() {
   if (lights.length) startEvents();
   refreshOnce();
   fetchLightStatesOnce(devices);
+  loadRules();
 }
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOnce(); });

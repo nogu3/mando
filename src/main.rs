@@ -1844,6 +1844,18 @@ mod tests {
         assert!(body.contains("/api/mesh/refresh"));
     }
 
+    #[tokio::test]
+    async fn index_has_rules_section_script() {
+        let res = router(test_app())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("/api/rules"));
+        assert!(body.contains("その他のルール"));
+    }
+
     async fn call(method: &str, path: &str) -> (axum::http::StatusCode, Value) {
         let res = router(test_app())
             .oneshot(
