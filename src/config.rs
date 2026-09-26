@@ -2238,6 +2238,46 @@ mod tests {
         std::fs::remove_file(p).ok();
     }
 
+    #[test]
+    fn rules_absent_is_none() {
+        let p = write_tmp(
+            "rulesnone",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.rules.is_none());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn rules_empty_command_rejected() {
+        let p = write_tmp(
+            "rulesempty",
+            r##"
+            [[device]]
+            name = "s1"
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            [rules]
+            list = ["casad", "rules", "list", "--json"]
+            pause = []
+            resume = ["casad", "rules", "resume"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyRulesCommand)
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
     /// members テスト用の light デバイス定義を生成する。
     fn light_toml(name: &str, extra: &str) -> String {
         format!(
