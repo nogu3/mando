@@ -498,6 +498,8 @@ struct DeviceInfo {
     presets: Vec<PresetInfo>,
     /// switch の表示フェイス（表示専用。null なら素のスイッチ）。
     face: Option<Face>,
+    /// 状態を持たない switch（赤外線など）。UI は ON / OFF の 2 ボタンで状態ラベル無し。
+    stateless: bool,
     /// members を持つ light(グループカード)のメンバー device 名。空なら省略。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     members: Vec<String>,
@@ -525,6 +527,7 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
                 })
                 .collect(),
             face: d.face,
+            stateless: d.stateless,
             members: d.members.clone(),
         })
         .collect();
@@ -565,6 +568,18 @@ enum ReadFailLog {
 }
 
 async fn fetch_state_with(app: &App, device: &Device, on_fail: ReadFailLog) -> StateView {
+    // stateless（赤外線など一方通行）は読む手段が無い。exec を走らせず unknown を返し、
+    // exec キーも付けない（走らなかった exec の成否を騙らない）。set 後の再取得も
+    // ここを通るので、run_action は自然に「送信結果のみ」になる。
+    if device.stateless {
+        return StateView {
+            state: DeviceState::Unknown,
+            exec: None,
+            raw: None,
+            source: None,
+            stale: None,
+        };
+    }
     let result = run_bounded(
         &app.executor,
         device.exec_lane(),
@@ -1580,6 +1595,12 @@ mod tests {
             on  = ["sh", "-c", "printf '{}'"]
             off = ["sh", "-c", "printf '{}'"]
             [[device]]
+            name = "irfan"
+            kind = "switch"
+            stateless = true
+            on  = ["sh", "-c", "printf '{}'"]
+            off = ["sh", "-c", "printf '{}'"]
+            [[device]]
             name = "shutter"
             get_state = ["sh", "-c", "printf '{\"properties\":[{\"name\":\"open_close_state\",\"value\":\"open\"}]}'"]
             open  = ["sh", "-c", "printf '{}'"]
@@ -2072,6 +2093,37 @@ mod tests {
         let sh = arr.iter().find(|d| d["name"] == "shutter").unwrap();
         assert_eq!(sh["kind"], "shutter");
         assert_eq!(sh["presets"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn devices_list_exposes_stateless() {
+        let (st, v) = call("GET", "/api/devices").await;
+        assert_eq!(st, StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        let fan = arr.iter().find(|d| d["name"] == "irfan").unwrap();
+        assert_eq!(fan["stateless"], true);
+        let sh = arr.iter().find(|d| d["name"] == "shutter").unwrap();
+        assert_eq!(sh["stateless"], false);
+    }
+
+    #[tokio::test]
+    async fn stateless_state_is_unknown_without_exec() {
+        // get_state が無いので exec は走らない → exec キーも出さない（走らなかった
+        // exec の成否を騙らない）。state は unknown で固定。
+        let (st, v) = call("GET", "/api/devices/irfan/state").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["state"], "unknown");
+        assert!(v.get("exec").is_none(), "exec must be omitted: {v}");
+    }
+
+    #[tokio::test]
+    async fn stateless_on_returns_action_and_unknown_state() {
+        let (st, v) = call("POST", "/api/devices/irfan/on").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["action"], "success");
+        // ActionView は StateView を flatten して返す（action + state/exec/raw が同じ階層）。
+        assert_eq!(v["state"], "unknown");
+        assert!(v.get("exec").is_none(), "{v}");
     }
 
     #[tokio::test]

@@ -303,8 +303,14 @@ pub struct Device {
     /// デバイス種別。省略時 shutter（既存 config 互換）。
     #[serde(default)]
     pub kind: Kind,
-    /// 状態取得コマンド。全 kind で必須。
+    /// 状態取得コマンド。`stateless = true` の switch 以外は必須。
+    #[serde(default)]
     pub get_state: Vec<String>,
+    /// 状態を持たない switch（赤外線リモコンなど一方通行の機器。switch 専用・任意）。
+    /// true なら get_state を持たず、state は常に unknown で exec も走らない。
+    /// UI はトグル 1 個ではなく ON / OFF の 2 ボタンを出し、状態ラベルを出さない。
+    #[serde(default)]
+    pub stateless: bool,
     /// open コマンド（shutter 必須 / light・switch 不可）。
     #[serde(default)]
     pub open: Option<Vec<String>>,
@@ -611,7 +617,21 @@ impl Config {
             if !seen.insert(&d.name) {
                 return Err(ConfigError::DuplicateName(d.name.clone()));
             }
-            if d.get_state.is_empty() {
+            if d.stateless {
+                if d.kind != Kind::Switch {
+                    return Err(ConfigError::ForbiddenField {
+                        device: d.name.clone(),
+                        field: "stateless",
+                    });
+                }
+                // 読めるなら stateless にしない。両方あるのは設定の矛盾。
+                if !d.get_state.is_empty() {
+                    return Err(ConfigError::ForbiddenField {
+                        device: d.name.clone(),
+                        field: "get_state",
+                    });
+                }
+            } else if d.get_state.is_empty() {
                 return Err(ConfigError::EmptyCommand(d.name.clone()));
             }
             match d.kind {
@@ -1433,6 +1453,102 @@ mod tests {
     }
 
     #[test]
+    fn stateless_switch_may_omit_get_state() {
+        // 赤外線など一方通行の機器: 状態が読めないので get_state 無しで on/off だけ持つ。
+        let p = write_tmp(
+            "switch_stateless",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            stateless = true
+            on  = ["casa", "on",  "fan"]
+            off = ["casa", "off", "fan"]
+            "##,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("fan").unwrap();
+        assert!(d.stateless);
+        assert!(d.get_state.is_empty());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn stateless_switch_rejects_get_state() {
+        // stateless なのに get_state があるのは矛盾（読めるなら stateless にしない）。
+        let p = write_tmp(
+            "switch_stateless_getstate",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            stateless = true
+            get_state = ["casa", "get", "fan", "power"]
+            on  = ["casa", "on",  "fan"]
+            off = ["casa", "off", "fan"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "get_state", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn non_stateless_switch_still_requires_get_state() {
+        let p = write_tmp(
+            "switch_no_getstate",
+            r##"
+            [[device]]
+            name = "fan"
+            kind = "switch"
+            on  = ["casa", "on",  "fan"]
+            off = ["casa", "off", "fan"]
+            "##,
+        );
+        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn stateless_forbidden_on_light_and_shutter() {
+        let p = write_tmp(
+            "light_stateless",
+            r##"
+            [[device]]
+            name = "l"
+            kind = "light"
+            stateless = true
+            get_state = ["mat", "read", "--node", "l"]
+            on  = ["mat", "on",  "--node", "l"]
+            off = ["mat", "off", "--node", "l"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "stateless", .. })
+        ));
+        std::fs::remove_file(p).ok();
+        let p = write_tmp(
+            "shutter_stateless",
+            r##"
+            [[device]]
+            name = "s"
+            stateless = true
+            get_state = ["enl", "get", "x", "026301", "open_close_state"]
+            open  = ["enl", "set", "x", "026301", "open_close_operation", "open"]
+            close = ["enl", "set", "x", "026301", "open_close_operation", "close"]
+            "##,
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::ForbiddenField { field: "stateless", .. })
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
     fn switch_face_light_parses() {
         let p = write_tmp(
             "switch_face",
@@ -1547,6 +1663,7 @@ mod tests {
             members: vec![],
             node_id: None,
             lane: None,
+            stateless: false,
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());

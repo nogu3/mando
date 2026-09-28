@@ -150,6 +150,9 @@
   .tile .tname { font-size: 14px; font-weight: 700; text-align: center; }
   .tile .status { justify-content: center; margin-top: 2px; min-height: 16px; }
   .tile.lit .status .label { color: #ffca7a; }
+  /* stateless switch（赤外線など）: 状態ラベルを出さず ON / OFF の 2 ボタン */
+  .tile .onoff { display: flex; gap: 8px; margin: 6px 0 2px; }
+  .tile .onoff button.act { flex: 1; min-height: 46px; font-size: 15px; letter-spacing: .06em; border-radius: 12px; }
   /* ── 色変更ボタン + 色選択ボトムシート ─────────────── */
   button.colorbtn {
     appearance: none; width: 100%; min-height: 44px; margin-top: 7px;
@@ -662,6 +665,7 @@ function buildLightGroupCard(dev, byName) {
 
 /* ── switch タイル（電源ボタン = on/off トグル。振る舞いは shutter 系）──── */
 function buildSwitchTile(dev) {
+  if (dev.stateless) return buildStatelessSwitchTile(dev);
   const el = document.createElement("div");
   el.className = "tile";
   const isLight = dev.face === "light";
@@ -685,6 +689,38 @@ function buildSwitchTile(dev) {
   el.querySelector(".bulb").addEventListener("click", () =>
     deviceAct(dev.name, c.state === "on" ? "off" : "on")
   );
+  cards.set(dev.name, c);
+  return el;
+}
+
+/* ── stateless switch タイル（赤外線など一方通行。状態が読めないので
+   トグルにせず ON / OFF を別ボタンで出し、状態ラベルは置かない）──── */
+function buildStatelessSwitchTile(dev) {
+  const el = document.createElement("div");
+  el.className = "tile";
+  el.innerHTML = `
+    <div class="tname"></div>
+    <div class="onoff">
+      <button class="act on"  type="button" data-op="on">ON</button>
+      <button class="act off" type="button" data-op="off">OFF</button>
+    </div>
+    <div class="status unknown"><span class="msg"></span></div>
+  `;
+  el.querySelector(".tname").textContent = dev.label;
+  const c = {
+    kind: "switch",
+    face: dev.face || null,
+    stateless: true,
+    rootEl: el,
+    statusEl: el.querySelector(".status"),
+    labelEl: null, // 状態ラベル無し（renderState は stateless を見て label を触らない）
+    msgEl: el.querySelector(".status .msg"),
+    buttons: [...el.querySelectorAll("button.act")],
+    state: "unknown",
+  };
+  for (const b of c.buttons) {
+    b.addEventListener("click", () => deviceAct(dev.name, b.dataset.op));
+  }
   cards.set(dev.name, c);
   return el;
 }
@@ -976,6 +1012,14 @@ function scheduleLightCatchup(name) {
 function renderState(name, view) {
   const c = cards.get(name);
   if (!c) return;
+  if (c.stateless) {
+    // 状態は常に unknown。exec も走らないので、出すのは stale/exec の異常だけ。
+    c.state = "unknown";
+    const m = STATE_MSG[view.exec] || (view.stale ? "状態不明" : "");
+    c.msgEl.textContent = m;
+    c.statusEl.classList.toggle("error", !!m);
+    return;
+  }
   const st = view.state || "unknown";
   c.state = st;
   c.statusEl.className = "status " + st;
@@ -1048,6 +1092,11 @@ async function deviceAct(name, op) {
     renderState(name, view);
     const am = ACTION_MSG[view.action] || "";
     if (am) { c.msgEl.textContent = "⚠ " + am; c.statusEl.classList.add("error"); }
+    else if (c && c.stateless) {
+      // 状態で確認できない機器は「送った」ことだけ短く出す（成功を騙らない言い方）。
+      c.msgEl.textContent = "送信しました";
+      setTimeout(() => { if (c.msgEl.textContent === "送信しました") c.msgEl.textContent = ""; }, 2500);
+    }
   } catch (e) {
     if (c) { c.msgEl.textContent = "⚠ 通信エラー"; c.statusEl.classList.add("error"); }
   } finally {
@@ -1091,6 +1140,8 @@ async function pollOnce() {
     // light は定期ポーリングしない（mat 直叩きは遅く、exec 直列を詰まらせる）。
     // 表示時 1 回 + 操作後の再取得のみ（fetchLightStatesOnce / scheduleLightCatchup）。
     if (c.kind === "light") continue;
+    // stateless は読む手段が無い（サーバも exec しない）。ポーリングしない。
+    if (c.stateless) continue;
     try {
       const view = await api("GET", `/api/devices/${encodeURIComponent(name)}/state`);
       renderState(name, view);
