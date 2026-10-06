@@ -105,7 +105,8 @@ struct LoopRun {
   拍 `i` の処理: `i % bar_beats == 0` なら `bar[(i / bar_beats) % bar.len()]` を exec → `beat` を順に exec。
   同じ拍のコマンドは**直列**（順序が意味を持つ: 色 → 100% → フェード）。
 - 処理が次の拍の時刻を越えていたら、**越えた分の拍は飛ばして**次の未来の拍に揃える（遅れを積まない）。
-- exec は `Executor::run(device.exec_lane(), cmd)`（既存の timeout 有界）。失敗（non-zero / timeout）は
+- exec は loop 専用の `Executor`（graph / mesh と同じ流儀。`App.executor` を Arc 化して App 構築 9 箇所に
+  触るのを避ける）で、lane は `device.exec_lane()`、timeout は `[exec] timeout_ms`。失敗（non-zero / timeout）は
   debug ログ、**連続 10 拍失敗で warn 1 回**（成功で復帰したらまた 10 回からカウント）。ループは止めない。
 - `cancel` が true になるか `deadline` に達したら終了。deadline 到達時は `on_stop` を exec して
   `loops` から自分を外す（自動停止）。
