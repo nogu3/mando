@@ -15,6 +15,9 @@ pub enum Kind {
     Shutter,
     Light,
     Switch,
+    /// config のコマンド配列を BPM の拍に合わせて exec し続ける（クラブ照明など）。
+    /// 状態は in-memory（running / stopped）で、get_state は持たない。
+    Loop,
 }
 
 /// switch の表示フェイス（表示専用。振る舞いは switch のまま）。UI のアイコン・
@@ -358,9 +361,44 @@ pub struct Device {
     /// 同一の lane（例 "echonet"）を明示すること。
     #[serde(default)]
     pub lane: Option<String>,
+    /// loop: UI の BPM プリセット（先頭が既定）。loop 必須・他 kind 不可。各 40〜200。
+    #[serde(default)]
+    pub bpms: Vec<u32>,
+    /// loop: 自動停止までの分（省略 60）。1〜600。
+    #[serde(default)]
+    pub max_minutes: Option<u32>,
+    /// loop: 1 小節の拍数（省略 4）。1〜16。
+    #[serde(default)]
+    pub bar_beats: Option<u32>,
+    /// loop: 毎拍、順に exec するコマンド配列（必須）。`{fade}` は拍長の 80% を 0.1 秒単位にした値。
+    #[serde(default)]
+    pub beat: Vec<Vec<String>>,
+    /// loop: 小節の頭に beat より先に exec するコマンド配列。小節ごとに順繰り（任意）。
+    #[serde(default)]
+    pub bar: Vec<Vec<String>>,
+    /// loop: 停止・自動停止・shutdown 時に順に exec するコマンド配列（必須）。
+    /// shutter の `stop`（1 コマンド）と混ざらないよう別名。
+    #[serde(default)]
+    pub on_stop: Vec<Vec<String>>,
 }
 
 impl Device {
+    /// loop: 自動停止までの分（省略 60）。
+    pub fn max_minutes(&self) -> u32 {
+        self.max_minutes.unwrap_or(60)
+    }
+
+    /// loop: 1 小節の拍数（省略 4）。
+    pub fn bar_beats(&self) -> u32 {
+        self.bar_beats.unwrap_or(4)
+    }
+
+    /// loop: 既定 BPM（`bpms[0]`。validate で 1 個以上を保証済み）。
+    #[allow(dead_code)] // 呼び出しは looper（後続タスク）で入る。
+    pub fn default_bpm(&self) -> u32 {
+        self.bpms.first().copied().unwrap_or(120)
+    }
+
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
     }
@@ -477,6 +515,17 @@ pub enum ConfigError {
     EmptyPushListen,
     /// `[push] status` が空配列。
     EmptyPushStatus,
+    /// loop の数値フィールドが値域外。
+    LoopValue {
+        device: String,
+        field: &'static str,
+        value: u64,
+    },
+    /// `{fade}` を beat 以外に書いた。
+    FadePlaceholder {
+        device: String,
+        field: &'static str,
+    },
     /// `[rules]` の list / pause / resume のいずれかが空配列。
     EmptyRulesCommand,
 }
@@ -553,6 +602,19 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyMeshCommand => write!(f, "mesh: command が空"),
             ConfigError::EmptyPushListen => write!(f, "push: listen が空"),
             ConfigError::EmptyPushStatus => write!(f, "push: status が空"),
+            ConfigError::LoopValue {
+                device,
+                field,
+                value,
+            } => {
+                write!(f, "device {device}: {field} の値 {value} が範囲外")
+            }
+            ConfigError::FadePlaceholder { device, field } => {
+                write!(
+                    f,
+                    "device {device}: {{fade}} は beat でしか使えない（{field} にある）"
+                )
+            }
             ConfigError::EmptyRulesCommand => write!(f, "rules: list/pause/resume のいずれかが空"),
         }
     }
@@ -631,7 +693,7 @@ impl Config {
                         field: "get_state",
                     });
                 }
-            } else if d.get_state.is_empty() {
+            } else if d.kind != Kind::Loop && d.get_state.is_empty() {
                 return Err(ConfigError::EmptyCommand(d.name.clone()));
             }
             match d.kind {
@@ -725,6 +787,107 @@ impl Config {
                             field: "preset",
                         });
                     }
+                }
+                Kind::Loop => {
+                    forbid(&d.name, "open", &d.open)?;
+                    forbid(&d.name, "close", &d.close)?;
+                    forbid(&d.name, "stop", &d.stop)?;
+                    forbid(&d.name, "on", &d.on)?;
+                    forbid(&d.name, "off", &d.off)?;
+                    forbid(&d.name, "color", &d.color)?;
+                    forbid(&d.name, "brightness", &d.brightness)?;
+                    let forbidden_field = |field: &'static str| ConfigError::ForbiddenField {
+                        device: d.name.clone(),
+                        field,
+                    };
+                    if !d.get_state.is_empty() {
+                        return Err(forbidden_field("get_state"));
+                    }
+                    if d.face.is_some() {
+                        return Err(forbidden_field("face"));
+                    }
+                    if !d.presets.is_empty() {
+                        return Err(forbidden_field("preset"));
+                    }
+                    if !d.members.is_empty() {
+                        return Err(forbidden_field("members"));
+                    }
+                    if d.node_id.is_some() {
+                        return Err(forbidden_field("node_id"));
+                    }
+                    let loop_value = |field: &'static str, value: u64| ConfigError::LoopValue {
+                        device: d.name.clone(),
+                        field,
+                        value,
+                    };
+                    if d.bpms.is_empty() {
+                        return Err(ConfigError::MissingCommand {
+                            device: d.name.clone(),
+                            field: "bpms",
+                        });
+                    }
+                    for &b in &d.bpms {
+                        if !(40..=200).contains(&b) {
+                            return Err(loop_value("bpms", b as u64));
+                        }
+                    }
+                    let mm = d.max_minutes();
+                    if !(1..=600).contains(&mm) {
+                        return Err(loop_value("max_minutes", mm as u64));
+                    }
+                    let bb = d.bar_beats();
+                    if !(1..=16).contains(&bb) {
+                        return Err(loop_value("bar_beats", bb as u64));
+                    }
+                    // コマンド配列: beat / on_stop は 1 個以上、各コマンドは空不可。
+                    // {fade} は beat のみ。
+                    let has_fade =
+                        |cmds: &[Vec<String>]| cmds.iter().flatten().any(|s| s.contains("{fade}"));
+                    for (field, cmds, required) in [
+                        ("beat", &d.beat, true),
+                        ("bar", &d.bar, false),
+                        ("on_stop", &d.on_stop, true),
+                    ] {
+                        if required && cmds.is_empty() {
+                            return Err(ConfigError::MissingCommand {
+                                device: d.name.clone(),
+                                field,
+                            });
+                        }
+                        if cmds.iter().any(|c| c.is_empty()) {
+                            return Err(ConfigError::EmptyCommand(d.name.clone()));
+                        }
+                        if field != "beat" && has_fade(cmds) {
+                            return Err(ConfigError::FadePlaceholder {
+                                device: d.name.clone(),
+                                field,
+                            });
+                        }
+                    }
+                }
+            }
+            if d.kind != Kind::Loop {
+                let forbidden_field = |field: &'static str| ConfigError::ForbiddenField {
+                    device: d.name.clone(),
+                    field,
+                };
+                if !d.bpms.is_empty() {
+                    return Err(forbidden_field("bpms"));
+                }
+                if d.max_minutes.is_some() {
+                    return Err(forbidden_field("max_minutes"));
+                }
+                if d.bar_beats.is_some() {
+                    return Err(forbidden_field("bar_beats"));
+                }
+                if !d.beat.is_empty() {
+                    return Err(forbidden_field("beat"));
+                }
+                if !d.bar.is_empty() {
+                    return Err(forbidden_field("bar"));
+                }
+                if !d.on_stop.is_empty() {
+                    return Err(forbidden_field("on_stop"));
                 }
             }
         }
@@ -1490,7 +1653,10 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::ForbiddenField { field: "get_state", .. })
+            Err(ConfigError::ForbiddenField {
+                field: "get_state",
+                ..
+            })
         ));
         std::fs::remove_file(p).ok();
     }
@@ -1507,7 +1673,10 @@ mod tests {
             off = ["casa", "off", "fan"]
             "##,
         );
-        assert!(matches!(Config::load(&p), Err(ConfigError::EmptyCommand(_))));
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
         std::fs::remove_file(p).ok();
     }
 
@@ -1527,7 +1696,10 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::ForbiddenField { field: "stateless", .. })
+            Err(ConfigError::ForbiddenField {
+                field: "stateless",
+                ..
+            })
         ));
         std::fs::remove_file(p).ok();
         let p = write_tmp(
@@ -1543,7 +1715,10 @@ mod tests {
         );
         assert!(matches!(
             Config::load(&p),
-            Err(ConfigError::ForbiddenField { field: "stateless", .. })
+            Err(ConfigError::ForbiddenField {
+                field: "stateless",
+                ..
+            })
         ));
         std::fs::remove_file(p).ok();
     }
@@ -1664,6 +1839,12 @@ mod tests {
             node_id: None,
             lane: None,
             stateless: false,
+            bpms: vec![],
+            max_minutes: None,
+            bar_beats: None,
+            beat: vec![],
+            bar: vec![],
+            on_stop: vec![],
         };
         assert_eq!(d.label(), "x");
         assert!(d.stop_cmd().is_none());
@@ -2603,5 +2784,197 @@ mod tests {
             Err(ConfigError::UnknownChart { .. })
         ));
         std::fs::remove_file(p).ok();
+    }
+
+    const LOOP_OK: &str = r##"
+        [[device]]
+        name  = "club"
+        kind  = "loop"
+        bpms  = [100, 120, 128]
+        beat = [
+          ["mat", "group", "level", "--group", "g", "--percent", "100"],
+          ["mat", "group", "level", "--group", "g", "--percent", "8", "--transition", "{fade}"],
+        ]
+        bar = [["mat", "group", "color", "--group", "g", "--name", "magenta"]]
+        on_stop = [["mat", "group", "color-temp", "--group", "g", "--mireds", "370"]]
+        "##;
+
+    #[test]
+    fn loop_minimal_config_loads_with_defaults() {
+        let p = write_tmp("loop_ok", LOOP_OK);
+        let cfg = Config::load(&p).unwrap();
+        let d = cfg.find("club").unwrap();
+        assert_eq!(d.kind, Kind::Loop);
+        assert_eq!(d.bpms, vec![100, 120, 128]);
+        assert_eq!(d.default_bpm(), 100);
+        assert_eq!(d.max_minutes(), 60);
+        assert_eq!(d.bar_beats(), 4);
+        assert_eq!(d.beat.len(), 2);
+        assert_eq!(d.bar.len(), 1);
+        assert_eq!(d.on_stop.len(), 1);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn loop_requires_bpms_beat_and_on_stop() {
+        for (tag, drop) in [("bpms", "bpms"), ("beat", "beat"), ("on_stop", "on_stop")] {
+            // 該当行（配列の開始行から閉じ括弧まで）を消す。bpms は 1 行、beat/on_stop は複数行。
+            let src: String = LOOP_OK
+                .lines()
+                .scan(false, |skipping, l| {
+                    let t = l.trim_start();
+                    if t.starts_with(&format!("{drop} ")) || t.starts_with(&format!("{drop}=")) {
+                        *skipping =
+                            !t.ends_with(']') || t.matches('[').count() != t.matches(']').count();
+                        return Some(None);
+                    }
+                    if *skipping {
+                        if t == "]" {
+                            *skipping = false;
+                        }
+                        return Some(None);
+                    }
+                    Some(Some(l))
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let p = write_tmp(&format!("loop_missing_{tag}"), &src);
+            assert!(
+                matches!(Config::load(&p), Err(ConfigError::MissingCommand { field, .. }) if field == drop),
+                "{drop} を消したら MissingCommand になるはず"
+            );
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn loop_value_ranges() {
+        for (tag, line, field) in [
+            ("bpm_low", "bpms = [39]", "bpms"),
+            ("bpm_high", "bpms = [201]", "bpms"),
+            ("max_low", "bpms = [120]\nmax_minutes = 0", "max_minutes"),
+            ("max_high", "bpms = [120]\nmax_minutes = 601", "max_minutes"),
+            ("bar_low", "bpms = [120]\nbar_beats = 0", "bar_beats"),
+            ("bar_high", "bpms = [120]\nbar_beats = 17", "bar_beats"),
+        ] {
+            let src = LOOP_OK.replace("bpms  = [100, 120, 128]", line);
+            let p = write_tmp(&format!("loop_{tag}"), &src);
+            assert!(
+                matches!(Config::load(&p), Err(ConfigError::LoopValue { field: f, .. }) if f == field),
+                "{tag}: {field} の値域エラーになるはず"
+            );
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn loop_fade_only_in_beat() {
+        for (tag, from, to, field) in [
+            (
+                "bar",
+                r#"--name", "magenta"]"#,
+                r#"--name", "{fade}"]"#,
+                "bar",
+            ),
+            (
+                "on_stop",
+                r#"--mireds", "370"]"#,
+                r#"--mireds", "{fade}"]"#,
+                "on_stop",
+            ),
+        ] {
+            let p = write_tmp(&format!("loop_fade_{tag}"), &LOOP_OK.replace(from, to));
+            assert!(
+                matches!(Config::load(&p), Err(ConfigError::FadePlaceholder { field: f, .. }) if f == field),
+                "{tag}: {{fade}} は beat 以外で使えない"
+            );
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn loop_rejects_empty_inner_command() {
+        let p = write_tmp(
+            "loop_empty_inner",
+            &LOOP_OK.replace(
+                r#"bar = [["mat", "group", "color", "--group", "g", "--name", "magenta"]]"#,
+                "bar = [[]]",
+            ),
+        );
+        assert!(matches!(
+            Config::load(&p),
+            Err(ConfigError::EmptyCommand(_))
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn loop_forbids_light_and_shutter_fields() {
+        for (tag, extra, field) in [
+            ("get_state", r#"get_state = ["mat", "read"]"#, "get_state"),
+            ("on", r#"on = ["mat", "on"]"#, "on"),
+            ("off", r#"off = ["mat", "off"]"#, "off"),
+            ("open", r#"open = ["enl", "open"]"#, "open"),
+            ("close", r#"close = ["enl", "close"]"#, "close"),
+            ("stop", r#"stop = ["enl", "stop"]"#, "stop"),
+            ("color", r#"color = ["mat", "{color}"]"#, "color"),
+            (
+                "brightness",
+                r#"brightness = ["mat", "{brightness}"]"#,
+                "brightness",
+            ),
+            ("stateless", "stateless = true", "stateless"),
+            ("face", r#"face = "light""#, "face"),
+            ("members", r#"members = ["club"]"#, "members"),
+            ("node_id", "node_id = 5", "node_id"),
+            (
+                "preset",
+                "[[device.preset]]\nname = \"x\"\ncmd = [\"sh\"]",
+                "preset",
+            ),
+        ] {
+            let src = if tag == "preset" {
+                format!("{LOOP_OK}\n{extra}\n")
+            } else {
+                LOOP_OK.replace("kind  = \"loop\"", &format!("kind  = \"loop\"\n{extra}"))
+            };
+            let p = write_tmp(&format!("loop_forbid_{tag}"), &src);
+            assert!(
+                matches!(Config::load(&p), Err(ConfigError::ForbiddenField { field: f, .. }) if f == field),
+                "{tag}: loop では {field} を書けない"
+            );
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn loop_fields_forbidden_on_other_kinds() {
+        for (tag, extra, field) in [
+            ("bpms", "bpms = [120]", "bpms"),
+            ("max_minutes", "max_minutes = 10", "max_minutes"),
+            ("bar_beats", "bar_beats = 4", "bar_beats"),
+            ("beat", r#"beat = [["sh"]]"#, "beat"),
+            ("bar", r#"bar = [["sh"]]"#, "bar"),
+            ("on_stop", r#"on_stop = [["sh"]]"#, "on_stop"),
+        ] {
+            let src = format!(
+                r##"
+                [[device]]
+                name = "l"
+                kind = "light"
+                get_state = ["mat", "read"]
+                on  = ["mat", "on"]
+                off = ["mat", "off"]
+                {extra}
+                "##
+            );
+            let p = write_tmp(&format!("light_loopfield_{tag}"), &src);
+            assert!(
+                matches!(Config::load(&p), Err(ConfigError::ForbiddenField { field: f, .. }) if f == field),
+                "{tag}: light に {field} は書けない"
+            );
+            std::fs::remove_file(p).ok();
+        }
     }
 }

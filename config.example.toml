@@ -309,3 +309,30 @@ stop      = ["casa", "set", "shutter", "open_close_operation", "stop"]
 # list   = ["casad", "rules", "list", "--json"]
 # pause  = ["casad", "rules", "pause", "--"]
 # resume = ["casad", "rules", "resume", "--"]
+
+# ── loop（拍に合わせてコマンドを回す。クラブ照明など）──────────────
+# 状態は in-memory（running / stopped）。get_state は持たない。
+# beat: 毎拍、順に exec。{fade} は拍長の 80% を 0.1 秒単位にした整数（120 BPM で 4）。
+# bar: 小節の頭に beat より先に exec。小節ごとに順繰り。
+# on_stop: 停止・自動停止（max_minutes）・mando 終了時に順に exec（元の明かりに戻す）。
+# [[device]]
+# name  = "club_living"
+# alias = "クラブ（リビング）"
+# kind  = "loop"
+# bpms  = [100, 120, 128]   # UI のプリセット。先頭が既定
+# max_minutes = 60          # 省略時 60
+# bar_beats = 4             # 省略時 4
+# beat = [
+#   ["mat", "group", "level", "--group", "living_lights", "--percent", "100"],
+#   ["mat", "group", "level", "--group", "living_lights", "--percent", "8", "--transition", "{fade}"],
+# ]
+# bar = [
+#   ["mat", "group", "color", "--group", "living_lights", "--name", "magenta"],
+#   ["mat", "group", "color", "--group", "living_lights", "--name", "blue"],
+#   ["mat", "group", "color", "--group", "living_lights", "--name", "purple"],
+#   ["mat", "group", "color", "--group", "living_lights", "--name", "cyan"],
+# ]
+# on_stop = [
+#   ["mat", "group", "color-temp", "--group", "living_lights", "--mireds", "370"],
+#   ["mat", "group", "level", "--group", "living_lights", "--percent", "100"],
+# ]

@@ -619,7 +619,7 @@ async fn fetch_state_with(app: &App, device: &Device, on_fail: ReadFailLog) -> S
                 state: match device.kind {
                     Kind::Shutter => normalize_enl_state(&raw),
                     Kind::Light => normalize_mat_onoff(&raw),
-                    Kind::Switch => normalize_enl_state(&raw),
+                    Kind::Switch | Kind::Loop => normalize_enl_state(&raw),
                 },
                 exec: Some(result.outcome),
                 raw: Some(raw),
