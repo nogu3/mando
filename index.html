@@ -153,6 +153,19 @@
   /* stateless switch（赤外線など）: 状態ラベルを出さず ON / OFF の 2 ボタン */
   .tile .onoff { display: flex; gap: 8px; margin: 6px 0 2px; }
   .tile .onoff button.act { flex: 1; min-height: 46px; font-size: 15px; letter-spacing: .06em; border-radius: 12px; }
+  /* ── loop カード（クラブ照明）。再生中は見出しの状態が光る ── */
+  .loopcard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px; margin: 0 0 12px; }
+  .loopcard .lhead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .loopcard .lname { font-size: 15px; font-weight: 700; }
+  .loopcard .lstate { font-size: 12px; color: var(--muted); }
+  .loopcard.playing .lstate { color: #ff6ad5; font-weight: 600; }
+  .loopcard .lctl { display: flex; gap: 8px; margin-top: 10px; }
+  .loopcard .lctl button.act { flex: 1; min-height: 46px; font-size: 15px; border-radius: 12px; }
+  .loopcard .lctl button.act.tap { flex: 1.4; }
+  .loopcard .lctl button.act.stop { flex: 1; }
+  .loopcard.playing button.act.bpm.cur { outline: 2px solid #ff6ad5; }
+  .loopcard .lmsg { font-size: 11px; color: var(--muted); min-height: 16px; margin-top: 6px; }
+  .loopcard .lmsg.error { color: var(--warn); }
   /* ── 色変更ボタン + 色選択ボトムシート ─────────────── */
   button.colorbtn {
     appearance: none; width: 100%; min-height: 44px; margin-top: 7px;
@@ -723,6 +736,133 @@ function buildStatelessSwitchTile(dev) {
   }
   cards.set(dev.name, c);
   return el;
+}
+
+/* ── loop カード（クラブ照明）。状態は in-memory 即答なので cards には登録せず、
+   再生中だけ 5 秒ごとに自前で state を取る。 ── */
+const LOOP_POLL_MS = 5000;
+const TAP_SETTLE_MS = 1500;   // 最後のタップからこれだけ空いたら確定して start
+const TAP_RESET_MS  = 2000;   // 間隔がこれを超えたら叩き直し
+const TAP_KEEP = 9;           // 直近 9 回（= 8 間隔）
+
+function buildLoopCard(dev) {
+  const el = document.createElement("div");
+  el.className = "loopcard";
+  el.innerHTML = `
+    <div class="lhead"><span class="lname"></span><span class="lstate">停止中</span></div>
+    <div class="lctl"></div>
+    <div class="lmsg"></div>
+  `;
+  el.querySelector(".lname").textContent = dev.label;
+  const ctl = el.querySelector(".lctl");
+  const card = {
+    name: dev.name,
+    rootEl: el,
+    stateEl: el.querySelector(".lstate"),
+    msgEl: el.querySelector(".lmsg"),
+    bpmBtns: [],
+    tapBtn: null,
+    timer: null,
+    taps: [],
+    tapTimer: null,
+  };
+  for (const bpm of dev.bpms || []) {
+    const b = document.createElement("button");
+    b.className = "act bpm";
+    b.type = "button";
+    b.dataset.bpm = String(bpm);
+    b.textContent = String(bpm);
+    b.addEventListener("click", () => loopStart(card, bpm));
+    ctl.appendChild(b);
+    card.bpmBtns.push(b);
+  }
+  const tap = document.createElement("button");
+  tap.className = "act tap";
+  tap.type = "button";
+  tap.textContent = "タップ";
+  tap.addEventListener("click", () => loopTap(card));
+  ctl.appendChild(tap);
+  card.tapBtn = tap;
+  const stop = document.createElement("button");
+  stop.className = "act stop";
+  stop.type = "button";
+  stop.textContent = "停止";
+  stop.addEventListener("click", () => loopStop(card));
+  ctl.appendChild(stop);
+  loopRefresh(card);
+  return el;
+}
+
+function renderLoop(card, st) {
+  const playing = st && st.state === "running";
+  card.rootEl.classList.toggle("playing", playing);
+  if (playing) {
+    const min = Math.max(1, Math.ceil((st.remaining_s || 0) / 60));
+    card.stateEl.textContent = `${st.bpm} BPM で再生中 ・ 残り ${min} 分`;
+    for (const b of card.bpmBtns) b.classList.toggle("cur", Number(b.dataset.bpm) === st.bpm);
+    if (!card.timer) card.timer = setInterval(() => loopRefresh(card), LOOP_POLL_MS);
+  } else {
+    card.stateEl.textContent = "停止中";
+    for (const b of card.bpmBtns) b.classList.remove("cur");
+    if (card.timer) { clearInterval(card.timer); card.timer = null; }
+  }
+}
+
+async function loopRefresh(card) {
+  try {
+    renderLoop(card, await api("GET", `/api/devices/${encodeURIComponent(card.name)}/state`));
+  } catch (e) {
+    // 取れなくても表示は前回のまま。再生中なら次の周期で再試行する。
+  }
+}
+
+function loopMsg(card, text, isError) {
+  card.msgEl.textContent = text;
+  card.msgEl.classList.toggle("error", !!isError);
+}
+
+async function loopStart(card, bpm) {
+  loopMsg(card, "", false);
+  try {
+    renderLoop(card, await api("POST", `/api/devices/${encodeURIComponent(card.name)}/start`, { bpm }));
+  } catch (e) {
+    loopMsg(card, "⚠ 通信エラー", true);
+  }
+}
+
+async function loopStop(card) {
+  loopMsg(card, "戻しています…", false);
+  try {
+    renderLoop(card, await api("POST", `/api/devices/${encodeURIComponent(card.name)}/stop`));
+    loopMsg(card, "", false);
+  } catch (e) {
+    loopMsg(card, "⚠ 通信エラー", true);
+  }
+}
+
+/* タップテンポ: 直近 8 間隔の中央値から BPM。最後のタップから 1.5 秒空いたら start。 */
+function loopTap(card) {
+  const now = performance.now();
+  if (card.taps.length && now - card.taps[card.taps.length - 1] > TAP_RESET_MS) card.taps = [];
+  card.taps.push(now);
+  if (card.taps.length > TAP_KEEP) card.taps.shift();
+  if (card.tapTimer) clearTimeout(card.tapTimer);
+  if (card.taps.length < 2) {
+    card.tapBtn.textContent = "タップ…";
+    card.tapTimer = setTimeout(() => { card.tapBtn.textContent = "タップ"; card.taps = []; }, TAP_RESET_MS);
+    return;
+  }
+  const gaps = [];
+  for (let i = 1; i < card.taps.length; i++) gaps.push(card.taps[i] - card.taps[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const mid = gaps.length % 2 ? gaps[(gaps.length - 1) / 2] : (gaps[gaps.length / 2 - 1] + gaps[gaps.length / 2]) / 2;
+  const bpm = Math.min(200, Math.max(40, Math.round(60000 / mid)));
+  card.tapBtn.textContent = `タップ ${bpm}`;
+  card.tapTimer = setTimeout(() => {
+    card.taps = [];
+    card.tapBtn.textContent = "タップ";
+    loopStart(card, bpm);
+  }, TAP_SETTLE_MS);
 }
 
 /* ── 色選択ボトムシート（ページ共有の 1 枚、開くたびに対象 device へ組み替え）── */
@@ -1787,6 +1927,7 @@ async function boot() {
   const switchLights = devices.filter((d) => d.kind === "switch" && d.face === "light");
   const plainSwitches = devices.filter((d) => d.kind === "switch" && d.face !== "light");
   const shutters = devices.filter((d) => d.kind === "shutter");
+  const loops = devices.filter((d) => d.kind === "loop");
   const grouped = new Set(grps.flatMap((g) => g.members));
   // members に挙がった light はトップの一覧から消え、グループカードの展開内に入る。
   const lightMemberSet = new Set(lights.flatMap((d) => d.members || []));
@@ -1812,6 +1953,10 @@ async function boot() {
     tiles.className = "tiles";
     for (const dev of plainSwitches) tiles.appendChild(buildSwitchTile(dev));
     panes.ops.appendChild(tiles);
+  }
+  if (loops.length) {
+    panes.ops.appendChild(sectionHeading("🎶 クラブ"));
+    for (const dev of loops) panes.ops.appendChild(buildLoopCard(dev));
   }
   if (shutters.length) {
     panes.ops.appendChild(sectionHeading("🪟 シャッター"));
