@@ -114,32 +114,35 @@ impl Looper {
         bpm: u32,
         max: Duration,
     ) -> LoopStatus {
-        if let Some(old) = self.take(name) {
-            abort_run(old);
-        }
         let (cancel, rx) = watch::channel(false);
         let now = Instant::now();
         let deadline = now + max;
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
-        let task = tokio::spawn(run_loop(
-            self.clone(),
-            name.to_string(),
-            spec,
-            bpm,
-            deadline,
-            rx,
-            gen,
-        ));
-        self.runs.lock().expect("runs poisoned").insert(
-            name.to_string(),
-            LoopRun {
+        {
+            // spawn と置き換えを 1 つのロックの下で行う。タスクが先に走っても
+            // エントリが存在し（take_if_gen が成功する）、同名の同時 start でも
+            // 古い方を必ず abort できる。spawn は await しないので std Mutex で足りる。
+            let mut runs = self.runs.lock().expect("runs poisoned");
+            let task = tokio::spawn(run_loop(
+                self.clone(),
+                name.to_string(),
+                spec,
+                bpm,
+                deadline,
+                rx,
+                gen,
+            ));
+            let run = LoopRun {
                 bpm,
                 deadline,
                 cancel,
                 task,
                 gen,
-            },
-        );
+            };
+            if let Some(old) = runs.insert(name.to_string(), run) {
+                abort_run(old);
+            }
+        }
         tracing::info!(device = name, bpm, max_s = max.as_secs(), "loop 開始");
         self.status(name)
     }
@@ -519,5 +522,36 @@ mod tests {
             "shutdown は 5 秒で打ち切る: {took:?}"
         );
         std::fs::remove_file(p).ok();
+    }
+
+    #[tokio::test]
+    async fn double_start_leaves_only_one_loop_running() {
+        // 同名 start の連打: 古い方は必ず abort される（ハンドルを失って走り続けない）。
+        let p = tmp("double");
+        let l = looper();
+        l.start("club", spec(&p), 200, Duration::from_secs(60));
+        l.start("club", spec(&p), 200, Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        l.stop("club", &spec(&p)).await;
+        let n = lines(&p).len();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(lines(&p).len(), n, "stop 後も古いループが走っている");
+        // 拍 0 の bar0 は 1 回だけ（2 本走っていれば 2 回出る）。
+        assert_eq!(lines(&p).iter().filter(|l| *l == "bar0").count(), 1);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tiny_max_auto_stop_clears_entry_and_runs_on_stop() {
+        // max が極小でも、エントリ挿入前にタスクが終わって running が残ることはない。
+        for i in 0..20 {
+            let p = tmp(&format!("tiny{i}"));
+            let l = looper();
+            l.start("club", spec(&p), 200, Duration::from_millis(0));
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(l.status("club").state, "stopped");
+            assert_eq!(lines(&p), vec!["stop"]);
+            std::fs::remove_file(p).ok();
+        }
     }
 }
