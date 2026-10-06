@@ -6,7 +6,6 @@
 mod cache;
 mod config;
 mod exec;
-#[allow(dead_code)]
 mod looper;
 mod normalize;
 mod push;
@@ -67,6 +66,8 @@ struct App {
     /// light 状態の push ストア（[push] 未設定なら None）。
     /// 永続化しない — mando 再起動で unprimed から始めてよい。
     push: Option<Arc<push::PushStore>>,
+    /// loop デバイスのランタイム（専用 executor・in-memory 状態）。
+    looper: Arc<looper::Looper>,
 }
 
 impl App {
@@ -174,6 +175,7 @@ async fn main() {
         .as_ref()
         .map(|_| Arc::new(push::PushStore::new(&config)));
 
+    let exec_timeout_ms = config.exec.timeout_ms;
     let app = Arc::new(App {
         config,
         executor: Executor::new(),
@@ -182,7 +184,11 @@ async fn main() {
         state_cache: cache::Cache::default(),
         mesh_job: std::sync::Mutex::new(MeshJob::default()),
         push: store.clone(),
+        looper: Arc::new(looper::Looper::new(std::time::Duration::from_millis(
+            exec_timeout_ms,
+        ))),
     });
+    let app_for_shutdown = app.clone();
 
     let router = router(app.clone());
 
@@ -203,7 +209,12 @@ async fn main() {
     };
 
     axum::serve(listener, router)
-        .with_graceful_shutdown(run_shutdown(wait_for_signal(), store, push_tasks))
+        .with_graceful_shutdown(run_shutdown(
+            wait_for_signal(),
+            store,
+            push_tasks,
+            app_for_shutdown,
+        ))
         .await
         .expect("server error");
 }
@@ -226,9 +237,19 @@ async fn run_shutdown(
     signal: impl std::future::Future<Output = ()>,
     store: Option<Arc<push::PushStore>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    app: Shared,
 ) {
     signal.await;
     tracing::info!("shutdown");
+    // loop を先に止めて照明を戻す（on_stop は合計 5 秒で打ち切り）。
+    let specs: Vec<(String, looper::LoopSpec)> = app
+        .config
+        .devices
+        .iter()
+        .filter(|d| d.kind == Kind::Loop)
+        .map(|d| (d.name.clone(), loop_spec(d)))
+        .collect();
+    app.looper.shutdown(&specs).await;
     if let Some(store) = store {
         store.close();
     }
@@ -452,6 +473,7 @@ fn router(app: Shared) -> Router {
         .route("/api/devices/:name/open", post(open_device))
         .route("/api/devices/:name/close", post(close_device))
         .route("/api/devices/:name/stop", post(stop_device))
+        .route("/api/devices/:name/start", post(start_device))
         .route("/api/devices/:name/on", post(on_device))
         .route("/api/devices/:name/off", post(off_device))
         .route("/api/devices/:name/presets/:preset", post(preset_device))
@@ -505,6 +527,12 @@ struct DeviceInfo {
     /// members を持つ light(グループカード)のメンバー device 名。空なら省略。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     members: Vec<String>,
+    /// loop の BPM プリセット（loop 以外は省略）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bpms: Vec<u32>,
+    /// loop の自動停止までの分（loop 以外は省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_minutes: Option<u32>,
 }
 
 async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
@@ -531,6 +559,8 @@ async fn list_devices(State(app): State<Shared>) -> Json<Vec<DeviceInfo>> {
             face: d.face,
             stateless: d.stateless,
             members: d.members.clone(),
+            bpms: d.bpms.clone(),
+            max_minutes: (d.kind == Kind::Loop).then(|| d.max_minutes()),
         })
         .collect();
     Json(devices)
@@ -717,6 +747,8 @@ async fn push_state(app: &App, store: &Arc<push::PushStore>, device: &Device) ->
 
 async fn get_state(State(app): State<Shared>, Path(name): Path<String>) -> Response {
     match app.config.find(&name) {
+        // loop は in-memory 即答（exec しない）。
+        Some(device) if device.kind == Kind::Loop => Json(app.looper.status(&name)).into_response(),
         Some(device) => Json(cached_state(&app, device).await).into_response(),
         None => not_found(&name),
     }
@@ -816,6 +848,50 @@ async fn close_device(State(app): State<Shared>, Path(name): Path<String>) -> Re
 
 async fn stop_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
     device_op(&app, &name, Op::Stop).await
+}
+
+#[derive(Deserialize)]
+struct StartBody {
+    bpm: Option<Value>,
+}
+
+/// loop を起動（running なら新 bpm で置き換え）。body 無し／`bpm` 無しは `bpms[0]`。
+async fn start_device(
+    State(app): State<Shared>,
+    Path(name): Path<String>,
+    body: Option<Json<StartBody>>,
+) -> Response {
+    let Some(device) = app.config.find(&name) else {
+        return not_found(&name);
+    };
+    if device.kind != Kind::Loop {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"unsupported operation\",\"name\":{}}}",
+                json_str(&name)
+            ),
+        )
+            .into_response();
+    }
+    // bpm: 省略時は既定。整数 40〜200 以外（文字列・小数・範囲外）は 400。
+    let bpm = match body.and_then(|Json(b)| b.bpm) {
+        None | Some(Value::Null) => device.default_bpm(),
+        Some(v) => match v.as_u64() {
+            Some(n) if (40..=200).contains(&n) => n as u32,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    "{\"error\":\"invalid_bpm\"}",
+                )
+                    .into_response()
+            }
+        },
+    };
+    let max = std::time::Duration::from_secs(device.max_minutes() as u64 * 60);
+    Json(app.looper.start(&name, loop_spec(device), bpm, max)).into_response()
 }
 
 async fn on_device(State(app): State<Shared>, Path(name): Path<String>) -> Response {
@@ -948,10 +1024,27 @@ async fn brightness_device(
     Json(run_light_action(&app, device, &cmd).await).into_response()
 }
 
+/// loop の Device から looper に渡す中身を組む（Device → LoopSpec の写しはここだけ）。
+fn loop_spec(device: &Device) -> looper::LoopSpec {
+    looper::LoopSpec {
+        lane: device.exec_lane().to_string(),
+        bar_beats: device.bar_beats(),
+        beat: device.beat.clone(),
+        bar: device.bar.clone(),
+        on_stop: device.on_stop.clone(),
+    }
+}
+
 async fn device_op(app: &App, name: &str, op: Op) -> Response {
     let Some(device) = app.config.find(name) else {
         return not_found(name);
     };
+    if device.kind == Kind::Loop {
+        if let Op::Stop = op {
+            return Json(app.looper.stop(name, &loop_spec(device)).await).into_response();
+        }
+        // open/close/on/off は device_cmd が None を返し「unsupported operation」に落ちる。
+    }
     match device_cmd(device, op) {
         // light は exec 結果のみ返す（state は UI が非同期に追いつき取得）。
         Some(cmd) if device.kind == Kind::Light => {
@@ -1662,6 +1755,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -1676,6 +1770,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -1942,6 +2037,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         });
         let res = router(app)
             .oneshot(
@@ -2487,6 +2583,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         };
         let device = app.config.find("slow").unwrap();
         let start = Instant::now();
@@ -2523,6 +2620,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -2591,6 +2689,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: None,
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -2751,7 +2850,12 @@ mod tests {
 
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_shutdown(std::future::ready(()), Some(store.clone()), vec![t1, t2]),
+            run_shutdown(
+                std::future::ready(()),
+                Some(store.clone()),
+                vec![t1, t2],
+                app.clone(),
+            ),
         )
         .await;
         assert!(
@@ -2811,6 +2915,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: Some(store),
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -2857,6 +2962,7 @@ mod tests {
             state_cache: cache::Cache::default(),
             mesh_job: std::sync::Mutex::new(MeshJob::default()),
             push: Some(store),
+            looper: Arc::new(looper::Looper::new(std::time::Duration::from_secs(15))),
         })
     }
 
@@ -3174,5 +3280,181 @@ mod tests {
         // 空の members はフィールドごと省略される。
         let kid = arr.iter().find(|d| d["name"] == "kid").unwrap();
         assert!(kid.get("members").is_none());
+    }
+
+    /// JSON body 付きで叩く（start の bpm 指定用）。
+    async fn call_json_on(
+        app: Shared,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, Value) {
+        let res = router(app)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    fn loop_app(log: &str) -> Shared {
+        app_from(&format!(
+            r##"
+            [[device]]
+            name  = "club"
+            alias = "クラブ"
+            kind  = "loop"
+            bpms  = [100, 120, 128]
+            max_minutes = 1
+            bar_beats = 2
+            beat = [["sh", "-c", "echo beat >> {log}"]]
+            bar  = [["sh", "-c", "echo bar >> {log}"]]
+            on_stop = [["sh", "-c", "echo stop >> {log}"]]
+            [[device]]
+            name = "shutter"
+            get_state = ["sh", "-c", "printf '{{\"properties\":[{{\"name\":\"open_close_state\",\"value\":\"open\"}}]}}'"]
+            open  = ["sh", "-c", "printf '{{}}'"]
+            close = ["sh", "-c", "printf '{{}}'"]
+            "##
+        ))
+    }
+
+    #[tokio::test]
+    async fn list_devices_exposes_loop_bpms_and_max_minutes() {
+        let app = loop_app(&tmp_counter("loop_list"));
+        let (st, v) = call_on(app, "GET", "/api/devices").await;
+        assert_eq!(st, 200);
+        let club = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "club")
+            .unwrap();
+        assert_eq!(club["kind"], "loop");
+        assert_eq!(club["label"], "クラブ");
+        assert_eq!(club["bpms"], serde_json::json!([100, 120, 128]));
+        assert_eq!(club["max_minutes"], 1);
+        let shutter = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "shutter")
+            .unwrap();
+        assert!(shutter.get("bpms").is_none(), "loop 以外に bpms は出さない");
+        assert!(shutter.get("max_minutes").is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_state_is_stopped_without_exec() {
+        let log = tmp_counter("loop_state");
+        let app = loop_app(&log);
+        let (st, v) = call_on(app, "GET", "/api/devices/club/state").await;
+        assert_eq!(st, 200);
+        assert_eq!(v, serde_json::json!({"state": "stopped"}));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "",
+            "state は exec しない"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_then_state_then_stop() {
+        let log = tmp_counter("loop_cycle");
+        let app = loop_app(&log);
+        let (st, v) = call_json_on(
+            app.clone(),
+            "POST",
+            "/api/devices/club/start",
+            r#"{"bpm":128}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["bpm"], 128);
+        assert!(v["remaining_s"].as_u64().unwrap() <= 60);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let (_, v) = call_on(app.clone(), "GET", "/api/devices/club/state").await;
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["bpm"], 128);
+        let (st, v) = call_on(app.clone(), "POST", "/api/devices/club/stop").await;
+        assert_eq!(st, 200);
+        assert_eq!(v, serde_json::json!({"state": "stopped"}));
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("bar\nbeat\n"), "{text:?}");
+        assert!(text.ends_with("stop\n"), "{text:?}");
+        let (_, v) = call_on(app, "GET", "/api/devices/club/state").await;
+        assert_eq!(v["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn start_without_body_uses_first_preset() {
+        let log = tmp_counter("loop_default");
+        let app = loop_app(&log);
+        let (st, v) = call_on(app.clone(), "POST", "/api/devices/club/start").await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["bpm"], 100);
+        call_on(app, "POST", "/api/devices/club/stop").await;
+    }
+
+    #[tokio::test]
+    async fn start_rejects_bpm_out_of_range() {
+        let log = tmp_counter("loop_badbpm");
+        let app = loop_app(&log);
+        for body in [
+            r#"{"bpm":39}"#,
+            r#"{"bpm":201}"#,
+            r#"{"bpm":"fast"}"#,
+            r#"{"bpm":120.5}"#,
+        ] {
+            let (st, v) = call_json_on(app.clone(), "POST", "/api/devices/club/start", body).await;
+            assert_eq!(st, 400, "{body}");
+            assert_eq!(v["error"], "invalid_bpm", "{body}");
+        }
+        let (_, v) = call_on(app, "GET", "/api/devices/club/state").await;
+        assert_eq!(v["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn start_on_non_loop_is_unsupported() {
+        let log = tmp_counter("loop_nonloop");
+        let app = loop_app(&log);
+        let (st, _) = call_on(app.clone(), "POST", "/api/devices/shutter/start").await;
+        assert_eq!(st, 404);
+        let (st, _) = call_on(app, "POST", "/api/devices/nope/start").await;
+        assert_eq!(st, 404);
+    }
+
+    #[tokio::test]
+    async fn loop_rejects_open_close_on_off() {
+        let log = tmp_counter("loop_ops");
+        let app = loop_app(&log);
+        for op in ["open", "close", "on", "off"] {
+            let (st, v) = call_on(app.clone(), "POST", &format!("/api/devices/club/{op}")).await;
+            assert_eq!(st, 404, "{op}");
+            assert_eq!(v["error"], "unsupported operation", "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_loop_on_stop() {
+        let log = tmp_counter("loop_shutdown");
+        let app = loop_app(&log);
+        call_on(app.clone(), "POST", "/api/devices/club/start").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        run_shutdown(std::future::ready(()), None, vec![], app.clone()).await;
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.ends_with("stop\n"), "{text:?}");
+        let (_, v) = call_on(app, "GET", "/api/devices/club/state").await;
+        assert_eq!(v["state"], "stopped");
     }
 }

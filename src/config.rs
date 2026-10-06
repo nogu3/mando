@@ -394,7 +394,6 @@ impl Device {
     }
 
     /// loop: 既定 BPM（`bpms[0]`。validate で 1 個以上を保証済み）。
-    #[allow(dead_code)] // 呼び出しは looper（後続タスク）で入る。
     pub fn default_bpm(&self) -> u32 {
         self.bpms.first().copied().unwrap_or(120)
     }
