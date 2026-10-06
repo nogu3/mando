@@ -104,7 +104,7 @@ struct LoopRun {
 - 開始時刻からの**絶対スケジュール**で `tokio::time::sleep_until(start + i * beat)`。
   拍 `i` の処理: `i % bar_beats == 0` なら `bar[(i / bar_beats) % bar.len()]` を exec → `beat` を順に exec。
   同じ拍のコマンドは**直列**（順序が意味を持つ: 色 → 100% → フェード）。
-- 処理が次の拍の時刻を越えていたら、**越えた分の拍は飛ばして**次の未来の拍に揃える（遅れを積まない）。
+- 処理が次の拍の時刻を越えていたら、**越えた分の拍は飛ばして**次の未来の拍に揃える（遅れを積まない）。ただし遅れが 1/4 拍未満なら飛ばさない（`i = max(i+1, (経過 − 拍長/4) / 拍長 + 1)`）。実機では小節頭の 3 exec が拍長を数 ms 越えうるが、少し遅れたパルスの方が欠けたパルスより良いため。
 - exec は loop 専用の `Executor`（graph / mesh と同じ流儀。`App.executor` を Arc 化して App 構築 9 箇所に
   触るのを避ける）で、lane は `device.exec_lane()`、timeout は `[exec] timeout_ms`。失敗（non-zero / timeout）は
   debug ログ、**連続 10 拍失敗で warn 1 回**（成功で復帰したらまた 10 回からカウント）。ループは止めない。

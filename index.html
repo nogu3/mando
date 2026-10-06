@@ -822,6 +822,10 @@ function loopMsg(card, text, isError) {
 }
 
 async function loopStart(card, bpm) {
+  // 保留中のタップ確定タイマーを取り消す（停止・プリセットを後から上書きさせない）。
+  if (card.tapTimer) { clearTimeout(card.tapTimer); card.tapTimer = null; }
+  card.taps = [];
+  card.tapBtn.textContent = "タップ";
   loopMsg(card, "", false);
   try {
     renderLoop(card, await api("POST", `/api/devices/${encodeURIComponent(card.name)}/start`, { bpm }));
@@ -831,6 +835,10 @@ async function loopStart(card, bpm) {
 }
 
 async function loopStop(card) {
+  // 保留中のタップ確定タイマーを取り消す（停止・プリセットを後から上書きさせない）。
+  if (card.tapTimer) { clearTimeout(card.tapTimer); card.tapTimer = null; }
+  card.taps = [];
+  card.tapBtn.textContent = "タップ";
   loopMsg(card, "戻しています…", false);
   try {
     renderLoop(card, await api("POST", `/api/devices/${encodeURIComponent(card.name)}/stop`));
@@ -859,9 +867,8 @@ function loopTap(card) {
   const bpm = Math.min(200, Math.max(40, Math.round(60000 / mid)));
   card.tapBtn.textContent = `タップ ${bpm}`;
   card.tapTimer = setTimeout(() => {
-    card.taps = [];
-    card.tapBtn.textContent = "タップ";
-    loopStart(card, bpm);
+    card.tapTimer = null;
+    loopStart(card, bpm); // 内部で taps・ボタン表示もリセットされる
   }, TAP_SETTLE_MS);
 }
 

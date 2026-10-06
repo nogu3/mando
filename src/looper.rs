@@ -4,7 +4,8 @@
 //! 照明の群・色・パルスの形は config（設計原則 1・2）。
 //!
 //! - 拍は開始時刻からの絶対スケジュール（ドリフトしない）。処理が次の拍を越えたら
-//!   越えた分は飛ばして未来の拍に揃える（遅れを積まない）。
+//!   越えた分は飛ばして未来の拍に揃える（遅れを積まない）。ただし遅れが 1/4 拍未満なら
+//!   飛ばさない（小節頭の 3 exec が拍長を数 ms 越えても次のパルスを欠かさない）。
 //! - 各コマンドは専用 Executor（graph / mesh と同じ流儀）で timeout 有界に exec。
 //!   レーンは loop デバイス名（同じ loop の中は直列 — 色 → 100% → フェードの順が意味を持つ）。
 //! - 拍の exec 失敗はループを止めない（演出で 1 拍落ちは許容）。連続 10 拍で warn 1 回。
@@ -279,9 +280,11 @@ async fn run_loop(
                 tracing::debug!(device = %name, beat = i, "拍の exec 非成功");
             }
         }
-        // 次の拍。処理が遅れて次の拍を越えていたら、越えた分は飛ばす。
+        // 次の拍。処理が遅れて次の拍を越えていたら、越えた分は飛ばす（1/4 拍未満の遅れは許容）。
+        // 1/4 拍未満の遅れは許容する（少し遅れたパルスの方が欠けたパルスより良い）。
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        i = (i + 1).max(elapsed_ms / beat_ms + 1);
+        let slack = beat_ms / 4;
+        i = (i + 1).max(elapsed_ms.saturating_sub(slack) / beat_ms + 1);
     }
     // 自動停止: 自分の世代のエントリだけ外し、on_stop を走らせる。
     if looper.take_if_gen(&name, gen) {
@@ -458,6 +461,37 @@ mod tests {
             gap_ms >= 850,
             "遅れを積まず拍 3（900 ms）に揃うはず: gap={gap_ms}ms"
         );
+        std::fs::remove_file(p).ok();
+    }
+
+    #[tokio::test]
+    async fn slightly_late_beat_is_not_skipped() {
+        // 200 BPM = 300 ms/拍、拍コマンドが 330 ms（30 ms 遅れ < 75 ms の許容）。
+        // 次の拍は飛ばされず、連続拍（約 330 ms 間隔）になる。旧規則だと約 600 ms 間隔。
+        // 遅れは積み上がるので、許容を使い切る前の約 1 秒（拍 0〜2）だけを見る。
+        let p = tmp("late");
+        let l = looper();
+        let sp = LoopSpec {
+            lane: "club".into(),
+            bar_beats: 4,
+            beat: vec![vec![
+                "sh".into(),
+                "-c".into(),
+                format!("date +%s%N >> {p}; sleep 0.33"),
+            ]],
+            bar: vec![],
+            on_stop: vec![],
+        };
+        l.start("club", sp.clone(), 200, Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        l.stop("club", &sp).await;
+        let got = lines(&p);
+        let ts: Vec<u128> = got.iter().filter_map(|l| l.parse().ok()).collect();
+        assert!(ts.len() >= 3, "{got:?}");
+        for w in ts.windows(2) {
+            let gap_ms = (w[1] - w[0]) / 1_000_000;
+            assert!(gap_ms < 450, "拍が飛ばされた: gap={gap_ms}ms {got:?}");
+        }
         std::fs::remove_file(p).ok();
     }
 

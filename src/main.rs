@@ -859,7 +859,7 @@ struct StartBody {
 async fn start_device(
     State(app): State<Shared>,
     Path(name): Path<String>,
-    body: Option<Json<StartBody>>,
+    body: axum::body::Bytes,
 ) -> Response {
     let Some(device) = app.config.find(&name) else {
         return not_found(&name);
@@ -876,7 +876,23 @@ async fn start_device(
             .into_response();
     }
     // bpm: 省略時は既定。整数 40〜200 以外（文字列・小数・範囲外）は 400。
-    let bpm = match body.and_then(|Json(b)| b.bpm) {
+    // body は content-type 不問。空なら既定、非空で JSON として不正なら 400（黙って既定にしない）。
+    let parsed = if body.trim_ascii().is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<StartBody>(&body) {
+            Ok(b) => b.bpm,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    "{\"error\":\"invalid_bpm\"}",
+                )
+                    .into_response()
+            }
+        }
+    };
+    let bpm = match parsed {
         None | Some(Value::Null) => device.default_bpm(),
         Some(v) => match v.as_u64() {
             Some(n) if (40..=200).contains(&n) => n as u32,
@@ -3415,6 +3431,7 @@ mod tests {
             r#"{"bpm":201}"#,
             r#"{"bpm":"fast"}"#,
             r#"{"bpm":120.5}"#,
+            r#"{"bpm":150"#,
         ] {
             let (st, v) = call_json_on(app.clone(), "POST", "/api/devices/club/start", body).await;
             assert_eq!(st, 400, "{body}");
@@ -3422,6 +3439,27 @@ mod tests {
         }
         let (_, v) = call_on(app, "GET", "/api/devices/club/state").await;
         assert_eq!(v["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn start_accepts_json_body_without_content_type() {
+        let log = tmp_counter("loop_noctype");
+        let app = loop_app(&log);
+        let res = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/devices/club/start")
+                    .body(Body::from(r#"{"bpm":150}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["bpm"], 150);
+        call_on(app, "POST", "/api/devices/club/stop").await;
     }
 
     #[tokio::test]
