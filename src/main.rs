@@ -6,6 +6,8 @@
 mod cache;
 mod config;
 mod exec;
+#[allow(dead_code)]
+mod looper;
 mod normalize;
 mod push;
 
