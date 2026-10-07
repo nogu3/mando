@@ -26,6 +26,10 @@ use crate::exec::{ExecOutcome, Executor};
 const FAIL_WARN_AFTER: u32 = 10;
 /// shutdown 時に全 loop の on_stop に許す合計時間。
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+/// on_stop を再送するまでの間。Thread の multicast は burst の直後に捨てられる
+/// （2026-10-07 実機: 停止直後の戻し 2 発が届かず、1.5 秒後の再送は届いた）ので、
+/// 戻しは即時 1 回＋この間を空けてもう 1 回送る（冪等なので二重に届いても害はない）。
+const ON_STOP_REPEAT_GAP: Duration = Duration::from_millis(1500);
 
 /// config から組んだ 1 loop の中身（main が Device から作る）。
 #[derive(Debug, Clone)]
@@ -72,6 +76,8 @@ pub struct Looper {
     timeout: Duration,
     runs: Mutex<HashMap<String, LoopRun>>,
     next_gen: AtomicU64,
+    /// on_stop の再送間隔。None なら 1 回だけ送る（テスト用）。
+    on_stop_repeat: Option<Duration>,
 }
 
 /// `{fade}`: 拍長 ms × 0.8 を 0.1 秒単位で四捨五入（最小 1）。
@@ -82,11 +88,17 @@ pub fn fade_ds(bpm: u32) -> u64 {
 
 impl Looper {
     pub fn new(timeout: Duration) -> Self {
+        Self::with_on_stop_repeat(timeout, Some(ON_STOP_REPEAT_GAP))
+    }
+
+    /// on_stop の再送間隔を指定して作る（None = 再送しない）。
+    pub fn with_on_stop_repeat(timeout: Duration, on_stop_repeat: Option<Duration>) -> Self {
         Looper {
             executor: Executor::new(),
             timeout,
             runs: Mutex::new(HashMap::new()),
             next_gen: AtomicU64::new(1),
+            on_stop_repeat,
         }
     }
 
@@ -171,9 +183,16 @@ impl Looper {
         if stopped.is_empty() {
             return;
         }
+        // 再送の gap は全 loop で 1 回だけ空ける（loop ごとに待つと予算に収まらない）。
         let work = async {
-            for (name, spec) in stopped {
-                self.run_on_stop(name, spec).await;
+            for (name, spec) in &stopped {
+                self.run_on_stop_once(name, spec).await;
+            }
+            if let Some(gap) = self.on_stop_repeat {
+                tokio::time::sleep(gap).await;
+                for (name, spec) in &stopped {
+                    self.run_on_stop_once(name, spec).await;
+                }
             }
         };
         if tokio::time::timeout(SHUTDOWN_BUDGET, work).await.is_err() {
@@ -196,7 +215,16 @@ impl Looper {
         }
     }
 
+    /// on_stop を送る: 即時 1 回＋（設定があれば）gap を空けてもう 1 回。
     async fn run_on_stop(&self, name: &str, spec: &LoopSpec) {
+        self.run_on_stop_once(name, spec).await;
+        if let Some(gap) = self.on_stop_repeat {
+            tokio::time::sleep(gap).await;
+            self.run_on_stop_once(name, spec).await;
+        }
+    }
+
+    async fn run_on_stop_once(&self, name: &str, spec: &LoopSpec) {
         for cmd in &spec.on_stop {
             let r = self.exec(&spec.lane, cmd).await;
             if r.outcome != ExecOutcome::Success {
@@ -325,8 +353,9 @@ mod tests {
         }
     }
 
+    /// 既存テストは on_stop を 1 回だけ数えるので再送なしで組む（再送は専用テスト）。
     fn looper() -> Arc<Looper> {
-        Arc::new(Looper::new(Duration::from_secs(5)))
+        Arc::new(Looper::with_on_stop_repeat(Duration::from_secs(5), None))
     }
 
     #[test]
@@ -385,6 +414,37 @@ mod tests {
         let n = got.len();
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(lines(&p).len(), n, "stop 後に拍が走った");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[tokio::test]
+    async fn on_stop_is_repeated_after_gap() {
+        // Thread の multicast は burst の直後に捨てられる（2026-10-07 実機: 停止直後の
+        // 戻し 2 発が届かず、1.5 秒後の再送は届いた）。戻しは gap 空けて 2 回送る。
+        let p = tmp("stop_repeat");
+        let l = Arc::new(Looper::with_on_stop_repeat(
+            Duration::from_secs(5),
+            Some(Duration::from_millis(200)),
+        ));
+        let sp = LoopSpec {
+            lane: "club".into(),
+            bar_beats: 4,
+            beat: vec![echo(&p, "beat")],
+            bar: vec![],
+            on_stop: vec![vec!["sh".into(), "-c".into(), format!("date +%s%N >> {p}")]],
+        };
+        let t0 = std::time::Instant::now();
+        l.stop("club", &sp).await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(200),
+            "stop は再送まで待って返る"
+        );
+        let ts: Vec<u128> = lines(&p).iter().filter_map(|l| l.parse().ok()).collect();
+        assert_eq!(ts.len(), 2, "on_stop は 2 回送る: {ts:?}");
+        assert!(
+            (ts[1] - ts[0]) / 1_000_000 >= 200,
+            "2 回目は gap 以上あとに送る"
+        );
         std::fs::remove_file(p).ok();
     }
 
